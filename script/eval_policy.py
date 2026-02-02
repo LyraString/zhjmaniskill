@@ -157,7 +157,9 @@ def main(usr_args):
 
     seed = usr_args["seed"]
 
-    st_seed = 100000 * (1 + seed)
+    # 确保 seed 在 NumPy 的有效范围内 (0 到 2^32 - 1)
+    MAX_SEED = 2**32 - 1
+    st_seed = (100000 * (1 + seed)) % MAX_SEED
     suc_nums = []
     test_num = 100
     topk = 1
@@ -221,6 +223,9 @@ def eval_policy(task_name,
 
         if expert_check:
             try:
+                #增加调试信息，查看seed的类型和值
+                print(f"DEBUG: now_seed = {now_seed}, type = {type(now_seed)}")
+
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 episode_info = TASK_ENV.play_once()
                 TASK_ENV.close_env()
@@ -233,10 +238,11 @@ def eval_policy(task_name,
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
-                # stack_trace = traceback.format_exc()
-                # print(" -------------")
-                # print("Error: ", e)
-                # print(" -------------")
+                stack_trace = traceback.format_exc()
+                print(" -------------")
+                print("Error: ", e)
+                print(stack_trace)
+                print(" -------------")
                 TASK_ENV.close_env()
                 now_seed += 1
                 args["render_freq"] = render_freq
