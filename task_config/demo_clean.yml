@@ -4,7 +4,7 @@ render_freq: 0
 episode_num: 50
 use_seed: false
 save_freq: 15
-embodiment: [aloha-agilex]
+embodiment: [ur5-wsg, ur5-wsg, 0.6]
 language_num: 100
 domain_randomization:
   random_background: false
