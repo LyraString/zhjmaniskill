@@ -1,6 +1,6 @@
 # if you want to modify the config, please check the following tutorial first:
 # https://robotwin-platform.github.io/doc/usage/configurations.html
-render_freq: 0
+render_freq: 20
 episode_num: 50
 use_seed: false
 save_freq: 15

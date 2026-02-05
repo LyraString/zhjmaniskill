@@ -28,3 +28,6 @@ envs/curobo/*
 
 /*.json*
 /*.txt
+
+adjust_bottle_args.yaml
+script/run_adjust_bottle_visual.py
