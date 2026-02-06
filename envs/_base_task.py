@@ -741,6 +741,7 @@ class Base_Task(gym.Env):
             return
         if pose is None:
             self.plan_success = False
+            print("left move to pose failed: pose is None")
             return
         if type(pose) == sapien.Pose:
             pose = pose.p.tolist() + pose.q.tolist()
@@ -754,6 +755,7 @@ class Base_Task(gym.Env):
 
         if left_result["status"] != "Success":
             self.plan_success = False
+            print("left move to pose failed: planning was not successful")
             return
 
         return left_result
@@ -774,6 +776,7 @@ class Base_Task(gym.Env):
             return
         if pose is None:
             self.plan_success = False
+            print("right move to pose failed: pose is None")
             return
         if type(pose) == sapien.Pose:
             pose = pose.p.tolist() + pose.q.tolist()
@@ -787,6 +790,7 @@ class Base_Task(gym.Env):
 
         if right_result["status"] != "Success":
             self.plan_success = False
+            print("right move to pose failed: planning was not successful")
             return
 
         return right_result
@@ -809,6 +813,7 @@ class Base_Task(gym.Env):
             return
         if left_target_pose is None or right_target_pose is None:
             self.plan_success = False
+            print("together move to pose failed: left_target_pose or right_target_pose is None")
             return
         if type(left_target_pose) == sapien.Pose:
             left_target_pose = left_target_pose.p.tolist() + left_target_pose.q.tolist()
@@ -831,10 +836,12 @@ class Base_Task(gym.Env):
             right_success = right_result["status"] == "Success"
             if not left_success or not right_success:
                 self.plan_success = False
+                print("together move to pose failed: planning was not successful")
                 # return TODO
         except Exception as e:
             if left_result is None or right_result is None:
                 self.plan_success = False
+                print("together move to pose failed: Error! planning was not successful")
                 return  # TODO
 
         if save_freq != None:

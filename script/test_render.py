@@ -59,6 +59,8 @@ class Sapien_TEST(gym.Env):
             - Set up the basic scene: light source, viewer.
         """
         self.engine = sapien.Engine()
+        # scene = sapien.Scene()
+        # scene.set_timestep(1 / 100.0)
         # declare sapien renderer
         from sapien.render import set_global_config
 
@@ -75,6 +77,12 @@ class Sapien_TEST(gym.Env):
         # declare sapien scene
         scene_config = sapien.SceneConfig()
         self.scene = self.engine.create_scene(scene_config)
+        # viewer = scene.create_viewer()
+        
+        # while not viewer.closed:
+        #     scene.step()
+        #     scene.update_render()
+        #     viewer.render()
 
 
 if __name__ == "__main__":

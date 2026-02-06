@@ -142,10 +142,13 @@ try:
 
             result = self.motion_gen.plan_single(start_joint_states, goal_pose_of_ee, plan_config)
 
+
             # output
             res_result = dict()
             if result.success.item() == False:
                 res_result["status"] = "Fail"
+                error_status=result.status.value
+                raise Exception(f"Planning failed with error status: {error_status}")
                 return res_result
             else:
                 res_result["status"] = "Success"
