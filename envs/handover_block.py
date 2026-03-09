@@ -46,6 +46,25 @@ class handover_block(Base_Task):
         self.add_prohibit_area(self.target_box, padding=0.1)
         self.block_middle_pose = [0, 0.0, 0.9, 0, 1, 0, 0]
 
+    # 在最终放置之前，先将放置臂移动到一个安全的预接近位姿
+    def _get_handover_approach_pose(self, arm_tag: ArmTag):
+        """Build a high, rear-biased pre-approach waypoint before final grasp."""
+        pre_grasp_pose, _ = self.choose_grasp_pose(
+            self.box,
+            arm_tag=arm_tag,
+            pre_dis=0.08,
+            target_dis=0.0,
+            contact_point_id=[4, 5, 6, 7],
+        )
+        if pre_grasp_pose is None:
+            return None
+
+        approach_pose = list(pre_grasp_pose)
+        # Move to a safer waypoint above and slightly behind the pre-grasp pose.
+        approach_pose[2] += 0.10
+        approach_pose[1] -= 0.07
+        return approach_pose
+
     def play_once(self):
         # Determine which arm to use for grasping based on box position
         grasp_arm_tag = ArmTag("left" if self.box.get_pose().p[0] < 0 else "right")
@@ -76,12 +95,17 @@ class handover_block(Base_Task):
                 constrain="free",
             ))
 
+        # 先将放置臂移动到一个安全的预接近位姿
+        approach_pose = self._get_handover_approach_pose(place_arm_tag)
+        if approach_pose is not None:
+            self.move(self.move_to_pose(place_arm_tag, approach_pose))
+
         # Grasp the box again with the other arm (for repositioning)
         self.move(
             self.grasp_actor(
                 self.box,
                 arm_tag=place_arm_tag,
-                pre_grasp_dis=0.07,
+                pre_grasp_dis=0.08,
                 grasp_dis=0.0,
                 contact_point_id=[4, 5, 6, 7],
             ))

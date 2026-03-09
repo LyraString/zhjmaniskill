@@ -133,6 +133,8 @@ try:
             )
             # plan
             plan_config = MotionGenPlanConfig(max_attempts=10)
+            
+            # constraint_pose = None
             if constraint_pose is not None:
                 pose_cost_metric = PoseCostMetric(
                     hold_partial_pose=True,
@@ -141,6 +143,12 @@ try:
                 plan_config.pose_cost_metric = pose_cost_metric
 
             result = self.motion_gen.plan_single(start_joint_states, goal_pose_of_ee, plan_config)
+
+            # copilot一些情况下，Curobo的规划会因为部分位姿约束而失败，此时我们放宽约束再试一次
+            if (constraint_pose is not None and not result.success.item()
+                    and str(result.status.value) == "Invalid partial pose metric"):
+                fallback_config = MotionGenPlanConfig(max_attempts=10)
+                result = self.motion_gen.plan_single(start_joint_states, goal_pose_of_ee, fallback_config)
 
 
             # output

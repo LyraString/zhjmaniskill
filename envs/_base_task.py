@@ -1207,6 +1207,12 @@ class Base_Task(gym.Env):
             target_dis=grasp_dis,
             contact_point_id=contact_point_id,
         )
+        # copilot空位姿不执行动作，直接返回失败
+        if pre_grasp_pose is None or grasp_pose is None:
+            self.plan_success = False
+            print(f"{arm_tag} grasp failed: no valid grasp pose found")
+            return None, []
+
         if pre_grasp_pose == grasp_pose:
             return arm_tag, [
                 Action(arm_tag, "move", target_pose=pre_grasp_pose),
