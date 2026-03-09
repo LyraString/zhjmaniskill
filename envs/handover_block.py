@@ -44,7 +44,7 @@ class handover_block(Base_Task):
 
         self.add_prohibit_area(self.box, padding=0.1)
         self.add_prohibit_area(self.target_box, padding=0.1)
-        self.block_middle_pose = [0, 0.0, 0.9, 0, 1, 0, 0]
+        self.block_middle_pose = [0, 0.1, 0.9, 0, 1, 0, 0]
 
     # 在最终放置之前，先将放置臂移动到一个安全的预接近位姿
     def _get_handover_approach_pose(self, arm_tag: ArmTag):
@@ -76,13 +76,13 @@ class handover_block(Base_Task):
             self.grasp_actor(
                 self.box,
                 arm_tag=grasp_arm_tag,
-                pre_grasp_dis=0.07,
+                pre_grasp_dis=0.08,
                 grasp_dis=0.0,
                 contact_point_id=[0, 1, 2, 3],
             ))
         # Lift the box up
         self.move(self.move_by_displacement(grasp_arm_tag, z=0.1))
-        # Place the box at initial position [0, 0., 0.9, 0, 1, 0, 0]
+        # Place the box at initial position [0, 0., 0.9, 0, 1, 0, 0] -> [0, 0.1, 0.9, 0, 1, 0, 0]
         self.move(
             self.place_actor(
                 self.box,
