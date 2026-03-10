@@ -116,8 +116,10 @@ class handover_block(Base_Task):
         # Perform two actions simultaneously:
         # 1. Return the original arm to its origin position
         # 2. Place the box at the target's functional point with precise alignment
+        # 首先将原来抓取的机械臂移回原点位置，避免干扰放置动作
+        self.move(self.back_to_origin(grasp_arm_tag))
+        # 然后将放置臂移动到目标位置进行放置，要求与目标功能点对齐
         self.move(
-            self.back_to_origin(grasp_arm_tag),
             self.place_actor(
                 self.box,
                 target_pose=self.target_box.get_functional_point(1, "pose"),

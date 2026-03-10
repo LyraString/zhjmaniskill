@@ -207,7 +207,11 @@ class Base_Task(gym.Env):
         from sapien.render import set_global_config
 
         set_global_config(max_num_materials=50000, max_num_textures=50000)
-        self.renderer = sapien.SapienRenderer()
+        # self.renderer = sapien.SapienRenderer()
+        # Explicitly bind Vulkan renderer to the same GPU as CUDA (respects CUDA_VISIBLE_DEVICES).
+        # Inside the process, cuda:0 always maps to whatever physical GPU is first in
+        # CUDA_VISIBLE_DEVICES, so this keeps compute and rendering on the same device.
+        self.renderer = sapien.SapienRenderer(device="cuda:0")
         # give renderer to sapien sim
         self.engine.set_renderer(self.renderer)
 
