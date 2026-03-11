@@ -112,22 +112,38 @@ class handover_block(Base_Task):
         # Open the original grasping arm's gripper
         self.move(self.open_gripper(grasp_arm_tag))
         # Move the original arm up to release the box
-        self.move(self.move_by_displacement(grasp_arm_tag, z=0.1, move_axis="arm"))
+        self.move(self.move_by_displacement(grasp_arm_tag, z=0.12, move_axis="arm"))
         # Perform two actions simultaneously:
         # 1. Return the original arm to its origin position
         # 2. Place the box at the target's functional point with precise alignment
-        # 首先将原来抓取的机械臂移回原点位置，避免干扰放置动作
+        # 将原来抓取的机械臂移回原点位置
         self.move(self.back_to_origin(grasp_arm_tag))
-        # 然后将放置臂移动到目标位置进行放置，要求与目标功能点对齐
+
+        # 在 place_actor 之前，先将放置臂移至 blue pad 正上方约 20cm 处。
+        # 目的：让 IK 在较高位置时解算出 "wrist up" 构型；
+        #       随后下降时保持该构型，避免 wrist_1_link 碰桌面。
+        target_fp_pose = self.target_box.get_functional_point(1, "pose")
+        current_ee = np.array(self.get_arm_pose(place_arm_tag))
+        above_target = current_ee.copy()
+        above_target[0] = float(target_fp_pose.p[0] + 0.05) # x方向，沿着桌面长端指向右臂
+        above_target[1] = float(target_fp_pose.p[1] - 0.12) # y方向，沿着桌面短端指向双臂前方
+        above_target[2] = float(target_fp_pose.p[2]) + 0.20
+        self.move(self.move_to_pose(place_arm_tag, above_target))
+
+        # 使用 constrain="free" 保持当前末端朝向不变，避免额外旋转引发构型跳变。
+        # pre_dis_axis="fp" 从正上方接近，pre_dis=0.05 在最终位置 5cm 上方预备。
+
+        # target_fp_pose.p[1] = target_fp_pose.p[1] - 0.08
+        
         self.move(
             self.place_actor(
                 self.box,
-                target_pose=self.target_box.get_functional_point(1, "pose"),
+                target_pose=target_fp_pose,
                 arm_tag=place_arm_tag,
                 functional_point_id=0,
                 pre_dis=0.05,
                 dis=0.,
-                constrain="align",
+                constrain="free",
                 pre_dis_axis="fp",
             ),
         )

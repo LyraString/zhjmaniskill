@@ -75,7 +75,7 @@ try:
                 self.yml_path,
                 world_config,
                 interpolation_dt=1 / 250,
-                num_trajopt_seeds=1,
+                num_trajopt_seeds=4,
             )
 
             self.motion_gen = MotionGen(motion_gen_config)
@@ -84,7 +84,7 @@ try:
                 self.yml_path,
                 world_config,
                 interpolation_dt=1 / 250,
-                num_trajopt_seeds=1,
+                num_trajopt_seeds=4,
                 num_graph_seeds=1,
             )
             self.motion_gen_batch = MotionGen(motion_gen_config)
