@@ -76,12 +76,13 @@ class handover_block(Base_Task):
             self.grasp_actor(
                 self.box,
                 arm_tag=grasp_arm_tag,
-                pre_grasp_dis=0.08,
+                pre_grasp_dis=0.09,
                 grasp_dis=0.0,
                 contact_point_id=[0, 1, 2, 3],
             ))
         # Lift the box up
         self.move(self.move_by_displacement(grasp_arm_tag, z=0.1))
+
         # Place the box at initial position [0, 0., 0.9, 0, 1, 0, 0] -> [0, 0.1, 0.9, 0, 1, 0, 0]
         self.move(
             self.place_actor(
@@ -95,7 +96,7 @@ class handover_block(Base_Task):
                 constrain="free",
             ))
 
-        # 先将放置臂移动到一个安全的预接近位姿
+        # 右臂从右侧高位移到交接点的预接近位姿
         approach_pose = self._get_handover_approach_pose(place_arm_tag)
         if approach_pose is not None:
             self.move(self.move_to_pose(place_arm_tag, approach_pose))
@@ -109,16 +110,14 @@ class handover_block(Base_Task):
                 grasp_dis=0.0,
                 contact_point_id=[4, 5, 6, 7],
             ))
+    
         # Open the original grasping arm's gripper
         self.move(self.open_gripper(grasp_arm_tag))
         # Move the original arm up to release the box
         self.move(self.move_by_displacement(grasp_arm_tag, z=0.12, move_axis="arm"))
-        # Perform two actions simultaneously:
-        # 1. Return the original arm to its origin position
-        # 2. Place the box at the target's functional point with precise alignment
         # 将原来抓取的机械臂移回原点位置
         self.move(self.back_to_origin(grasp_arm_tag))
-
+    
         # 在 place_actor 之前，先将放置臂移至 blue pad 正上方约 20cm 处。
         # 目的：让 IK 在较高位置时解算出 "wrist up" 构型；
         #       随后下降时保持该构型，避免 wrist_1_link 碰桌面。
@@ -139,11 +138,12 @@ class handover_block(Base_Task):
             self.place_actor(
                 self.box,
                 target_pose=target_fp_pose,
+                # target_pose=self.target_box.get_pose(),
                 arm_tag=place_arm_tag,
                 functional_point_id=0,
-                pre_dis=0.05,
+                pre_dis=0.08,
                 dis=0.,
-                constrain="free",
+                constrain="align",
                 pre_dis_axis="fp",
             ),
         )
