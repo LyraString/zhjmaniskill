@@ -6,6 +6,7 @@ expert_data_num=${3}
 seed=${4}
 action_dim=${5}
 gpu_id=${6}
+resume_ckpt_path=${7:-null}  # 可选：指定恢复训练的 checkpoint 路径，例如 checkpoints/handover_block-demo_clean-50-42/300.ckpt
 
 head_camera_type=D435
 
@@ -49,6 +50,7 @@ python train.py --config-name=${config_name}.yaml \
                             logging.mode=${wandb_mode} \
                             setting=${task_config} \
                             expert_data_num=${expert_data_num} \
-                            head_camera_type=$head_camera_type
+                            head_camera_type=$head_camera_type \
+                            training.resume_ckpt_path=${resume_ckpt_path}
                             # checkpoint.save_ckpt=${save_ckpt}
                             # hydra.run.dir=${run_dir} \

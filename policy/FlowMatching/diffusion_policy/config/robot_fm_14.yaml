@@ -85,6 +85,7 @@ training:
   seed: 42
   debug: False
   resume: True
+  resume_ckpt_path: null  # 指定恢复训练的 checkpoint 路径，null 表示自动查找 latest.ckpt
   # 优化器设置
   lr_scheduler: cosine
   lr_warmup_steps: 500

@@ -62,10 +62,22 @@ class RobotWorkspace(BaseWorkspace):
 
         # resume training
         if cfg.training.resume:
-            lastest_ckpt_path = self.get_checkpoint_path()
-            if lastest_ckpt_path.is_file():
-                print(f"Resuming from checkpoint {lastest_ckpt_path}")
-                self.load_checkpoint(path=lastest_ckpt_path)
+            # lastest_ckpt_path = self.get_checkpoint_path()
+            # if lastest_ckpt_path.is_file():
+            #     print(f"Resuming from checkpoint {lastest_ckpt_path}")
+            #     self.load_checkpoint(path=lastest_ckpt_path)
+            resume_ckpt_path = cfg.training.get("resume_ckpt_path", None)
+            if resume_ckpt_path is not None:
+                ckpt_path = pathlib.Path(resume_ckpt_path)
+                if not ckpt_path.is_file():
+                    raise FileNotFoundError(f"Specified resume checkpoint not found: {ckpt_path}")
+                print(f"Resuming from specified checkpoint {ckpt_path}")
+                self.load_checkpoint(path=ckpt_path)
+            else:
+                lastest_ckpt_path = self.get_checkpoint_path()
+                if lastest_ckpt_path.is_file():
+                    print(f"Resuming from checkpoint {lastest_ckpt_path}")
+                    self.load_checkpoint(path=lastest_ckpt_path)
 
         # configure dataset
         dataset: BaseImageDataset
