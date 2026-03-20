@@ -1,0 +1,186 @@
+defaults:
+  - _self_
+  - task: default_task_14
+
+name: robot_fpo_${task.name}
+_target_: diffusion_policy.workspace.fpo_robotworkspace.RobotWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "default"
+
+horizon: 8
+n_obs_steps: 3
+n_action_steps: 6
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+past_action_visible: False
+keypoint_visible_rate: 1.0
+obs_as_global_cond: True
+
+policy:
+  _target_: diffusion_policy.policy.FPO_image_policy.FPOImagePolicy
+
+  shape_meta: ${shape_meta}
+  
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.multi_image_obs_encoder.MultiImageObsEncoder
+    shape_meta: ${shape_meta}
+    rgb_model:
+      _target_: diffusion_policy.model.vision.model_getter.get_resnet
+      name: resnet18
+      weights: null
+    resize_shape: null
+    crop_shape: null
+    # 恒定中心裁剪
+    random_crop: True
+    use_group_norm: True
+    share_rgb_model: False
+    imagenet_norm: True
+
+  horizon: ${horizon}
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 10  # ODE 积分步数（比 DDPM 少得多！）
+  obs_as_global_cond: ${obs_as_global_cond}
+  diffusion_step_embed_dim: 128
+  down_dims: [256, 512, 1024]
+  kernel_size: 5
+  n_groups: 8
+  cond_predict_scale: True
+  sigma_min: 0.0  # 用于稳定性的最小噪声水平
+  ode_solver: euler  # 'euler' 或 'rk4'（RK4 更精确但更慢）
+
+  discretize_t_for_training: True
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 64
+  num_workers: 0
+  shuffle: True
+  pin_memory: True
+  persistent_workers: False
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 0
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+critic:
+  _target_: diffusion_policy.model.rl.value_mlp.CriticMLP
+  input_dim: 1578
+  hidden_dims: [256, 256]
+
+critic_optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  resume_ckpt_path: null  # 指定恢复训练的 checkpoint 路径，null 表示自动查找 latest.ckpt
+  # 优化器设置
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 3000
+  gradient_accumulate_every: 2
+  # EMA 与 BatchNorm 一起使用会降低性能
+  # 用 GroupNorm 替换 BatchNorm
+  use_ema: True
+  freeze_encoder: False
+  # 训练循环控制
+  # 单位：轮次（epochs）
+  rollout_every: 50
+  checkpoint_every: 100
+  val_every: 1
+  sample_every: 5
+  # 每轮步数
+  max_train_steps: null
+  max_val_steps: null
+  # 其他
+  tqdm_interval_sec: 1.0
+  #RL 相关
+  gamma: 0.99
+  lmbda: 0.99
+  clip_coef: 0.05
+  timesteps_per_batch: 4800
+  max_timesteps_per_episode: 1600
+  n_updates_per_iteration: 5
+  num_fpo_samples: 8
+  online_iters: 1000
+  average_losses_before_exp: True
+  rho_clip: 3.0
+  rho_min: 1.0e-6
+  rho_max: 1.0e6
+  num_minibatches: 4
+  max_grad_norm: 1.0
+  value_loss_coeff: 0.25
+  loss_mode: fpo
+  final_steps_only: False
+  # GAE
+  reward_scaling: 1.0
+  discounting: 1.0
+
+logging:
+  project: FPO_policy_debug
+  resume: True
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}", "FPO"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: test_mean_score
+    mode: max
+    k: 5
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+# 输出目录配置：
+# 选项1（当前）：基于时间戳，每次运行创建新目录 - 无法自动恢复训练
+# 选项2（推荐）：基于任务名和seed，相同配置使用相同目录 - 可自动恢复训练
+#   修改方法：将下面的 ${now:...} 替换为 ${name}_${task_name}_seed${training.seed}
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  # run_dir: data/outputs/${name}_${task_name}_seed${training.seed}  # 取消注释此行并注释上一行以启用自动恢复
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  # wandb_name_base: ${name}_${task_name}_seed${training.seed}  # 取消注释此行并注释上一行
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    # dir: data/outputs/${name}_${task_name}_seed${training.seed}  # 取消注释此行并注释上一行以启用自动恢复
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    # dir: data/outputs/${name}_${task_name}_seed${training.seed}  # 取消注释此行并注释上一行
+    subdir: ${hydra.job.num}
+
+setting: null
+expert_data_num: null
+head_camera_type: null

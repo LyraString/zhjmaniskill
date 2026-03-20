@@ -4,7 +4,8 @@ if __name__ == "__main__":
     import pathlib
 
     ROOT_DIR = str(pathlib.Path(__file__).parent.parent.parent)
-    sys.path.append(ROOT_DIR)
+    # sys.path.append(ROOT_DIR)
+    sys.path.insert(0, ROOT_DIR)
     os.chdir(ROOT_DIR)
 
 import os
@@ -144,6 +145,10 @@ class RobotWorkspace(BaseWorkspace):
 
         # save batch for sampling
         train_sampling_batch = None
+        fpo_checks_done = True
+        fpo_smoke_status = None
+        fpo_repro_status = None
+        fpo_smoke_cfm_loss_mean = None
 
         if cfg.training.debug:
             cfg.training.num_epochs = 2
@@ -176,6 +181,29 @@ class RobotWorkspace(BaseWorkspace):
                         batch = dataset.postprocess(batch, device)
                         if train_sampling_batch is None:
                             train_sampling_batch = batch
+
+                        # one-time FPO checks on the first train batch
+                        if (not fpo_checks_done) and hasattr(self.model, "run_fpo_forward_smoke_test") and hasattr(self.model, "run_fpo_reproducibility_check"):
+                            smoke_info = self.model.run_fpo_forward_smoke_test(
+                                batch=batch,
+                                num_fpo_samples=4,
+                                batch_size=min(2, batch["action"].shape[0]),
+                            )
+                            repro_info = self.model.run_fpo_reproducibility_check(
+                                batch=batch,
+                                num_fpo_samples=4,
+                                seed=seed,
+                                batch_size=min(2, batch["action"].shape[0]),
+                                atol=0.0,
+                                rtol=0.0,
+                            )
+                            print(f"[FPO CHECK] smoke test passed: {smoke_info}")
+                            print(f"[FPO CHECK] reproducibility passed: {repro_info}")
+                            fpo_smoke_status = smoke_info.get("status", "unknown")
+                            fpo_repro_status = repro_info.get("status", "unknown")
+                            fpo_smoke_cfm_loss_mean = smoke_info.get("cfm_loss_mean", None)
+                            fpo_checks_done = True
+
                         # compute loss
                         raw_loss = self.model.compute_loss(batch)
                         loss = raw_loss / cfg.training.gradient_accumulate_every
@@ -201,6 +229,12 @@ class RobotWorkspace(BaseWorkspace):
                             "epoch": self.epoch,
                             "lr": lr_scheduler.get_last_lr()[0],
                         }
+                        if fpo_smoke_status is not None:
+                            step_log["fpo_smoke_status"] = fpo_smoke_status
+                        if fpo_repro_status is not None:
+                            step_log["fpo_repro_status"] = fpo_repro_status
+                        if fpo_smoke_cfm_loss_mean is not None:
+                            step_log["fpo_smoke_cfm_loss_mean"] = fpo_smoke_cfm_loss_mean
 
                         is_last_batch = batch_idx == (len(train_dataloader) - 1)
                         if not is_last_batch:
