@@ -451,7 +451,7 @@ class FPOImagePolicy(BaseImagePolicy):
             return loss.mean()
 
     # 采样动作 + 产出FPO训练所需信息
-    def sample_action_with_info(self, obs_dict: Dict[str, torch.Tensor], num_fpo_samples, loss_mode="fpo", final_steps_only=False):
+    def sample_action_with_info(self, obs_dict: Dict[str, torch.Tensor], num_fpo_samples):
         N = int(num_fpo_samples)
         conds_dict = self.build_condition_from_obs(obs_dict)
         cond_data, cond_mask, local_cond, global_cond = conds_dict["cond_data"], conds_dict["cond_mask"], conds_dict["local_cond"], conds_dict["global_cond"]

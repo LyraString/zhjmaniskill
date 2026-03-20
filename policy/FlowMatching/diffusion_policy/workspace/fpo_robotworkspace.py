@@ -457,9 +457,6 @@ class RobotWorkspace(BaseWorkspace):
         num_fpo_samples = int(cfg_t.num_fpo_samples)
         reward_scaling = float(getattr(cfg_t, "reward_scaling", 1.0))
 
-        loss_mode = str(getattr(cfg_t, "loss_mode", "fpo"))
-        final_steps_only = bool(getattr(cfg_t, "final_steps_only", False))
-
         # 给GAE的episode-wise数据
         batch_rews = []
         batch_vals = []
@@ -501,8 +498,6 @@ class RobotWorkspace(BaseWorkspace):
                     out = self.model.sample_action_with_info(
                         obs_input,
                         num_fpo_samples=num_fpo_samples,
-                        loss_mode=loss_mode,
-                        final_steps_only=final_steps_only,
                     )
                     critic_in = self._build_critic_input_from_obs(obs_input)   # [1, D]
                     v = self.critic(critic_in).squeeze(-1)                     # [1]
@@ -528,14 +523,9 @@ class RobotWorkspace(BaseWorkspace):
 
                 flat_critic_obs.append(critic_in.squeeze(0).detach().cpu())                     # [D]
                 flat_action_target.append(out["action_pred"].squeeze(0).detach().cpu())         # [T, Da]
-                if loss_mode == "fpo":
-                    flat_loss_eps.append(out["loss_eps"].squeeze(0).detach().cpu())                 # [N, T, Da]
-                    flat_loss_t.append(out["loss_t"].squeeze(0).detach().cpu())                     # [N]
-                    flat_init_cfm_loss.append(out["initial_cfm_loss"].squeeze(0).detach().cpu())    # [N]
-                elif loss_mode == "denoising_mdp":
-                    pass
-                else:
-                    raise ValueError(f"Unknown loss_mode: {loss_mode}")
+                flat_loss_eps.append(out["loss_eps"].squeeze(0).detach().cpu())                 # [N, T, Da]
+                flat_loss_t.append(out["loss_t"].squeeze(0).detach().cpu())                     # [N]
+                flat_init_cfm_loss.append(out["initial_cfm_loss"].squeeze(0).detach().cpu())    # [N]
 
                 flat_cond_data.append(conds["cond_data"].squeeze(0).detach().cpu())             # [T, Da]
                 flat_cond_mask.append(conds["cond_mask"].squeeze(0).detach().cpu())             # [T, Da]
@@ -580,14 +570,9 @@ class RobotWorkspace(BaseWorkspace):
             "batch_bootstrap_values": batch_bootstrap_values,
         }
 
-        if loss_mode == "fpo":
-            rollout["loss_eps"] = torch.stack(flat_loss_eps, dim=0)
-            rollout["loss_t"] = torch.stack(flat_loss_t, dim=0)
-            rollout["initial_cfm_loss"] = torch.stack(flat_init_cfm_loss, dim=0)
-        elif loss_mode == "denoising_mdp":
-            pass
-        else:
-            raise ValueError(f"Unknown loss_mode: {loss_mode}")
+        rollout["loss_eps"] = torch.stack(flat_loss_eps, dim=0)
+        rollout["loss_t"] = torch.stack(flat_loss_t, dim=0)
+        rollout["initial_cfm_loss"] = torch.stack(flat_init_cfm_loss, dim=0)
 
         return rollout
 
@@ -600,7 +585,6 @@ class RobotWorkspace(BaseWorkspace):
         n_updates = int(cfg_t.n_updates_per_iteration)
         max_grad_norm = float(getattr(cfg_t, "max_grad_norm", 1.0))
         value_loss_coeff = float(getattr(cfg_t, "value_loss_coeff", 0.25))
-        loss_mode = str(getattr(cfg_t, "loss_mode", "fpo"))
 
         avg_before_exp = bool(getattr(cfg_t, "average_losses_before_exp", True))
         rho_clip = float(getattr(cfg_t, "rho_clip", 3.0))
@@ -627,10 +611,9 @@ class RobotWorkspace(BaseWorkspace):
 
         critic_obs = rollout["critic_obs"].to(device)            # [S, D]
         action_target = rollout["action_target"].to(device)      # [S, T, Da]
-        if loss_mode == "fpo":
-            loss_eps = rollout["loss_eps"].to(device)                # [S, N, T, Da]
-            loss_t = rollout["loss_t"].to(device)                    # [S, N]
-            init_loss = rollout["initial_cfm_loss"].to(device)       # [S, N]
+        loss_eps = rollout["loss_eps"].to(device)                # [S, N, T, Da]
+        loss_t = rollout["loss_t"].to(device)                    # [S, N]
+        init_loss = rollout["initial_cfm_loss"].to(device)       # [S, N]
         cond_data = rollout["cond_data"].to(device)              # [S, T, Da]
         cond_mask = rollout["cond_mask"].to(device)              # [S, T, Da]
         global_cond = rollout["global_cond"].to(device)          # [S, D]
@@ -688,34 +671,25 @@ class RobotWorkspace(BaseWorkspace):
                     "global_cond": flat_global,
                 }
 
-                if loss_mode == "fpo":
-                    curr = self.model.compute_cfm_loss_with_fixed_noise_t(
-                        postdict,
-                        flat_action,
-                        flat_eps,
-                        flat_t,
-                        return_per_sample=True,
-                        postdict=True,
-                    )  # [B*N]
+                curr = self.model.compute_cfm_loss_with_fixed_noise_t(
+                    postdict,
+                    flat_action,
+                    flat_eps,
+                    flat_t,
+                    return_per_sample=True,
+                    postdict=True,
+                )  # [B*N]
 
-                    diff = (flat_init - curr).reshape(B, N)               # [B, N]
-                    # diff_clip = torch.clamp(diff, -3.0, 3.0)
-                    # rho = torch.exp(torch.clamp(diff_clip.mean(dim=1), -3.0, 3.0))  # [B]
+                diff = (flat_init - curr).reshape(B, N)               # [B, N]
 
-                    if avg_before_exp:
-                        rho = torch.exp(diff.mean(dim=1))   # 先均值后指数
-                    else:
-                        rho = torch.exp(torch.clamp(diff, -rho_clip, rho_clip)).mean(dim=1)  # 逐样本clip后指数再聚合
-
-                    rho = torch.clamp(rho, rho_min, rho_max)
-
-                    cfm_diffs.append(float(diff.mean().item()))
-
-                elif loss_mode == "denoising_mdp":
-                    raise NotImplementedError("denoising_mdp path not implemented yet")
-                
+                if avg_before_exp:
+                    rho = torch.exp(diff.mean(dim=1))   # 先均值后指数
                 else:
-                    raise ValueError(f"Unknown loss_mode: {loss_mode}")
+                    rho = torch.exp(torch.clamp(diff, -rho_clip, rho_clip)).mean(dim=1)  # 逐样本clip后指数再聚合
+
+                rho = torch.clamp(rho, rho_min, rho_max)
+
+                cfm_diffs.append(float(diff.mean().item()))
 
                 clipped_frac = (torch.abs(rho - 1.0) > clip_coef).float().mean()
                 clipped_ratio_fracs.append(float(clipped_frac.item()))
