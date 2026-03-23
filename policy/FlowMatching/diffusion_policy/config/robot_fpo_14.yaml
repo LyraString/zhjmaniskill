@@ -139,6 +139,10 @@ training:
   # GAE
   reward_scaling: 1.0
   discounting: 1.0
+  # 并行训练
+  num_envs: 2
+  vec_env_start_mode: spawn
+  vec_env_timeout_sec: 120
 
 logging:
   project: FPO_policy_debug
