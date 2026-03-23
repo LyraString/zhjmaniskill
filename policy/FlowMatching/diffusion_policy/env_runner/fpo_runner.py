@@ -54,12 +54,21 @@ class FPORunner:
         if str(robotwin_root) not in sys.path:
             sys.path.insert(0, str(robotwin_root))
 
-        from envs import CONFIGS_PATH
+        # 记录当前工作目录并更改
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(str(robotwin_root))
 
-        # 读取task_config
-        task_cfg_path = os.path.join(str(robotwin_root), "task_config", f"{self.setting}.yml")
-        with open(task_cfg_path, "r", encoding="utf-8") as f:
-            args = yaml.safe_load(f)
+            from envs import CONFIGS_PATH
+
+            # 读取task_config
+            task_cfg_path = os.path.join(str(robotwin_root), "task_config", f"{self.setting}.yml")
+            with open(task_cfg_path, "r", encoding="utf-8") as f:
+                args = yaml.safe_load(f)
+
+            self._args = args
+        finally:
+            os.chdir(prev_cwd)
 
         # 覆盖参数
         args["task_name"] = self.task_name
@@ -81,6 +90,11 @@ class FPORunner:
             robot_file = emb_types[emb_name]["file_path"]
             if robot_file is None:
                 raise ValueError("No embodiment file")
+            
+            robot_file = Path(robot_file)
+            if not robot_file.is_absolute():
+                robot_file = (robotwin_root / robot_file).resolve()
+
             return robot_file
         
         if len(embodiment_type) == 1:

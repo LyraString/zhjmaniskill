@@ -9,8 +9,11 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import os
+import io
+import contextlib
 import hydra
 import torch
+from torch.utils.tensorboard import SummaryWriter
 from omegaconf import OmegaConf
 import pathlib
 from torch.utils.data import DataLoader
@@ -35,6 +38,41 @@ from diffusion_policy.env_runner.fpo_runner import FPORunner
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
+# --------------------------------新增开始--------------------------------
+@contextlib.contextmanager
+def _maybe_suppress_stdout(enabled: bool):
+    if enabled:
+        with contextlib.redirect_stdout(io.StringIO()):
+            yield
+    else:
+        yield
+
+
+def _safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _format_online_progress(it, total, step_log):
+    iter_idx = int(it) + 1
+    total_iters = int(total)
+
+    mean_reward = _safe_float(step_log.get("mean_reward", 0.0))
+    mean_ep_len = _safe_float(step_log.get("mean_ep_len", 0.0))
+    actor_loss = _safe_float(step_log.get("actor_loss", 0.0))
+    critic_loss = _safe_float(step_log.get("critic_loss", 0.0))
+    rho_mean = _safe_float(step_log.get("rho_mean", 0.0))
+    clipped_ratio_frac = _safe_float(step_log.get("clipped_ratio_frac", 0.0))
+
+    return (
+        f"[online_fpo] iter {iter_idx}/{total_iters} | "
+        f"reward={mean_reward:.4f} ep_len={mean_ep_len:.2f} | "
+        f"actor={actor_loss:.4f} critic={critic_loss:.4f} | "
+        f"rho={rho_mean:.4f} clip_frac={clipped_ratio_frac:.4f}"
+    )
+# --------------------------------新增结束--------------------------------
 
 class RobotWorkspace(BaseWorkspace):
     include_keys = ["global_step", "epoch"]
@@ -175,6 +213,11 @@ class RobotWorkspace(BaseWorkspace):
 
         # training loop
         log_path = os.path.join(self.output_dir, "logs.json.txt")
+        tb_enabled = bool(getattr(cfg.logging, "tensorboard", {}).get("enabled", True))
+        tb_log_every = int(getattr(cfg.logging, "tensorboard", {}).get("log_every", 1))
+        tb_flush_secs = int(getattr(cfg.logging, "tensorboard", {}).get("flush_secs", 10))
+        tb_dir = os.path.join(self.output_dir, "tensorboard")
+        tb_writer = SummaryWriter(log_dir=tb_dir, flush_secs=tb_flush_secs) if tb_enabled else None
 
         # # 离线训练部分
         # with JsonLogger(log_path) as json_logger:
@@ -346,32 +389,67 @@ class RobotWorkspace(BaseWorkspace):
 
         try:
             with JsonLogger(log_path) as json_logger:
-                for it in range(cfg.training.online_iters):
-                    self.model.train()
-                    self.critic.train()
+                online_iters = int(cfg.training.online_iters)
+                with tqdm.tqdm(
+                    range(online_iters),
+                    desc="FPO Training",
+                    dynamic_ncols=True,
+                    mininterval=float(getattr(cfg.training, "tqdm_interval_sec", 1.0)),
+                    leave=True,
+                ) as pbar:
+                    for it in pbar:
+                        self.model.train()
+                        self.critic.train()
 
-                    rollout = self.collect_rollout(env, device)
-                    update_log = self.update_fpo_from_rollout(rollout, device)
+                        rollout = self.collect_rollout(env, device)
+                        update_log = self.update_fpo_from_rollout(rollout, device)
 
-                    step_log = {
-                        "iter": it,
-                        "global_step": self.global_step,
-                        **update_log,
-                        "mean_reward": rollout["reward_mean"],
-                        "mean_ep_len": rollout["ep_len_mean"],
-                    }
+                        step_log = {
+                            "iter": it,
+                            "iter_total": online_iters,
+                            "global_step": self.global_step,
+                            **update_log,
+                            "mean_reward": rollout["reward_mean"],
+                            "mean_ep_len": rollout["ep_len_mean"],
+                        }
 
-                    if cfg.training.use_ema:
-                        ema.step(self.model)
-                    
-                    if ((it + 1) % cfg.training.checkpoint_every) == 0:
-                        save_name = "online_fpo"
-                        self.save_checkpoint(f"checkpoints/{save_name}-{seed}/{self.epoch}-{it}.ckpt") 
-                    
-                    json_logger.log(step_log)
-                    self.global_step += 1
+                        if cfg.training.use_ema:
+                            ema.step(self.model)
+                        
+                        if ((it + 1) % cfg.training.checkpoint_every) == 0:
+                            save_name = "online_fpo"
+                            self.save_checkpoint(f"checkpoints/{save_name}-{seed}/{self.epoch}-{it}.ckpt") 
+
+                        progress_line = _format_online_progress(it, online_iters, step_log)
+                        pbar.set_postfix({
+                            "rew": f"{_safe_float(step_log['mean_reward']):.3f}",
+                            "ep": f"{_safe_float(step_log['mean_ep_len']):.1f}",
+                            "actor": f"{_safe_float(step_log['actor_loss']):.3f}",
+                            "critic": f"{_safe_float(step_log['critic_loss']):.3f}",
+                            "rho": f"{_safe_float(step_log['rho_mean']):.3f}",
+                        })
+
+                        if (tb_writer is not None) and (((it + 1) % max(1, tb_log_every)) == 0):
+                            tb_step = int(self.global_step)
+                            tb_writer.add_scalar("online/mean_reward", _safe_float(step_log["mean_reward"]), tb_step)
+                            tb_writer.add_scalar("online/mean_ep_len", _safe_float(step_log["mean_ep_len"]), tb_step)
+                            tb_writer.add_scalar("online/actor_loss", _safe_float(step_log["actor_loss"]), tb_step)
+                            tb_writer.add_scalar("online/critic_loss", _safe_float(step_log["critic_loss"]), tb_step)
+                            tb_writer.add_scalar("online/rho_mean", _safe_float(step_log["rho_mean"]), tb_step)
+                            tb_writer.add_scalar("online/cfm_diff_mean", _safe_float(step_log["cfm_diff_mean"]), tb_step)
+                            tb_writer.add_scalar("online/clipped_ratio_frac", _safe_float(step_log["clipped_ratio_frac"]), tb_step)
+                            tb_writer.add_scalar("online/iter", float(it), tb_step)
+
+                        tqdm.tqdm.write(progress_line)
+                        
+                        json_logger.log(step_log)
+                        self.global_step += 1
+                tqdm.tqdm.write("[online_fpo] training finished")
         
         finally:
+            if tb_writer is not None:
+                tb_writer.flush()
+                tb_writer.close()
             env.close()
 
     # 提取历史观测并堆叠成一个新的观测字典
@@ -451,6 +529,9 @@ class RobotWorkspace(BaseWorkspace):
     
     def collect_rollout(self, env, device):
         cfg_t = self.cfg.training
+        suppress_env_step_print = bool(getattr(cfg_t, "suppress_env_step_print", True))
+        show_rollout_tqdm = bool(getattr(cfg_t, "show_rollout_tqdm", True))
+        rollout_tqdm_interval = float(getattr(cfg_t, "rollout_tqdm_interval_sec", 1.0))
         target_steps = int(cfg_t.timesteps_per_batch)
         max_ep_steps = int(cfg_t.max_timesteps_per_episode)
         n_obs_steps = int(self.cfg.n_obs_steps)
@@ -476,78 +557,98 @@ class RobotWorkspace(BaseWorkspace):
 
         steps = 0
         obs_hist = deque(maxlen=n_obs_steps)
+        # --------------------------------新增开始--------------------------------
+        rollout_pbar = None
+        if show_rollout_tqdm:
+            rollout_pbar = tqdm.tqdm(
+                total=target_steps,
+                desc="Rollout",
+                dynamic_ncols=True,
+                leave=False,
+                mininterval=rollout_tqdm_interval,
+                position=1,
+            )
 
-        while steps < target_steps:
-            obs, _ = env.reset()
-            obs_hist.clear()
-            obs_hist.append(obs)
+        try:
+            while steps < target_steps:
+                with _maybe_suppress_stdout(suppress_env_step_print):
+                    obs, _ = env.reset()
+                obs_hist.clear()
+                obs_hist.append(obs)
 
-            ep_rews = []
-            ep_vals = []
-            ep_dones = []
-            ep_truncs = []
-            ep_discounts = []
-            done = False
-            ep_step = 0
+                ep_rews = []
+                ep_vals = []
+                ep_dones = []
+                ep_truncs = []
+                ep_discounts = []
+                done = False
+                ep_step = 0
 
-            while (not done) and (ep_step < max_ep_steps) and (steps < target_steps):
-                obs_to = self._stack_last_n_obs(obs_hist, n_obs_steps)
-                obs_input = self._obs_to_policy_input(obs_to, device)
+                while (not done) and (ep_step < max_ep_steps) and (steps < target_steps):
+                    obs_to = self._stack_last_n_obs(obs_hist, n_obs_steps)
+                    obs_input = self._obs_to_policy_input(obs_to, device)
 
+                    with torch.no_grad():
+                        out = self.model.sample_action_with_info(
+                            obs_input,
+                            num_fpo_samples=num_fpo_samples,
+                        )
+                        critic_in = self._build_critic_input_from_obs(obs_input)   # [1, D]
+                        v = self.critic(critic_in).squeeze(-1)                     # [1]
+
+                        # 供后续compute_cfm_loss_with_fixed_noise_t(postdict=True)
+                        conds = self.model.build_condition_from_obs(obs_input)
+
+                    # 执行动作：默认取第一个动作
+                    # out["action"]: [1, Ta, Da]
+                    env_action = out["action"][0, 0].detach().cpu().numpy()
+
+                    with _maybe_suppress_stdout(suppress_env_step_print):
+                        next_obs, rew, terminated, truncated, _ = env.step(env_action)
+                    done = bool(terminated or truncated)
+
+                    trunc = float(truncated)
+                    discount = 0.0 if bool(terminated) else 1.0
+                    ep_truncs.append(trunc)
+                    ep_discounts.append(discount)
+
+                    ep_rews.append(float(rew) * reward_scaling)
+                    ep_vals.append(float(v.item()))
+                    ep_dones.append(float(done))
+
+                    flat_critic_obs.append(critic_in.squeeze(0).detach().cpu())                     # [D]
+                    flat_action_target.append(out["action_pred"].squeeze(0).detach().cpu())         # [T, Da]
+                    flat_loss_eps.append(out["loss_eps"].squeeze(0).detach().cpu())                 # [N, T, Da]
+                    flat_loss_t.append(out["loss_t"].squeeze(0).detach().cpu())                     # [N]
+                    flat_init_cfm_loss.append(out["initial_cfm_loss"].squeeze(0).detach().cpu())    # [N]
+
+                    flat_cond_data.append(conds["cond_data"].squeeze(0).detach().cpu())             # [T, Da]
+                    flat_cond_mask.append(conds["cond_mask"].squeeze(0).detach().cpu())             # [T, Da]
+                    flat_global_cond.append(conds["global_cond"].squeeze(0).detach().cpu())         # [D]
+
+                    obs_hist.append(next_obs)
+                    steps += 1
+                    ep_step += 1
+
+                    if rollout_pbar is not None:
+                        rollout_pbar.update(1)
+
+                # 最后一个obs的bootstrap value
+                last_obs_to = self._stack_last_n_obs(obs_hist, n_obs_steps)
+                last_obs_input = self._obs_to_policy_input(last_obs_to, device)
                 with torch.no_grad():
-                    out = self.model.sample_action_with_info(
-                        obs_input,
-                        num_fpo_samples=num_fpo_samples,
-                    )
-                    critic_in = self._build_critic_input_from_obs(obs_input)   # [1, D]
-                    v = self.critic(critic_in).squeeze(-1)                     # [1]
+                    last_v = self.critic(self._build_critic_input_from_obs(last_obs_input)).squeeze(-1).item()
+                batch_truncs.append(ep_truncs)
+                batch_discounts.append(ep_discounts)
+                batch_bootstrap_values.append(float(last_v))
 
-                    # 供后续compute_cfm_loss_with_fixed_noise_t(postdict=True)
-                    conds = self.model.build_condition_from_obs(obs_input)
-
-                # 执行动作：默认取第一个动作
-                # out["action"]: [1, Ta, Da]
-                env_action = out["action"][0, 0].detach().cpu().numpy()
-
-                next_obs, rew, terminated, truncated, _ = env.step(env_action)
-                done = bool(terminated or truncated)
-
-                trunc = float(truncated)
-                discount = 0.0 if bool(terminated) else 1.0
-                ep_truncs.append(trunc)
-                ep_discounts.append(discount)
-
-                ep_rews.append(float(rew) * reward_scaling)
-                ep_vals.append(float(v.item()))
-                ep_dones.append(float(done))
-
-                flat_critic_obs.append(critic_in.squeeze(0).detach().cpu())                     # [D]
-                flat_action_target.append(out["action_pred"].squeeze(0).detach().cpu())         # [T, Da]
-                flat_loss_eps.append(out["loss_eps"].squeeze(0).detach().cpu())                 # [N, T, Da]
-                flat_loss_t.append(out["loss_t"].squeeze(0).detach().cpu())                     # [N]
-                flat_init_cfm_loss.append(out["initial_cfm_loss"].squeeze(0).detach().cpu())    # [N]
-
-                flat_cond_data.append(conds["cond_data"].squeeze(0).detach().cpu())             # [T, Da]
-                flat_cond_mask.append(conds["cond_mask"].squeeze(0).detach().cpu())             # [T, Da]
-                flat_global_cond.append(conds["global_cond"].squeeze(0).detach().cpu())         # [D]
-
-                obs_hist.append(next_obs)
-                steps += 1
-                ep_step += 1
-
-            # 最后一个obs的bootstrap value
-            last_obs_to = self._stack_last_n_obs(obs_hist, n_obs_steps)
-            last_obs_input = self._obs_to_policy_input(last_obs_to, device)
-            with torch.no_grad():
-                last_v = self.critic(self._build_critic_input_from_obs(last_obs_input)).squeeze(-1).item()
-            batch_truncs.append(ep_truncs)
-            batch_discounts.append(ep_discounts)
-            batch_bootstrap_values.append(float(last_v))
-
-            batch_rews.append(ep_rews)
-            batch_vals.append(ep_vals)
-            batch_dones.append(ep_dones)
-
+                batch_rews.append(ep_rews)
+                batch_vals.append(ep_vals)
+                batch_dones.append(ep_dones)
+        finally:
+            if rollout_pbar is not None:
+                rollout_pbar.close()
+        # --------------------------------新增结束--------------------------------
         flat_rewards = [r for ep in batch_rews for r in ep]
         ep_lens = [len(ep) for ep in batch_rews if len(ep) > 0]
 

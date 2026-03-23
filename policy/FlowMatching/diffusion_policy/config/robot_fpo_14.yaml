@@ -112,7 +112,7 @@ training:
   # 训练循环控制
   # 单位：轮次（epochs）
   rollout_every: 50
-  checkpoint_every: 100
+  checkpoint_every: 50
   val_every: 1
   sample_every: 5
   # 每轮步数
@@ -148,6 +148,10 @@ logging:
   tags: ["${name}", "${task_name}", "${exp_name}", "FPO"]
   id: null
   group: null
+  tensorboard:
+    enabled: True
+    log_every: 1
+    flush_secs: 10
 
 checkpoint:
   topk:
