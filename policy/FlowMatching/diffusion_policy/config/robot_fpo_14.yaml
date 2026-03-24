@@ -128,6 +128,7 @@ training:
   max_timesteps_per_episode: 1600
   n_updates_per_iteration: 5
   num_fpo_samples: 8
+  max_total_fpo_samples_per_call: 16
   online_iters: 1000
   average_losses_before_exp: True
   rho_clip: 3.0
@@ -140,8 +141,8 @@ training:
   reward_scaling: 1.0
   discounting: 1.0
   # 并行训练
-  num_envs: 2
-  vec_env_start_mode: spawn
+  num_envs: 4
+  vec_env_start_method: spawn
   vec_env_timeout_sec: 120
 
 logging:

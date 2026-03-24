@@ -35,6 +35,7 @@ from collections import deque
 import torch.nn.functional as F
 
 from diffusion_policy.env_runner.fpo_runner import FPORunner
+from diffusion_policy.env_runner.vector_fpo_runner import VectorFPORunner
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -379,13 +380,26 @@ class RobotWorkspace(BaseWorkspace):
 
         # 在线训练部分
 
-        env = FPORunner(
-            task_name=cfg.task.name,
-            setting=cfg.setting,
-            head_camera_type=cfg.head_camera_type,
-            base_seed=cfg.training.seed,
-            action_type="qpos",
-        )
+        num_envs = int(getattr(cfg.training, "num_envs", 1))
+        if num_envs > 1:
+            env = VectorFPORunner(
+                task_name=cfg.task.name,
+                setting=cfg.setting,
+                head_camera_type=cfg.head_camera_type,
+                num_envs=num_envs,
+                base_seed=cfg.training.seed,
+                action_type="qpos",
+                start_method=str(getattr(cfg.training, "vec_env_start_method", "spawn")),
+                suppress_worker_output=bool(getattr(cfg.training, "suppress_env_step_print", True)),
+            )
+        else:
+            env = FPORunner(
+                task_name=cfg.task.name,
+                setting=cfg.setting,
+                head_camera_type=cfg.head_camera_type,
+                base_seed=cfg.training.seed,
+                action_type="qpos",
+            )
 
         try:
             with JsonLogger(log_path) as json_logger:
@@ -417,7 +431,8 @@ class RobotWorkspace(BaseWorkspace):
                             ema.step(self.model)
                         
                         if ((it + 1) % cfg.training.checkpoint_every) == 0:
-                            save_name = "online_fpo"
+                            pretrain_epoch = int(self.epoch)
+                            save_name = f"online_fpo-pretrain_ep{pretrain_epoch}"
                             self.save_checkpoint(f"checkpoints/{save_name}-{seed}/{self.epoch}-{it}.ckpt") 
 
                         progress_line = _format_online_progress(it, online_iters, step_log)
@@ -528,6 +543,13 @@ class RobotWorkspace(BaseWorkspace):
         )
     
     def collect_rollout(self, env, device):
+        num_envs = int(getattr(self.cfg.training, "num_envs", 1))
+        if num_envs <= 1:
+            return self.collect_rollout_single(env, device)
+        else:
+            return self.collect_rollout_vector(env, device, num_envs)
+    
+    def collect_rollout_single(self, env, device):
         cfg_t = self.cfg.training
         suppress_env_step_print = bool(getattr(cfg_t, "suppress_env_step_print", True))
         show_rollout_tqdm = bool(getattr(cfg_t, "show_rollout_tqdm", True))
@@ -535,7 +557,11 @@ class RobotWorkspace(BaseWorkspace):
         target_steps = int(cfg_t.timesteps_per_batch)
         max_ep_steps = int(cfg_t.max_timesteps_per_episode)
         n_obs_steps = int(self.cfg.n_obs_steps)
-        num_fpo_samples = int(cfg_t.num_fpo_samples)
+        base_num_fpo_samples = int(cfg_t.num_fpo_samples)
+        max_total_fpo_samples = int(getattr(cfg_t, "max_total_fpo_samples_per_call", 0))
+        num_fpo_samples = base_num_fpo_samples
+        if max_total_fpo_samples > 0:
+            num_fpo_samples = max(1, min(base_num_fpo_samples, max_total_fpo_samples))
         reward_scaling = float(getattr(cfg_t, "reward_scaling", 1.0))
 
         # 给GAE的episode-wise数据
@@ -588,16 +614,13 @@ class RobotWorkspace(BaseWorkspace):
                     obs_to = self._stack_last_n_obs(obs_hist, n_obs_steps)
                     obs_input = self._obs_to_policy_input(obs_to, device)
 
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         out = self.model.sample_action_with_info(
                             obs_input,
                             num_fpo_samples=num_fpo_samples,
                         )
-                        critic_in = self._build_critic_input_from_obs(obs_input)   # [1, D]
+                        critic_in = out["global_cond"]
                         v = self.critic(critic_in).squeeze(-1)                     # [1]
-
-                        # 供后续compute_cfm_loss_with_fixed_noise_t(postdict=True)
-                        conds = self.model.build_condition_from_obs(obs_input)
 
                     # 执行动作：默认取第一个动作
                     # out["action"]: [1, Ta, Da]
@@ -622,9 +645,9 @@ class RobotWorkspace(BaseWorkspace):
                     flat_loss_t.append(out["loss_t"].squeeze(0).detach().cpu())                     # [N]
                     flat_init_cfm_loss.append(out["initial_cfm_loss"].squeeze(0).detach().cpu())    # [N]
 
-                    flat_cond_data.append(conds["cond_data"].squeeze(0).detach().cpu())             # [T, Da]
-                    flat_cond_mask.append(conds["cond_mask"].squeeze(0).detach().cpu())             # [T, Da]
-                    flat_global_cond.append(conds["global_cond"].squeeze(0).detach().cpu())         # [D]
+                    flat_cond_data.append(out["cond_data"].squeeze(0).detach().cpu())             # [T, Da]
+                    flat_cond_mask.append(out["cond_mask"].squeeze(0).detach().cpu())             # [T, Da]
+                    flat_global_cond.append(out["global_cond"].squeeze(0).detach().cpu())         # [D]
 
                     obs_hist.append(next_obs)
                     steps += 1
@@ -636,7 +659,7 @@ class RobotWorkspace(BaseWorkspace):
                 # 最后一个obs的bootstrap value
                 last_obs_to = self._stack_last_n_obs(obs_hist, n_obs_steps)
                 last_obs_input = self._obs_to_policy_input(last_obs_to, device)
-                with torch.no_grad():
+                with torch.inference_mode():
                     last_v = self.critic(self._build_critic_input_from_obs(last_obs_input)).squeeze(-1).item()
                 batch_truncs.append(ep_truncs)
                 batch_discounts.append(ep_discounts)
@@ -649,6 +672,210 @@ class RobotWorkspace(BaseWorkspace):
             if rollout_pbar is not None:
                 rollout_pbar.close()
         # --------------------------------新增结束--------------------------------
+        flat_rewards = [r for ep in batch_rews for r in ep]
+        ep_lens = [len(ep) for ep in batch_rews if len(ep) > 0]
+
+        reward_mean = float(np.mean(flat_rewards)) if len(flat_rewards) > 0 else 0.0
+        ep_len_mean = float(np.mean(ep_lens)) if len(ep_lens) > 0 else 0.0
+
+        rollout = {
+            "batch_rews": batch_rews,
+            "batch_vals": batch_vals,
+            "batch_dones": batch_dones,
+            "critic_obs": torch.stack(flat_critic_obs, dim=0),
+            "action_target": torch.stack(flat_action_target, dim=0),
+            "cond_data": torch.stack(flat_cond_data, dim=0),
+            "cond_mask": torch.stack(flat_cond_mask, dim=0),
+            "global_cond": torch.stack(flat_global_cond, dim=0),
+            "reward_mean": reward_mean,
+            "ep_len_mean": ep_len_mean,
+            "batch_truncs": batch_truncs,
+            "batch_discounts": batch_discounts,
+            "batch_bootstrap_values": batch_bootstrap_values,
+        }
+
+        rollout["loss_eps"] = torch.stack(flat_loss_eps, dim=0)
+        rollout["loss_t"] = torch.stack(flat_loss_t, dim=0)
+        rollout["initial_cfm_loss"] = torch.stack(flat_init_cfm_loss, dim=0)
+
+        return rollout
+
+    def collect_rollout_vector(self, env, device, num_envs):
+        cfg_t = self.cfg.training
+        suppress_env_step_print = bool(getattr(cfg_t, "suppress_env_step_print", True))
+        show_rollout_tqdm = bool(getattr(cfg_t, "show_rollout_tqdm", True))
+        rollout_tqdm_interval = float(getattr(cfg_t, "rollout_tqdm_interval_sec", 1.0))
+        target_steps = int(cfg_t.timesteps_per_batch)
+        max_ep_steps = int(cfg_t.max_timesteps_per_episode)
+        n_obs_steps = int(self.cfg.n_obs_steps)
+        base_num_fpo_samples = int(cfg_t.num_fpo_samples)
+        max_total_fpo_samples = int(getattr(cfg_t, "max_total_fpo_samples_per_call", 0))
+        reward_scaling = float(getattr(cfg_t, "reward_scaling", 1.0))
+
+        # 初始化并行环境
+        obs_list, _ = env.reset()
+
+        # 初始化每个环境独立历史与episode缓存
+        obs_hist_list = [deque(maxlen=n_obs_steps) for _ in range(num_envs)]
+        ep_rews = [[] for _ in range(num_envs)]
+        ep_vals = [[] for _ in range(num_envs)]
+        ep_dones = [[] for _ in range(num_envs)]
+        ep_truncs = [[] for _ in range(num_envs)]
+        ep_discounts = [[] for _ in range(num_envs)]
+        ep_steps = [0 for _ in range(num_envs)]
+        alive = [True for _ in range(num_envs)]
+
+        for i in range(num_envs):
+            obs_hist_list[i].append(obs_list[i])
+
+        # 全局batch容器
+        batch_rews, batch_vals, batch_dones = [], [], []
+        batch_truncs, batch_discounts, batch_bootstrap_values = [], [], []
+        flat_critic_obs, flat_action_target = [], []
+        flat_loss_eps, flat_loss_t, flat_init_cfm_loss = [], [], []
+        flat_cond_data, flat_cond_mask, flat_global_cond = [], [], []
+
+        steps = 0
+        rollout_pbar = None
+        if show_rollout_tqdm:
+            rollout_pbar = tqdm.tqdm(
+                total=target_steps,
+                desc="Rollout",
+                dynamic_ncols=True,
+                leave=False,
+                mininterval=rollout_tqdm_interval,
+                position=1,
+            )
+
+        try:
+            while steps < target_steps:
+                active_ids = [i for i in range(num_envs) if alive[i]]
+                if len(active_ids) == 0:
+                    reset_out = env.reset_at(list(range(num_envs)))
+                    for i in range(num_envs):
+                        obs_i, _ = reset_out[i]
+                        obs_hist_list[i].clear()
+                        obs_hist_list[i].append(obs_i)
+                        ep_steps[i] = 0
+                        alive[i] = True
+                    continue
+
+                obs_to_batch = {}
+                for i in active_ids:
+                    obs_to_i = self._stack_last_n_obs(obs_hist_list[i], n_obs_steps)
+                    for k, v in obs_to_i.items():
+                        obs_to_batch.setdefault(k, []).append(v)
+                for k in obs_to_batch:
+                    obs_to_batch[k] = np.stack(obs_to_batch[k], axis=0)
+
+                num_fpo_samples = base_num_fpo_samples
+                if max_total_fpo_samples > 0:
+                    per_env_budget = max_total_fpo_samples // max(1, len(active_ids))
+                    num_fpo_samples = max(1, min(base_num_fpo_samples, per_env_budget))
+
+                obs_input = {}
+                for k, v in obs_to_batch.items():
+                    t = torch.from_numpy(v).to(device)
+                    if t.dtype == torch.uint8:
+                        t = t.float() / 255.0
+                    obs_input[k] = t
+
+                with torch.inference_mode():
+                    out = self.model.sample_action_with_info(
+                        obs_input,
+                        num_fpo_samples=num_fpo_samples,
+                    )
+                    critic_in = out["global_cond"]
+                    v = self.critic(critic_in).squeeze(-1)
+
+                # 构造完整actions，非active env保持空动作占位
+                action_dim = out["action"].shape[-1]
+                actions_all = [np.zeros((action_dim,), dtype=np.float32) for _ in range(num_envs)]
+                for local_j, env_id in enumerate(active_ids):
+                    actions_all[env_id] = out["action"][local_j, 0].detach().cpu().numpy()
+
+                with _maybe_suppress_stdout(suppress_env_step_print):
+                    next_obs_list, rew_arr, terminated_arr, truncated_arr, _ = env.step(actions_all)
+
+                for local_j, env_id in enumerate(active_ids):
+                    done = bool(terminated_arr[env_id] or truncated_arr[env_id])
+                    trunc = float(bool(truncated_arr[env_id]))
+                    discount = 0.0 if bool(terminated_arr[env_id]) else 1.0
+
+                    ep_rews[env_id].append(float(rew_arr[env_id]) * reward_scaling)
+                    ep_vals[env_id].append(float(v[local_j].item()))
+                    ep_dones[env_id].append(float(done))
+                    ep_truncs[env_id].append(trunc)
+                    ep_discounts[env_id].append(discount)
+
+                    flat_critic_obs.append(critic_in[local_j].detach().cpu())
+                    flat_action_target.append(out["action_pred"][local_j].detach().cpu())
+                    flat_loss_eps.append(out["loss_eps"][local_j].detach().cpu())
+                    flat_loss_t.append(out["loss_t"][local_j].detach().cpu())
+                    flat_init_cfm_loss.append(out["initial_cfm_loss"][local_j].detach().cpu())
+                    flat_cond_data.append(out["cond_data"][local_j].detach().cpu())
+                    flat_cond_mask.append(out["cond_mask"][local_j].detach().cpu())
+                    flat_global_cond.append(out["global_cond"][local_j].detach().cpu())
+
+                    obs_hist_list[env_id].append(next_obs_list[env_id])
+                    ep_steps[env_id] += 1
+                    steps += 1
+
+                    if rollout_pbar is not None:
+                        rollout_pbar.update(1)
+
+                    reached_max = ep_steps[env_id] >= max_ep_steps
+                    if done or reached_max:
+                        last_obs_to = self._stack_last_n_obs(obs_hist_list[env_id], n_obs_steps)
+                        last_obs_input = self._obs_to_policy_input(last_obs_to, device)
+                        with torch.inference_mode():
+                            last_v = self.critic(self._build_critic_input_from_obs(last_obs_input)).squeeze(-1).item()
+
+                        batch_rews.append(ep_rews[env_id])
+                        batch_vals.append(ep_vals[env_id])
+                        batch_dones.append(ep_dones[env_id])
+                        batch_truncs.append(ep_truncs[env_id])
+                        batch_discounts.append(ep_discounts[env_id])
+                        batch_bootstrap_values.append(float(last_v))
+
+                        ep_rews[env_id] = []
+                        ep_vals[env_id] = []
+                        ep_dones[env_id] = []
+                        ep_truncs[env_id] = []
+                        ep_discounts[env_id] = []
+                        ep_steps[env_id] = 0
+
+                        if done:
+                            reset_out = env.reset_at([env_id])
+                            obs_i, _ = reset_out[env_id]
+                            obs_hist_list[env_id].clear()
+                            obs_hist_list[env_id].append(obs_i)
+                        else:
+                            obs_hist_list[env_id].clear()
+                            obs_hist_list[env_id].append(next_obs_list[env_id])
+
+                if steps >= target_steps:
+                    break
+
+            # flush未结束episode，保证GAE输入完整
+            for i in range(num_envs):
+                if len(ep_rews[i]) == 0:
+                    continue
+                last_obs_to = self._stack_last_n_obs(obs_hist_list[i], n_obs_steps)
+                last_obs_input = self._obs_to_policy_input(last_obs_to, device)
+                with torch.inference_mode():
+                    last_v = self.critic(self._build_critic_input_from_obs(last_obs_input)).squeeze(-1).item()
+
+                batch_rews.append(ep_rews[i])
+                batch_vals.append(ep_vals[i])
+                batch_dones.append(ep_dones[i])
+                batch_truncs.append(ep_truncs[i])
+                batch_discounts.append(ep_discounts[i])
+                batch_bootstrap_values.append(float(last_v))
+        finally:
+            if rollout_pbar is not None:
+                rollout_pbar.close()
+
         flat_rewards = [r for ep in batch_rews for r in ep]
         ep_lens = [len(ep) for ep in batch_rews if len(ep) > 0]
 

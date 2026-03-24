@@ -451,18 +451,28 @@ class FPOImagePolicy(BaseImagePolicy):
             return loss.mean()
 
     # 采样动作 + 产出FPO训练所需信息
-    def sample_action_with_info(self, obs_dict: Dict[str, torch.Tensor], num_fpo_samples):
+    def sample_action_with_info(self, obs_dict: Dict[str, torch.Tensor], num_fpo_samples, return_path=False):
         N = int(num_fpo_samples)
         conds_dict = self.build_condition_from_obs(obs_dict)
         cond_data, cond_mask, local_cond, global_cond = conds_dict["cond_data"], conds_dict["cond_mask"], conds_dict["local_cond"], conds_dict["global_cond"]
-        
-        nsample, x_t_path = self.flow_matching_sample(
-            cond_data,
-            cond_mask,
-            local_cond,
-            global_cond,
-            return_path=True
-        )
+
+        x_t_path = None
+        if return_path:
+            nsample, x_t_path = self.flow_matching_sample(
+                cond_data,
+                cond_mask,
+                local_cond,
+                global_cond,
+                return_path=True
+            )
+        else:
+            nsample = self.flow_matching_sample(
+                cond_data,
+                cond_mask,
+                local_cond,
+                global_cond,
+                return_path=False
+            )
         naction_pred = nsample[..., :self.action_dim]
         # 反归一化！
         action_pred = self.normalizer["action"].unnormalize(naction_pred)
@@ -507,6 +517,9 @@ class FPOImagePolicy(BaseImagePolicy):
             "loss_eps": eps.reshape(B, N, T, Da),
             "loss_t": t.reshape(B, N),
             "initial_cfm_loss": initial_cfm_loss,
+            "cond_data": cond_data,
+            "cond_mask": cond_mask,
+            "global_cond": global_cond,
         }
 
 
