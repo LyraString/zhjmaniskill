@@ -143,7 +143,7 @@ class handover_block(Base_Task):
                 functional_point_id=0,
                 pre_dis=0.08,
                 dis=0.,
-                constrain="align",
+                constrain="free",
                 pre_dis_axis="fp",
             ),
         )

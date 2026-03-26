@@ -223,8 +223,8 @@ def eval_policy(task_name,
 
         if expert_check:
             try:
-                #增加调试信息，查看seed的类型和值
-                print(f"DEBUG: now_seed = {now_seed}, type = {type(now_seed)}")
+                # #增加调试信息，查看seed的类型和值
+                # print(f"DEBUG: now_seed = {now_seed}, type = {type(now_seed)}")
 
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 episode_info = TASK_ENV.play_once()
