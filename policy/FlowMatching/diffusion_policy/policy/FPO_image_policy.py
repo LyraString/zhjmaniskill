@@ -28,7 +28,7 @@ class FPOImagePolicy(BaseImagePolicy):
         n_action_steps,
         n_obs_steps,
         num_inference_steps=10,  # ODE 积分步数
-        obs_as_global_cond=True,
+        obs_as_global_cond=True,    # 是否将观测作为全局条件（而不是局部条件）一般在Transformer中设置为False
         diffusion_step_embed_dim=256,
         down_dims=(256, 512, 1024),
         kernel_size=5,

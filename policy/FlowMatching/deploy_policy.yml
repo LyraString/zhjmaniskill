@@ -8,5 +8,5 @@ instruction_type: unseen
 
 # Add Parameters You Need
 expert_data_num: null
-checkpoint_num: 2100
+checkpoint_num: 2200
 head_camera_type: D435

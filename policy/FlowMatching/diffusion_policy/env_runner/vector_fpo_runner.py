@@ -107,4 +107,3 @@ class VectorFPORunner:
             c.close()
         for p in self.procs:
             p.join(timeout=1.0)
-
