@@ -86,7 +86,11 @@ optimizer:
 critic:
   _target_: diffusion_policy.model.rl.value_mlp.CriticMLP
   input_dim: 1578
-  hidden_dims: [256, 256]
+  hidden_dims: [1024, 512, 256]
+  activation: tanh
+  use_layer_norm: true
+  orthogonal_init: true
+  output_gain: 1.0
 
 critic_optimizer:
   _target_: torch.optim.AdamW
@@ -134,7 +138,7 @@ training:
   average_losses_before_exp: True
   rho_clip: 3.0
   rho_min: 1.0e-6
-  rho_max: 1.0e6
+  rho_max: 100
   num_minibatches: 32
   max_grad_norm: 1.0
   value_loss_coeff: 0.25

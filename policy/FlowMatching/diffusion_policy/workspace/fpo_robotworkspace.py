@@ -37,6 +37,11 @@ import torch.nn.functional as F
 from diffusion_policy.env_runner.fpo_runner import FPORunner
 from diffusion_policy.env_runner.vector_fpo_runner import VectorFPORunner
 
+# # Maniskill并行训练环境
+# import gymnasium as gym
+# import mani_skill.envs
+# from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
+
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 # --------------------------------新增开始--------------------------------
@@ -521,15 +526,15 @@ class RobotWorkspace(BaseWorkspace):
             ret = np.zeros(T, dtype=np.float32)
 
             next_value = float(ep_boot)
-            next_adv = 0.0
+            gae_adv = 0.0
 
             # TD Error反向递归计算优势函数
             for t in reversed(range(T)):
                 trunc_mask = 1.0 - float(ep_tr[t])
                 eff_disc = ep_disc[t] * discounting
                 delta = ep_rew[t] + gamma * next_value * eff_disc - ep_val[t]
-                next_adv = delta + gamma * lmbda * eff_disc * trunc_mask * next_adv
-                adv[t] = next_adv
+                gae_adv = delta + gamma * lmbda * eff_disc * trunc_mask * gae_adv
+                adv[t] = gae_adv
                 ret[t] = adv[t] + ep_val[t]
                 next_value = ep_val[t]
 
@@ -1031,13 +1036,11 @@ class RobotWorkspace(BaseWorkspace):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
                 self.optimizer.step()
 
-                # v_pred = self.critic(critic_obs[idx]).squeeze(-1)   # [B]
-                # critic_loss = F.mse_loss(v_pred, mb_ret)
-
-                mb_trunc = flat_trunc[idx]
-                v_pred = self.critic(critic_obs[idx]).squeeze(-1)
-                v_error = (mb_ret - v_pred) * (1.0 - mb_trunc)
-                critic_loss = (v_error.pow(2).mean()) * value_loss_coeff
+                # mb_trunc = flat_trunc[idx]
+                ret_pred = self.critic(critic_obs[idx]).squeeze(-1)
+                # v_error = (mb_ret - v_pred) * (1.0 - mb_trunc)
+                ret_error = mb_ret - ret_pred
+                critic_loss = (ret_error.pow(2).mean()) * value_loss_coeff
 
                 self.critic_optimizer.zero_grad()
                 critic_loss.backward()
