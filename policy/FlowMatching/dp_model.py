@@ -4,11 +4,12 @@ import hydra
 import dill
 import sys, os
 
-# 确保导入 FlowMatching 目录下的模块
-current_file_path = os.path.abspath(__file__)
-parent_dir = os.path.dirname(current_file_path)
-# 将 FlowMatching 目录添加到路径最前面，确保优先级
-sys.path.insert(0, parent_dir)
+# 确保导入 fm_diffusion 目录下的模块
+from pathlib import Path
+CURRENT_DIR = Path(__file__).resolve().parent
+CORE_DIR = CURRENT_DIR.parent / "fm_diffusion"
+# 将 fm_diffusion 目录添加到路径最前面，确保优先级
+sys.path.insert(0, str(CORE_DIR))
 
 from diffusion_policy.workspace.robotworkspace import RobotWorkspace
 from diffusion_policy.env_runner.dp_runner import DPRunner

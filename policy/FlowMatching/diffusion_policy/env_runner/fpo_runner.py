@@ -76,6 +76,18 @@ class FPORunner:
         args["save_data"] = False
         args["render_freq"] = 0
         args["collect_data"] = False
+        args.setdefault("need_curobo", self.action_type == "ee")
+        args.setdefault("need_topp", self.action_type == "qpos")
+
+        # 在线 FPO 默认使用低显存渲染配置；如 task_config 显式提供则以 task_config 为准。
+        renderer_cfg = args.setdefault("renderer", {})
+        renderer_cfg.setdefault("device", "cuda:0")
+        renderer_cfg.setdefault("camera_shader_dir", "rt")
+        renderer_cfg.setdefault("ray_tracing_samples_per_pixel", 1)
+        renderer_cfg.setdefault("ray_tracing_path_depth", 1)
+        renderer_cfg.setdefault("ray_tracing_denoiser", None)
+        renderer_cfg.setdefault("enable_observer_camera", False)
+        renderer_cfg.setdefault("enable_world_cameras", False)
 
         # 覆盖相机类型
         args["camera"]["head_camera_type"] = self.head_camera_type

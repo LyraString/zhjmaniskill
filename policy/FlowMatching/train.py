@@ -10,6 +10,13 @@ import sys
 sys.stdout = open(sys.stdout.fileno(), mode="w", buffering=1)
 sys.stderr = open(sys.stderr.fileno(), mode="w", buffering=1)
 
+# 确保导入 fm_diffusion 目录下的模块
+from pathlib import Path
+CURRENT_DIR = Path(__file__).resolve().parent
+CORE_DIR = CURRENT_DIR.parent / "fm_diffusion"
+# 将 fm_diffusion 目录添加到路径最前面，确保优先级
+sys.path.insert(0, str(CORE_DIR))
+
 import hydra, pdb
 from omegaconf import OmegaConf
 import pathlib, yaml
