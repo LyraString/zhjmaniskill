@@ -1,36 +1,37 @@
-import pickle, os
+import os
 import numpy as np
-import pdb
-from copy import deepcopy
 import zarr
 import shutil
 import argparse
-import yaml
-import cv2
 import h5py
 
 
 def load_hdf5(dataset_path):
     if not os.path.isfile(dataset_path):
-        print(f"Dataset does not exist at \n{dataset_path}\n")
-        exit()
+        raise FileNotFoundError(f"Dataset does not exist at path: {dataset_path}")
 
     with h5py.File(dataset_path, "r") as root:
-        left_gripper, left_arm = (
-            root["/joint_action/left_gripper"][()],
-            root["/joint_action/left_arm"][()],
-        )
-        right_gripper, right_arm = (
-            root["/joint_action/right_gripper"][()],
-            root["/joint_action/right_arm"][()],
-        )
         vector = root["/joint_action/vector"][()]
-        image_dict = dict()
-        for cam_name in root[f"/observation/"].keys():
-            image_dict[cam_name] = root[f"/observation/{cam_name}/rgb"][()]
+        pointcloud = root["/pointcloud"][()]
 
-    return left_gripper, left_arm, right_gripper, right_arm, vector, image_dict
+    return vector, pointcloud
 
+def to_xyz(pointcloud):
+    pointcloud = np.asarray(pointcloud)
+
+    if pointcloud.ndim == 2 and pointcloud.shape[1] == 0:
+        raise ValueError(
+            "Raw HDF5 contains empty /pointcloud with shape (T, 0)."
+            "These demos were likely collected without valid pointcloud data."
+        )
+    
+    if pointcloud.ndim != 3:
+        raise ValueError(f"Expected pointcloud ndim=3, got shape={pointcloud.shape}")
+    
+    if pointcloud.shape[-1] < 3:
+        raise ValueError(f"Expected last dim >= 3, got shape={pointcloud.shape}")
+    
+    return pointcloud[..., :3].astype(np.float32)
 
 def main():
     parser = argparse.ArgumentParser(description="Process some episodes.")
@@ -60,72 +61,59 @@ def main():
     if os.path.exists(save_dir):
         shutil.rmtree(save_dir)
 
-    current_ep = 0
-
     zarr_root = zarr.group(save_dir)
     zarr_data = zarr_root.create_group("data")
     zarr_meta = zarr_root.create_group("meta")
 
-    head_camera_arrays, front_camera_arrays, left_camera_arrays, right_camera_arrays = (
-        [],
-        [],
-        [],
-        [],
-    )
-    episode_ends_arrays, action_arrays, state_arrays, joint_action_arrays = (
-        [],
-        [],
-        [],
-        [],
-    )
+    point_cloud_arrays = []
+    state_arrays = []
+    action_arrays = []
+    episode_ends_arrays = []
 
-    while current_ep < num:
-        print(f"processing episode: {current_ep + 1} / {num}", end="\r")
+    for ep_idx in range(num):
+        print(f"processing episode: {ep_idx + 1} / {num}", end="\r")
 
-        load_path = os.path.join(load_dir, f"data/episode{current_ep}.hdf5")
-        (
-            left_gripper_all,
-            left_arm_all,
-            right_gripper_all,
-            right_arm_all,
-            vector_all,
-            image_dict_all,
-        ) = load_hdf5(load_path)
+        load_path = os.path.join(load_dir, f"data/episode{ep_idx}.hdf5")
+        vector_all, pointcloud_all = load_hdf5(load_path)
 
-        for j in range(0, left_gripper_all.shape[0]):
+        pointcloud_all = to_xyz(pointcloud_all)
 
-            head_img_bit = image_dict_all["head_camera"][j]
-            joint_state = vector_all[j]
+        if len(vector_all) != len(pointcloud_all):
+            raise ValueError(
+                f"Length mismatch in {load_path}: "
+                f"len(vector)={len(vector_all)}, len(pointcloud)={len(pointcloud_all)}"
+            )
 
-            if j != left_gripper_all.shape[0] - 1:
-                head_img = cv2.imdecode(np.frombuffer(head_img_bit, np.uint8), cv2.IMREAD_COLOR)
-                head_camera_arrays.append(head_img)
-                state_arrays.append(joint_state)
-            if j != 0:
-                joint_action_arrays.append(joint_state)
+        T = len(vector_all)
+        if T < 2:
+            raise ValueError(f"Episode too short in {load_path}, T={T}")
 
-        current_ep += 1
-        total_count += left_gripper_all.shape[0] - 1
+        for t in range(T - 1):
+            state_arrays.append(vector_all[t].astype(np.float32))
+            point_cloud_arrays.append(pointcloud_all[t])
+            action_arrays.append(vector_all[t + 1].astype(np.float32))
+
+        total_count += T - 1
         episode_ends_arrays.append(total_count)
 
-    print()
-    episode_ends_arrays = np.array(episode_ends_arrays)
-    # action_arrays = np.array(action_arrays)
-    state_arrays = np.array(state_arrays)
-    head_camera_arrays = np.array(head_camera_arrays)
-    joint_action_arrays = np.array(joint_action_arrays)
 
-    head_camera_arrays = np.moveaxis(head_camera_arrays, -1, 1)  # NHWC -> NCHW
+    print()
+
+    episode_ends_arrays = np.array(episode_ends_arrays, dtype=np.int64)
+    action_arrays = np.array(action_arrays, dtype=np.float32)
+    state_arrays = np.array(state_arrays, dtype=np.float32)
+    point_cloud_arrays = np.asarray(point_cloud_arrays, dtype=np.float32)
 
     compressor = zarr.Blosc(cname="zstd", clevel=3, shuffle=1)
-    # action_chunk_size = (100, action_arrays.shape[1])
+
+    action_chunk_size = (100, action_arrays.shape[1])
     state_chunk_size = (100, state_arrays.shape[1])
-    joint_chunk_size = (100, joint_action_arrays.shape[1])
-    head_camera_chunk_size = (100, *head_camera_arrays.shape[1:])
+    point_cloud_chunk_size = (100, *point_cloud_arrays.shape[1:])
     zarr_data.create_dataset(
-        "head_camera",
-        data=head_camera_arrays,
-        chunks=head_camera_chunk_size,
+        "point_cloud",
+        data=point_cloud_arrays,
+        chunks=point_cloud_chunk_size,
+        dtype="float32",
         overwrite=True,
         compressor=compressor,
     )
@@ -139,8 +127,8 @@ def main():
     )
     zarr_data.create_dataset(
         "action",
-        data=joint_action_arrays,
-        chunks=joint_chunk_size,
+        data=action_arrays,
+        chunks=action_chunk_size,
         dtype="float32",
         overwrite=True,
         compressor=compressor,

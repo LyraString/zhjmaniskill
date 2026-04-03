@@ -130,13 +130,11 @@ class FPORunner:
 
     # 对齐策略的输入观测格式
     def _convert_obs_for_policy(self, raw_obs):
-        head_cam = raw_obs["observation"]["head_camera"]["rgb"]
-        head_cam = np.moveaxis(head_cam, -1, 0).astype(np.float32) / 255.0
-
+        point_cloud = raw_obs["pointcloud"][..., :3].astype(np.float32)
         agent_pos = raw_obs["joint_action"]["vector"].astype(np.float32)
 
         return {
-            "head_cam": head_cam,
+            "point_cloud": point_cloud,
             "agent_pos": agent_pos,
         }
     

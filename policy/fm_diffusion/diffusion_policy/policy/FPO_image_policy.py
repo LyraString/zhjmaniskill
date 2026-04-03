@@ -410,10 +410,11 @@ class FPOImagePolicy(BaseImagePolicy):
 
     # ========= FPO Configuration ============
     def compute_cfm_loss_with_fixed_noise_t(self, obs_dict: Dict[str, torch.Tensor],
-                                            action_target: torch.Tensor, noise: torch.Tensor,
+                                            naction_target: torch.Tensor, noise: torch.Tensor,
                                             t: torch.Tensor, return_per_sample=False, 
                                             postdict=False):
-        assert action_target.shape == noise.shape
+        # naction_target must stay in normalized action space.
+        assert naction_target.shape == noise.shape
         if not self.obs_as_global_cond:
             raise NotImplementedError(
                 "当前实现仅支持 obs_as_global_cond=True。"
@@ -425,7 +426,7 @@ class FPOImagePolicy(BaseImagePolicy):
             prep_dict = self.build_condition_from_obs(obs_dict)
         cond_data, cond_mask, local_cond, global_cond = prep_dict["cond_data"], prep_dict["cond_mask"], prep_dict["local_cond"], prep_dict["global_cond"]
 
-        x_1 = action_target
+        x_1 = naction_target
         x_0 = noise.to(device=x_1.device, dtype=x_1.dtype)
 
         # 插值: x_t = t*x_1 + (1-t)*x_0
@@ -511,8 +512,9 @@ class FPOImagePolicy(BaseImagePolicy):
         initial_cfm_loss = initial_cfm_loss.detach().reshape(B, N)
 
         return {
-            "action": action,
-            "action_pred": action_pred,
+            "action": action,                         # unnormalized action used by env.step
+            "action_pred": action_pred,               # unnormalized full-horizon action prediction
+            "naction_pred": naction_pred.detach(),    # normalized full-horizon action prediction
             "x_t_path": x_t_path,
             "loss_eps": eps.reshape(B, N, T, Da),
             "loss_t": t.reshape(B, N),

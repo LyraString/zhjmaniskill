@@ -1,21 +1,11 @@
 name: task_config
 
-image_shape: &image_shape [3, -1, -1]
 shape_meta: &shape_meta
-  # acceptable types: rgb, low_dim
+  # acceptable types: point_cloud, low_dim
   obs:
-    head_cam:
-      shape: *image_shape
-      type: rgb
-    # front_cam:
-    #   shape: *image_shape
-    #   type: rgb
-    # left_cam:
-    #   shape: *image_shape
-    #   type: rgb
-    # right_cam:
-    #   shape: *image_shape
-    #   type: rgb
+    point_cloud:
+      shape: [512, 3]
+      type: point_cloud
     agent_pos:
       shape: [14]
       type: low_dim
@@ -39,7 +29,7 @@ env_runner:
   n_envs: null
 
 dataset:
-  _target_: diffusion_policy.dataset.robot_image_dataset.RobotImageDataset
+  _target_: diffusion_policy.dataset.robot_pointcloud_dataset.RobotPointCloudDataset
   zarr_path: data/useless.zarr
   batch_size: ${dataloader.batch_size}
   horizon: ${horizon}

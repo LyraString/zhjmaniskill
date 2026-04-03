@@ -578,7 +578,7 @@ class RobotWorkspace(BaseWorkspace):
         batch_bootstrap_values = []
 
         flat_critic_obs = []
-        flat_action_target = []
+        flat_naction_target = []  # normalized action prediction used for FPO ratio recomputation
         flat_loss_eps = []
         flat_loss_t = []
         flat_init_cfm_loss = []
@@ -645,7 +645,7 @@ class RobotWorkspace(BaseWorkspace):
                     ep_dones.append(float(done))
 
                     flat_critic_obs.append(critic_in.squeeze(0).detach().cpu())                     # [D]
-                    flat_action_target.append(out["action_pred"].squeeze(0).detach().cpu())         # [T, Da]
+                    flat_naction_target.append(out["naction_pred"].squeeze(0).detach().cpu())      # [T, Da], normalized
                     flat_loss_eps.append(out["loss_eps"].squeeze(0).detach().cpu())                 # [N, T, Da]
                     flat_loss_t.append(out["loss_t"].squeeze(0).detach().cpu())                     # [N]
                     flat_init_cfm_loss.append(out["initial_cfm_loss"].squeeze(0).detach().cpu())    # [N]
@@ -688,7 +688,7 @@ class RobotWorkspace(BaseWorkspace):
             "batch_vals": batch_vals,
             "batch_dones": batch_dones,
             "critic_obs": torch.stack(flat_critic_obs, dim=0),
-            "action_target": torch.stack(flat_action_target, dim=0),
+            "naction_target": torch.stack(flat_naction_target, dim=0),
             "cond_data": torch.stack(flat_cond_data, dim=0),
             "cond_mask": torch.stack(flat_cond_mask, dim=0),
             "global_cond": torch.stack(flat_global_cond, dim=0),
@@ -736,7 +736,7 @@ class RobotWorkspace(BaseWorkspace):
         # 全局batch容器
         batch_rews, batch_vals, batch_dones = [], [], []
         batch_truncs, batch_discounts, batch_bootstrap_values = [], [], []
-        flat_critic_obs, flat_action_target = [], []
+        flat_critic_obs, flat_naction_target = [], []  # normalized action predictions for current-loss recomputation
         flat_loss_eps, flat_loss_t, flat_init_cfm_loss = [], [], []
         flat_cond_data, flat_cond_mask, flat_global_cond = [], [], []
 
@@ -814,7 +814,7 @@ class RobotWorkspace(BaseWorkspace):
                     ep_discounts[env_id].append(discount)
 
                     flat_critic_obs.append(critic_in[local_j].detach().cpu())
-                    flat_action_target.append(out["action_pred"][local_j].detach().cpu())
+                    flat_naction_target.append(out["naction_pred"][local_j].detach().cpu())       # [T, Da], normalized
                     flat_loss_eps.append(out["loss_eps"][local_j].detach().cpu())
                     flat_loss_t.append(out["loss_t"][local_j].detach().cpu())
                     flat_init_cfm_loss.append(out["initial_cfm_loss"][local_j].detach().cpu())
@@ -892,7 +892,7 @@ class RobotWorkspace(BaseWorkspace):
             "batch_vals": batch_vals,
             "batch_dones": batch_dones,
             "critic_obs": torch.stack(flat_critic_obs, dim=0),
-            "action_target": torch.stack(flat_action_target, dim=0),
+            "naction_target": torch.stack(flat_naction_target, dim=0),
             "cond_data": torch.stack(flat_cond_data, dim=0),
             "cond_mask": torch.stack(flat_cond_mask, dim=0),
             "global_cond": torch.stack(flat_global_cond, dim=0),
@@ -943,7 +943,7 @@ class RobotWorkspace(BaseWorkspace):
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         critic_obs = rollout["critic_obs"].to(device)            # [S, D]
-        action_target = rollout["action_target"].to(device)      # [S, T, Da]
+        naction_target = rollout["naction_target"].to(device)    # [S, T, Da], normalized
         loss_eps = rollout["loss_eps"].to(device)                # [S, N, T, Da]
         loss_t = rollout["loss_t"].to(device)                    # [S, N]
         init_loss = rollout["initial_cfm_loss"].to(device)       # [S, N]
@@ -976,7 +976,7 @@ class RobotWorkspace(BaseWorkspace):
                 mb_adv = advantages[idx]              # [B]
                 mb_ret = returns[idx]                 # [B]
 
-                mb_action = action_target[idx]        # [B, T, Da]
+                mb_naction = naction_target[idx]      # [B, T, Da]
                 mb_eps = loss_eps[idx]                # [B, N, T, Da]
                 mb_t = loss_t[idx]                    # [B, N]
                 mb_init = init_loss[idx]              # [B, N]
@@ -988,7 +988,9 @@ class RobotWorkspace(BaseWorkspace):
                 B, N, T, Da = mb_eps.shape
 
                 # 展平 B*N
-                flat_action = mb_action.unsqueeze(1).expand(B, N, T, Da).reshape(B * N, T, Da)
+                # Recompute current CFM loss on the same normalized action scale
+                # used when collecting initial_cfm_loss during rollout.
+                flat_naction = mb_naction.unsqueeze(1).expand(B, N, T, Da).reshape(B * N, T, Da)
                 flat_eps = mb_eps.reshape(B * N, T, Da)
                 flat_t = mb_t.reshape(B * N)
                 flat_init = mb_init.reshape(B * N)
@@ -1006,7 +1008,7 @@ class RobotWorkspace(BaseWorkspace):
 
                 curr = self.model.compute_cfm_loss_with_fixed_noise_t(
                     postdict,
-                    flat_action,
+                    flat_naction,
                     flat_eps,
                     flat_t,
                     return_per_sample=True,

@@ -39,17 +39,17 @@ export CUDA_VISIBLE_DEVICES=${gpu_id}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FLOWMATCHING_DIR="${SCRIPT_DIR}/../FlowMatching"
 
-zarr_path="${FLOWMATCHING_DIR}/data/${task_name}-${task_config}-${expert_data_num}.zarr"
+zarr_path="${SCRIPT_DIR}/data/${task_name}-${task_config}-${expert_data_num}.zarr"
 
 if [ ! -d "${zarr_path}" ]; then
-    bash "${FLOWMATCHING_DIR}/process_data.sh" "${task_name}" "${task_config}" "${expert_data_num}"
+    bash "${SCRIPT_DIR}/process_data.sh" "${task_name}" "${task_config}" "${expert_data_num}"
 fi
 
 if [ "${resume_ckpt_path}" != "null" ] && [[ "${resume_ckpt_path}" != /* ]]; then
     resume_ckpt_path="${FLOWMATCHING_DIR}/${resume_ckpt_path}"
 fi
 
-python train.py --config-name=${config_name}.yaml \
+python "${SCRIPT_DIR}/train.py" --config-name=${config_name}.yaml \
                             task.name=${task_name} \
                             task.dataset.zarr_path="${zarr_path}" \
                             training.debug=$DEBUG \
