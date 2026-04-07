@@ -18,12 +18,12 @@ import torch.multiprocessing as mp
 
 class Robot:
 
-    def __init__(self, scene, need_topp=False, **kwargs):
+    def __init__(self, scene, need_topp=False, need_curobo=True, **kwargs):
         super().__init__()
         ta.setup_logging("CRITICAL")  # hide logging
-        self._init_robot_(scene, need_topp, **kwargs)
+        self._init_robot_(scene, need_topp, need_curobo, **kwargs)
 
-    def _init_robot_(self, scene, need_topp=False, **kwargs):
+    def _init_robot_(self, scene, need_topp=False, need_curobo=True, **kwargs):
         # self.dual_arm = dual_arm_tag
         # self.plan_success = True
 
@@ -36,6 +36,7 @@ class Robot:
         right_robot_file = kwargs["right_robot_file"]
 
         self.need_topp = need_topp
+        self.need_curobo = need_curobo
 
         self.left_urdf_path = os.path.join(left_robot_file, left_embodiment_args["urdf_path"])
         self.left_srdf_path = left_embodiment_args.get("srdf_path", None)
@@ -121,18 +122,23 @@ class Robot:
         self.left_entity.set_root_pose(self.left_entity_origion_pose)
         self.right_entity.set_root_pose(self.right_entity_origion_pose)
 
-    def reset(self, scene, need_topp=False, **kwargs):
-        self._init_robot_(scene, need_topp, **kwargs)
+    def reset(self, scene, need_topp=False, need_curobo=True, **kwargs):
+        self._init_robot_(scene, need_topp, need_curobo, **kwargs)
 
-        if self.communication_flag:
-            if hasattr(self, "left_conn") and self.left_conn:
-                self.left_conn.send({"cmd": "reset"})
-                _ = self.left_conn.recv()
-            if hasattr(self, "right_conn") and self.right_conn:
-                self.right_conn.send({"cmd": "reset"})
-                _ = self.right_conn.recv()
+        if self.need_curobo:
+            if getattr(self, "communication_flag", False):
+                if hasattr(self, "left_conn") and self.left_conn and hasattr(self, "right_conn") and self.right_conn:
+                    self.left_conn.send({"cmd": "reset"})
+                    _ = self.left_conn.recv()
+                    self.right_conn.send({"cmd": "reset"})
+                    _ = self.right_conn.recv()
+                else:
+                    self.set_planner(scene=scene)
+            else:
+                if (not hasattr(self, "left_planner")) or (not hasattr(self, "right_planner")) or (not isinstance(self.left_planner, CuroboPlanner)) or (not isinstance(self.right_planner, CuroboPlanner)):
+                    self.set_planner(scene=scene)
         else:
-            if not isinstance(self.left_planner, CuroboPlanner) or not isinstance(self.right_planner, CuroboPlanner):
+            if (not hasattr(self, "left_mplib_planner")) or self.left_mplib_planner is None or self.right_mplib_planner is None:
                 self.set_planner(scene=scene)
 
         self.init_joints()
@@ -258,47 +264,58 @@ class Robot:
         abs_left_curobo_yml_path = os.path.join(CONFIGS.ROOT_PATH, self.left_curobo_yml_path)
         abs_right_curobo_yml_path = os.path.join(CONFIGS.ROOT_PATH, self.right_curobo_yml_path)
 
-        self.communication_flag = (abs_left_curobo_yml_path != abs_right_curobo_yml_path)
+        self.communication_flag = False
+        self.left_planner = None
+        self.right_planner = None
+        self.left_conn = None
+        self.right_conn = None
 
-        if self.is_dual_arm:
-            abs_left_curobo_yml_path = abs_left_curobo_yml_path.replace("curobo.yml", "curobo_left.yml")
-            abs_right_curobo_yml_path = abs_right_curobo_yml_path.replace("curobo.yml", "curobo_right.yml")
+        if self.need_curobo:
+            self.communication_flag = (abs_left_curobo_yml_path != abs_right_curobo_yml_path)
 
-        if not self.communication_flag:
-            self.left_planner = CuroboPlanner(self.left_entity_origion_pose,
-                                              self.left_arm_joints_name,
-                                              [joint.get_name() for joint in self.left_entity.get_active_joints()],
-                                              yml_path=abs_left_curobo_yml_path)
-            self.right_planner = CuroboPlanner(self.right_entity_origion_pose,
-                                               self.right_arm_joints_name,
-                                               [joint.get_name() for joint in self.right_entity.get_active_joints()],
-                                               yml_path=abs_right_curobo_yml_path)
-        else:
-            self.left_conn, left_child_conn = mp.Pipe()
-            self.right_conn, right_child_conn = mp.Pipe()
+            if self.is_dual_arm:
+                abs_left_curobo_yml_path = abs_left_curobo_yml_path.replace("curobo.yml", "curobo_left.yml")
+                abs_right_curobo_yml_path = abs_right_curobo_yml_path.replace("curobo.yml", "curobo_right.yml")
 
-            left_args = {
-                "origin_pose": self.left_entity_origion_pose,
-                "joints_name": self.left_arm_joints_name,
-                "all_joints": [joint.get_name() for joint in self.left_entity.get_active_joints()],
-                "yml_path": abs_left_curobo_yml_path
-            }
+            if not self.communication_flag:
+                self.left_planner = CuroboPlanner(
+                    self.left_entity_origion_pose,
+                    self.left_arm_joints_name,
+                    [joint.get_name() for joint in self.left_entity.get_active_joints()],
+                    yml_path=abs_left_curobo_yml_path,
+                )
+                self.right_planner = CuroboPlanner(
+                    self.right_entity_origion_pose,
+                    self.right_arm_joints_name,
+                    [joint.get_name() for joint in self.right_entity.get_active_joints()],
+                    yml_path=abs_right_curobo_yml_path,
+                )
+            else:
+                self.left_conn, left_child_conn = mp.Pipe()
+                self.right_conn, right_child_conn = mp.Pipe()
 
-            right_args = {
-                "origin_pose": self.right_entity_origion_pose,
-                "joints_name": self.right_arm_joints_name,
-                "all_joints": [joint.get_name() for joint in self.right_entity.get_active_joints()],
-                "yml_path": abs_right_curobo_yml_path
-            }
+                left_args = {
+                    "origin_pose": self.left_entity_origion_pose,
+                    "joints_name": self.left_arm_joints_name,
+                    "all_joints": [joint.get_name() for joint in self.left_entity.get_active_joints()],
+                    "yml_path": abs_left_curobo_yml_path,
+                }
 
-            self.left_proc = mp.Process(target=planner_process_worker, args=(left_child_conn, left_args))
-            self.right_proc = mp.Process(target=planner_process_worker, args=(right_child_conn, right_args))
+                right_args = {
+                    "origin_pose": self.right_entity_origion_pose,
+                    "joints_name": self.right_arm_joints_name,
+                    "all_joints": [joint.get_name() for joint in self.right_entity.get_active_joints()],
+                    "yml_path": abs_right_curobo_yml_path,
+                }
 
-            self.left_proc.daemon = True
-            self.right_proc.daemon = True
+                self.left_proc = mp.Process(target=planner_process_worker, args=(left_child_conn, left_args))
+                self.right_proc = mp.Process(target=planner_process_worker, args=(right_child_conn, right_args))
 
-            self.left_proc.start()
-            self.right_proc.start()
+                self.left_proc.daemon = True
+                self.right_proc.daemon = True
+
+                self.left_proc.start()
+                self.right_proc.start()
 
         if self.need_topp:
             self.left_mplib_planner = MplibPlanner(
@@ -319,13 +336,31 @@ class Robot:
                 self.right_planner_type,
                 scene,
             )
+        else:
+            self.left_mplib_planner = None
+            self.right_mplib_planner = None
 
     def update_world_pcd(self, world_pcd):
+        if not self.need_curobo:
+            return
         try:
             self.left_planner.update_point_cloud(world_pcd, resolution=0.02)
             self.right_planner.update_point_cloud(world_pcd, resolution=0.02)
         except:
             print("Update world pointcloud wrong!")
+
+    def _require_curobo(self):
+        if not self.need_curobo:
+            raise RuntimeError("Curobo planner is disabled for the current action mode.")
+
+    def _plan_gripper_open_close(self, now_val, target_val):
+        num_step = 200
+        dis_val = target_val - now_val
+        return {
+            "num_step": num_step,
+            "per_step": dis_val / num_step,
+            "result": np.linspace(now_val, target_val, num_step),
+        }
 
     def _trans_from_gripper_to_endlink(self, target_pose, arm_tag=None):
         gripper_bias = (self.left_gripper_bias if arm_tag == "left" else self.right_gripper_bias)
@@ -339,6 +374,8 @@ class Robot:
         return sapien.Pose(gripper_pose_pos, gripper_pose_quat)
 
     def left_plan_grippers(self, now_val, target_val):
+        if not self.need_curobo:
+            return self._plan_gripper_open_close(now_val, target_val)
         if self.communication_flag:
             self.left_conn.send({"cmd": "plan_grippers", "now_val": now_val, "target_val": target_val})
             return self.left_conn.recv()
@@ -346,6 +383,8 @@ class Robot:
             return self.left_planner.plan_grippers(now_val, target_val)
 
     def right_plan_grippers(self, now_val, target_val):
+        if not self.need_curobo:
+            return self._plan_gripper_open_close(now_val, target_val)
         if self.communication_flag:
             self.right_conn.send({"cmd": "plan_grippers", "now_val": now_val, "target_val": target_val})
             return self.right_conn.recv()
@@ -360,6 +399,7 @@ class Robot:
         use_attach=False,
         last_qpos=None,
     ):
+        self._require_curobo()
         if constraint_pose is not None:
             constraint_pose = self.get_constraint_pose(constraint_pose, arm_tag="left")
         if last_qpos is None:
@@ -395,6 +435,7 @@ class Robot:
         use_attach=False,
         last_qpos=None,
     ):
+        self._require_curobo()
         if constraint_pose is not None:
             constraint_pose = self.get_constraint_pose(constraint_pose, arm_tag="right")
         if last_qpos is None:
@@ -430,6 +471,7 @@ class Robot:
         use_attach=False,
         last_qpos=None,
     ):
+        self._require_curobo()
         if constraint_pose is not None:
             constraint_pose = self.get_constraint_pose(constraint_pose, arm_tag="left")
         if last_qpos is None:
@@ -464,6 +506,7 @@ class Robot:
         use_attach=False,
         last_qpos=None,
     ):
+        self._require_curobo()
         if constraint_pose is not None:
             constraint_pose = self.get_constraint_pose(constraint_pose, arm_tag="right")
         if last_qpos is None:

@@ -57,6 +57,9 @@ class Camera:
 
         self.collect_head_camera = kwags["camera"].get("collect_head_camera", True)
         self.collect_wrist_camera = kwags["camera"].get("collect_wrist_camera", True)
+        renderer_cfg = kwags.get("renderer", {})
+        self.enable_observer_camera = bool(renderer_cfg.get("enable_observer_camera", True))
+        self.enable_world_cameras = bool(renderer_cfg.get("enable_world_cameras", True))
 
         # embodiment = kwags.get('embodiment')
         # embodiment_config_path = os.path.join(CONFIGS_PATH, '_embodiment_config.yml')
@@ -217,58 +220,63 @@ class Camera:
                 self.static_camera_config.append(camera_config)
 
         # observer camera
-        self.observer_camera = scene.add_camera(
-            name="observer_camera",
-            width=320,
-            height=240,
-            fovy=np.deg2rad(93),
-            near=near,
-            far=far,
-        )
-        observer_cam_pos = np.array([0.0, 0.23, 1.33])
-        observer_cam_forward = np.array([0, -1, -1.02])
-        # observer_cam_left = np.array([1,-1, 0])
-        observer_cam_left = np.array([1, 0, 0])
-        observer_up = np.cross(observer_cam_forward, observer_cam_left)
-        observer_mat44 = np.eye(4)
-        observer_mat44[:3, :3] = np.stack([observer_cam_forward, observer_cam_left, observer_up], axis=1)
-        observer_mat44[:3, 3] = observer_cam_pos
-        self.observer_camera.entity.set_pose(sapien.Pose(observer_mat44))
+        self.observer_camera = None
+        if self.enable_observer_camera:
+            self.observer_camera = scene.add_camera(
+                name="observer_camera",
+                width=320,
+                height=240,
+                fovy=np.deg2rad(93),
+                near=near,
+                far=far,
+            )
+            observer_cam_pos = np.array([0.0, 0.23, 1.33])
+            observer_cam_forward = np.array([0, -1, -1.02])
+            # observer_cam_left = np.array([1,-1, 0])
+            observer_cam_left = np.array([1, 0, 0])
+            observer_up = np.cross(observer_cam_forward, observer_cam_left)
+            observer_mat44 = np.eye(4)
+            observer_mat44[:3, :3] = np.stack([observer_cam_forward, observer_cam_left, observer_up], axis=1)
+            observer_mat44[:3, 3] = observer_cam_pos
+            self.observer_camera.entity.set_pose(sapien.Pose(observer_mat44))
 
-        # world pcd camera
-        self.world_camera1 = scene.add_camera(
-            name="world_camera1",
-            width=640,
-            height=480,
-            fovy=np.deg2rad(50),
-            near=near,
-            far=far,
-        )
-        world_cam_pos = np.array([0.4, -0.4, 1.6])
-        world_cam_forward = np.array([-1, 1, -1.4])
-        world_cam_left = np.array([-1, -1, 0])
-        world_cam_up = np.cross(world_cam_forward, world_cam_left)
-        world_cam_mat44 = np.eye(4)
-        world_cam_mat44[:3, :3] = np.stack([world_cam_forward, world_cam_left, world_cam_up], axis=1)
-        world_cam_mat44[:3, 3] = world_cam_pos
-        self.world_camera1.entity.set_pose(sapien.Pose(world_cam_mat44))
+        self.world_camera1 = None
+        self.world_camera2 = None
+        if self.enable_world_cameras:
+            # world pcd camera
+            self.world_camera1 = scene.add_camera(
+                name="world_camera1",
+                width=640,
+                height=480,
+                fovy=np.deg2rad(50),
+                near=near,
+                far=far,
+            )
+            world_cam_pos = np.array([0.4, -0.4, 1.6])
+            world_cam_forward = np.array([-1, 1, -1.4])
+            world_cam_left = np.array([-1, -1, 0])
+            world_cam_up = np.cross(world_cam_forward, world_cam_left)
+            world_cam_mat44 = np.eye(4)
+            world_cam_mat44[:3, :3] = np.stack([world_cam_forward, world_cam_left, world_cam_up], axis=1)
+            world_cam_mat44[:3, 3] = world_cam_pos
+            self.world_camera1.entity.set_pose(sapien.Pose(world_cam_mat44))
 
-        self.world_camera2 = scene.add_camera(
-            name="world_camera1",
-            width=640,
-            height=480,
-            fovy=np.deg2rad(50),
-            near=near,
-            far=far,
-        )
-        world_cam_pos = np.array([-0.4, -0.4, 1.6])
-        world_cam_forward = np.array([1, 1, -1.4])
-        world_cam_left = np.array([-1, 1, 0])
-        world_cam_up = np.cross(world_cam_forward, world_cam_left)
-        world_cam_mat44 = np.eye(4)
-        world_cam_mat44[:3, :3] = np.stack([world_cam_forward, world_cam_left, world_cam_up], axis=1)
-        world_cam_mat44[:3, 3] = world_cam_pos
-        self.world_camera2.entity.set_pose(sapien.Pose(world_cam_mat44))
+            self.world_camera2 = scene.add_camera(
+                name="world_camera1",
+                width=640,
+                height=480,
+                fovy=np.deg2rad(50),
+                near=near,
+                far=far,
+            )
+            world_cam_pos = np.array([-0.4, -0.4, 1.6])
+            world_cam_forward = np.array([1, 1, -1.4])
+            world_cam_left = np.array([-1, 1, 0])
+            world_cam_up = np.cross(world_cam_forward, world_cam_left)
+            world_cam_mat44 = np.eye(4)
+            world_cam_mat44[:3, :3] = np.stack([world_cam_forward, world_cam_left, world_cam_up], axis=1)
+            world_cam_mat44[:3, 3] = world_cam_pos
+            self.world_camera2.entity.set_pose(sapien.Pose(world_cam_mat44))
 
     def update_picture(self):
         # camera
@@ -364,6 +372,8 @@ class Camera:
         return res
 
     def get_observer_rgb(self) -> dict:
+        if self.observer_camera is None:
+            raise RuntimeError("Observer camera is disabled in the current renderer profile.")
         self.observer_camera.take_picture()
 
         def _get_rgb(camera):
@@ -449,6 +459,8 @@ class Camera:
 
     # Get World PointCloud
     def get_world_pcd(self):
+        if self.world_camera1 is None or self.world_camera2 is None:
+            raise RuntimeError("World pointcloud cameras are disabled in the current renderer profile.")
         self.world_camera1.take_picture()
         self.world_camera2.take_picture()
 

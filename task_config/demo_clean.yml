@@ -18,18 +18,22 @@ camera:
   head_camera_type: D435
   wrist_camera_type: D435
   collect_head_camera: true
-  collect_wrist_camera: true
+  # collect_wrist_camera: true
+  collect_wrist_camera: false
 data_type:
-  rgb: true
+  # rgb: true
+  rgb: false
   third_view: false
   depth: false
-  pointcloud: false
+  # pointcloud: false
+  pointcloud: true
   observer: false
   endpose: true
   qpos: true
   mesh_segmentation: false
   actor_segmentation: false
-pcd_down_sample_num: 1024
+# pcd_down_sample_num: 1024
+pcd_down_sample_num: 512
 pcd_crop: true
 save_path: ./data
 clear_cache_freq: 5

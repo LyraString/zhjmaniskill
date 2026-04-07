@@ -436,9 +436,15 @@ class RobotWorkspace(BaseWorkspace):
                             ema.step(self.model)
                         
                         if ((it + 1) % cfg.training.checkpoint_every) == 0:
-                            pretrain_epoch = int(self.epoch)
-                            save_name = f"online_fpo-pretrain_ep{pretrain_epoch}"
-                            self.save_checkpoint(f"checkpoints/{save_name}-{seed}/{self.epoch}-{it}.ckpt") 
+                            # Use one-based labels in checkpoint names so they match
+                            # the offline pretraining filenames (e.g. 2000.ckpt) and
+                            # the human-readable online iteration count.
+                            pretrain_epoch_label = int(self.epoch) + 1
+                            online_iter_label = int(it) + 1
+                            save_name = f"online_fpo-pretrain_ep{pretrain_epoch_label}"
+                            self.save_checkpoint(
+                                f"checkpoints/{save_name}-{seed}/{pretrain_epoch_label}-{online_iter_label}.ckpt"
+                            )
 
                         progress_line = _format_online_progress(it, online_iters, step_log)
                         pbar.set_postfix({

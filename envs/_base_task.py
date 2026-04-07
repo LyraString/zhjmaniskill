@@ -69,7 +69,8 @@ class Base_Task(gym.Env):
         self.dual_arm = kwags.get("dual_arm", True)
         self.eval_mode = kwags.get("eval_mode", False)
 
-        self.need_topp = True  # TODO
+        self.need_topp = kwags.get("need_topp", True)
+        self.need_curobo = kwags.get("need_curobo", True)
 
         # Random
         random_setting = kwags.get("domain_randomization")
@@ -87,7 +88,7 @@ class Base_Task(gym.Env):
         self.plan_success = True
         self.step_lim = None
         self.fix_gripper = False
-        self.setup_scene()
+        self.setup_scene(**kwags)
 
         self.left_js = None
         self.right_js = None
@@ -202,6 +203,13 @@ class Base_Task(gym.Env):
         Set the scene
             - Set up the basic scene: light source, viewer.
         """
+        renderer_cfg = kwargs.get("renderer", {})
+        renderer_device = renderer_cfg.get("device", "cuda:0")
+        camera_shader_dir = renderer_cfg.get("camera_shader_dir", "rt")
+        ray_tracing_spp = int(renderer_cfg.get("ray_tracing_samples_per_pixel", 32))
+        ray_tracing_depth = int(renderer_cfg.get("ray_tracing_path_depth", 8))
+        ray_tracing_denoiser = renderer_cfg.get("ray_tracing_denoiser", "oidn")
+
         self.engine = sapien.Engine()
         # declare sapien renderer
         from sapien.render import set_global_config
@@ -211,14 +219,15 @@ class Base_Task(gym.Env):
         # Explicitly bind Vulkan renderer to the same GPU as CUDA (respects CUDA_VISIBLE_DEVICES).
         # Inside the process, cuda:0 always maps to whatever physical GPU is first in
         # CUDA_VISIBLE_DEVICES, so this keeps compute and rendering on the same device.
-        self.renderer = sapien.SapienRenderer(device="cuda:0")
+        self.renderer = sapien.SapienRenderer(device=renderer_device)
         # give renderer to sapien sim
         self.engine.set_renderer(self.renderer)
 
-        sapien.render.set_camera_shader_dir("rt")
-        sapien.render.set_ray_tracing_samples_per_pixel(32)
-        sapien.render.set_ray_tracing_path_depth(8)
-        sapien.render.set_ray_tracing_denoiser("oidn")
+        sapien.render.set_camera_shader_dir(camera_shader_dir)
+        sapien.render.set_ray_tracing_samples_per_pixel(ray_tracing_spp)
+        sapien.render.set_ray_tracing_path_depth(ray_tracing_depth)
+        if ray_tracing_denoiser:
+            sapien.render.set_ray_tracing_denoiser(ray_tracing_denoiser)
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()
@@ -389,12 +398,26 @@ class Base_Task(gym.Env):
         """
         load aloha robot urdf file, set root pose and set joints
         """
+        robot_kwags = dict(kwags)
+        robot_kwags.pop("need_topp", None)
+        robot_kwags.pop("need_curobo", None)
+
         if not hasattr(self, "robot"):
-            self.robot = Robot(self.scene, self.need_topp, **kwags)
+            self.robot = Robot(
+                self.scene,
+                need_topp=self.need_topp,
+                need_curobo=self.need_curobo,
+                **robot_kwags,
+            )
             self.robot.set_planner(self.scene)
             self.robot.init_joints()
         else:
-            self.robot.reset(self.scene, self.need_topp, **kwags)
+            self.robot.reset(
+                self.scene,
+                need_topp=self.need_topp,
+                need_curobo=self.need_curobo,
+                **robot_kwags,
+            )
 
         for link in self.robot.left_entity.get_links():
             link: sapien.physx.PhysxArticulationLinkComponent = link
@@ -578,6 +601,34 @@ class Base_Task(gym.Env):
 
     def _set_eval_video_ffmpeg(self, ffmpeg):
         self.eval_video_ffmpeg = ffmpeg
+
+    def _get_eval_video_frame(self):
+        frame = self.now_obs.get("observation", {}).get("head_camera", {}).get("rgb", None)
+        if frame is not None:
+            return frame
+
+        if not getattr(self.cameras, "collect_head_camera", False):
+            return None
+
+        try:
+            # In point-cloud mode rgb may be absent from now_obs, but the head camera
+            # is still available. Grab a fresh RGB frame directly for eval video.
+            self.cameras.update_picture()
+            rgb = self.cameras.get_rgb()
+            return rgb.get("head_camera", {}).get("rgb", None)
+        except Exception:
+            return None
+
+    def _write_eval_video_frame(self):
+        if self.eval_video_path is None:
+            return
+        ffmpeg = getattr(self, "eval_video_ffmpeg", None)
+        if ffmpeg is None or ffmpeg.stdin is None:
+            return
+
+        frame = self._get_eval_video_frame()
+        if frame is not None:
+            ffmpeg.stdin.write(frame.tobytes())
 
     def close_env(self, clear_cache=False):
         if clear_cache:
@@ -1498,8 +1549,8 @@ class Base_Task(gym.Env):
             return
 
         eval_video_freq = 1  # fixed
-        if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
-            self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+        if self.take_action_cnt % eval_video_freq == 0:
+            self._write_eval_video_frame()
 
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
@@ -1674,8 +1725,7 @@ class Base_Task(gym.Env):
             if self.check_success():
                 self.eval_success = True
                 self.get_obs() # update obs
-                if (self.eval_video_path is not None):
-                    self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+                self._write_eval_video_frame()
                 return
 
         self._update_render()
