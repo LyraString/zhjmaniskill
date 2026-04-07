@@ -134,25 +134,25 @@ training:
   #RL 相关
   gamma: 0.99
   lmbda: 0.99
-  clip_coef: 0.05
-  timesteps_per_batch: 1024
+  clip_coef: 0.02
+  timesteps_per_batch: 4096 # 1024
   max_timesteps_per_episode: 2048
-  n_updates_per_iteration: 5
-  num_fpo_samples: 8
-  max_total_fpo_samples_per_call: 32
+  n_updates_per_iteration: 2  # 8
+  num_fpo_samples: 8 # 8
+  max_total_fpo_samples_per_call: 32  # 32
   online_iters: 1000
-  average_losses_before_exp: True
-  rho_clip: 3.0
+  ratio_mode: per_sample
+  clamp_logratio: 5.0
   rho_min: 1.0e-6
   rho_max: 100
-  num_minibatches: 8
+  num_minibatches: 4
   max_grad_norm: 1.0
   value_loss_coeff: 0.25
   # GAE
   reward_scaling: 1.0
   discounting: 1.0
   # 并行训练
-  num_envs: 8
+  num_envs: 4
   vec_env_start_method: spawn
   vec_env_timeout_sec: 120
 

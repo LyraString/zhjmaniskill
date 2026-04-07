@@ -535,7 +535,7 @@ class RobotWorkspace(BaseWorkspace):
                 delta = ep_rew[t] + gamma * next_value * eff_disc - ep_val[t]
                 gae_adv = delta + gamma * lmbda * eff_disc * trunc_mask * gae_adv
                 adv[t] = gae_adv
-                ret[t] = adv[t] + ep_val[t]
+                ret[t] = adv[t] + ep_val[t] 
                 next_value = ep_val[t]
 
             # 将每一个episode的优势函数添加到批次中
@@ -919,10 +919,12 @@ class RobotWorkspace(BaseWorkspace):
         max_grad_norm = float(getattr(cfg_t, "max_grad_norm", 1.0))
         value_loss_coeff = float(getattr(cfg_t, "value_loss_coeff", 0.25))
 
-        avg_before_exp = bool(getattr(cfg_t, "average_losses_before_exp", True))
-        rho_clip = float(getattr(cfg_t, "rho_clip", 3.0))
+        ratio_mode = str(getattr(cfg_t, "ratio_mode", "vanilla"))
+        clamp_logratio = getattr(cfg_t, "clamp_logratio", None)
+        if clamp_logratio is not None:
+            clamp_logratio = float(clamp_logratio)
         rho_min = float(getattr(cfg_t, "rho_min", 1e-6))
-        rho_max = float(getattr(cfg_t, "rho_max", 1e6))
+        rho_max = float(getattr(cfg_t, "rho_max", 100.0))
 
         flat_trunc = []
         for ep in rollout["batch_truncs"]:
@@ -959,7 +961,7 @@ class RobotWorkspace(BaseWorkspace):
 
         actor_losses = []
         critic_losses = []
-        rho_means = []
+        ratio_means = []
         cfm_diffs = []
 
         clipped_ratio_fracs = []
@@ -1015,23 +1017,39 @@ class RobotWorkspace(BaseWorkspace):
                     postdict=True,
                 )  # [B*N]
 
-                diff = (flat_init - curr).reshape(B, N)               # [B, N]
+                logratio = (flat_init - curr).reshape(B, N)
 
-                if avg_before_exp:
-                    rho = torch.exp(diff.mean(dim=1))   # 先均值后指数
+                if clamp_logratio is not None:
+                    logratio = torch.clamp(logratio, min=-clamp_logratio, max=clamp_logratio)
+
+                cfm_diffs.append(float(logratio.mean().item()))
+
+                if ratio_mode == "vanilla":
+                    ratio = torch.exp(logratio.mean(dim=1))
+                    ratio = torch.clamp(ratio, rho_min, rho_max)
+
+                    clipped_frac = (torch.abs(ratio - 1.0) > clip_coef).float().mean()
+                    clipped_ratio_fracs.append(float(clipped_frac.item()))
+
+                    surr1 = ratio * mb_adv
+                    surr2 = torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef) * mb_adv
+                    actor_loss = (-torch.min(surr1, surr2)).mean()
+
+                elif ratio_mode == "per_sample":
+                    ratio = torch.exp(logratio)
+                    ratio = torch.clamp(ratio, rho_min, rho_max)
+
+                    adv = mb_adv.unsqueeze(1).expand_as(ratio)
+
+                    clipped_frac = (torch.abs(ratio - 1.0) > clip_coef).float().mean()
+                    clipped_ratio_fracs.append(float(clipped_frac.item()))
+
+                    surr1 = ratio * adv
+                    surr2 = torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef) * adv
+                    actor_loss = (-torch.min(surr1, surr2)).mean()
+
                 else:
-                    rho = torch.exp(torch.clamp(diff, -rho_clip, rho_clip)).mean(dim=1)  # 逐样本clip后指数再聚合
-
-                rho = torch.clamp(rho, rho_min, rho_max)
-
-                cfm_diffs.append(float(diff.mean().item()))
-
-                clipped_frac = (torch.abs(rho - 1.0) > clip_coef).float().mean()
-                clipped_ratio_fracs.append(float(clipped_frac.item()))
-
-                surr1 = rho * mb_adv
-                surr2 = torch.clamp(rho, 1 - clip_coef, 1 + clip_coef) * mb_adv
-                actor_loss = (-torch.min(surr1, surr2)).mean()
+                    raise ValueError(f"Unknown ratio_mode: {ratio_mode}")
 
                 self.optimizer.zero_grad()
                 actor_loss.backward()
@@ -1051,12 +1069,12 @@ class RobotWorkspace(BaseWorkspace):
 
                 actor_losses.append(float(actor_loss.item()))
                 critic_losses.append(float(critic_loss.item()))
-                rho_means.append(float(rho.mean().item()))
+                ratio_means.append(float(ratio.mean().item()))
 
         return {
             "actor_loss": float(np.mean(actor_losses)) if actor_losses else 0.0,
             "critic_loss": float(np.mean(critic_losses)) if critic_losses else 0.0,
-            "rho_mean": float(np.mean(rho_means)) if rho_means else 0.0,
+            "rho_mean": float(np.mean(ratio_means)) if ratio_means else 0.0,
             "cfm_diff_mean": float(np.mean(cfm_diffs)) if cfm_diffs else 0.0,
             "clipped_ratio_frac": float(np.mean(clipped_ratio_fracs)) if clipped_ratio_fracs else 0.0,
         }

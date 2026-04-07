@@ -3,17 +3,16 @@ import numpy as np
 from .dp_model import DP
 import yaml
 
-def encode_obs(observation):  # Post-Process Observation
-    head_cam = (np.moveaxis(observation["observation"]["head_camera"]["rgb"], -1, 0) / 255)
-    left_cam = (np.moveaxis(observation["observation"]["left_camera"]["rgb"], -1, 0) / 255)
-    right_cam = (np.moveaxis(observation["observation"]["right_camera"]["rgb"], -1, 0) / 255)
-    obs = dict(
-        head_cam=head_cam,
-        left_cam=left_cam,
-        right_cam=right_cam,
-    )
-    obs["agent_pos"] = observation["joint_action"]["vector"]
+def encode_obs(observation):
+    point_cloud = observation["pointcloud"][..., :3].astype(np.float32)
+    agent_pos = observation["joint_action"]["vector"].astype(np.float32)
+
+    obs = {
+        "point_cloud": point_cloud,
+        "agent_pos": agent_pos,
+    }
     return obs
+
 
 
 def get_model(usr_args):  # from deploy_policy.yml and eval.sh (overrides)
