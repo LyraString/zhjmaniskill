@@ -121,7 +121,11 @@ class ManiSkillVectorEnvBackend:
         observations = []
         for env_index in range(self.num_envs):
             obs_i = _slice_batched_value(raw_obs, index=env_index, batch_size=self.num_envs)
-            info_i = _slice_batched_value(info, index=env_index, batch_size=self.num_envs) if info is not None else {}
+            info_i = (
+                _slice_batched_value(info, index=env_index, batch_size=self.num_envs)
+                if info is not None
+                else {}
+            )
             metadata = {
                 "backend": "maniskill",
                 "env_id": self.env_id,
@@ -135,6 +139,17 @@ class ManiSkillVectorEnvBackend:
             observations.append(convert_maniskill_obs(obs_i, metadata=metadata))
         return observations
 
+    def _validate_env_ids(self, env_ids: Sequence[int]) -> list[int]:
+        normalized = [int(env_id) for env_id in env_ids]
+        if len(normalized) == 0:
+            raise ValueError("env_ids must not be empty")
+        for env_id in normalized:
+            if env_id < 0 or env_id >= self.num_envs:
+                raise IndexError(
+                    f"env_id {env_id} is out of range for num_envs={self.num_envs}"
+                )
+        return normalized
+
     def reset(self, seeds: Sequence[int] | None = None):
         seed_arg = None
         if seeds is not None:
@@ -145,6 +160,36 @@ class ManiSkillVectorEnvBackend:
             seed_arg = [int(seed) for seed in seeds]
         raw_obs, info = self.env.reset(seed=seed_arg)
         return self._split_observations(raw_obs, info=info)
+
+    def reset_at(
+        self,
+        env_ids: Sequence[int],
+        seeds: Sequence[int] | None = None,
+    ):
+        env_ids = self._validate_env_ids(env_ids)
+        seed_arg = None
+        if seeds is not None:
+            if len(seeds) != len(env_ids):
+                raise ValueError(
+                    f"seeds length ({len(seeds)}) must match env_ids length ({len(env_ids)})"
+                )
+            if len(env_ids) == self.num_envs:
+                seed_arg = [int(seed) for seed in seeds]
+            elif len(env_ids) == 1:
+                seed_arg = int(seeds[0])
+            else:
+                raise NotImplementedError(
+                    "ManiSkill partial reset with multiple explicit seeds is not supported "
+                    "by this backend because ManiSkill reset expects either a scalar seed "
+                    "or a full num_envs seed list."
+                )
+
+        raw_obs, info = self.env.reset(
+            seed=seed_arg,
+            options={"env_idx": np.asarray(env_ids, dtype=np.int64)},
+        )
+        observations = self._split_observations(raw_obs, info=info)
+        return {env_id: observations[env_id] for env_id in env_ids}
 
     def step(self, actions: Sequence[ActionSpec]):
         if len(actions) != self.num_envs:

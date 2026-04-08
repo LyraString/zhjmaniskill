@@ -38,6 +38,7 @@ import torch.nn.functional as F
 from diffusion_policy.env_runner.fpo_runner import FPORunner
 from diffusion_policy.env_runner.vector_fpo_runner import VectorFPORunner
 from diffusion_policy.env_runner.maniskill_fpo_runner import ManiSkillFPORunner
+from diffusion_policy.env_runner.maniskill_vector_fpo_runner import ManiSkillVectorFPORunner
 
 # # Maniskill并行训练环境
 # import gymnasium as gym
@@ -428,23 +429,37 @@ class RobotWorkspace(BaseWorkspace):
 
         num_envs = int(getattr(cfg.training, "num_envs", 1))
         if env_backend == "maniskill":
-            if num_envs != 1:
-                raise ValueError("Stage 8 ManiSkill prototype only supports num_envs=1.")
             sim_config = getattr(cfg.training, "sim_config", None)
             sim_config = OmegaConf.to_container(sim_config, resolve=True) if sim_config is not None else None
-            env = ManiSkillFPORunner(
-                task_name=cfg.task.name,
-                base_seed=cfg.training.seed,
-                action_type=str(getattr(cfg.training, "action_type", "pd_joint_delta_pos")),
-                obs_mode=str(getattr(cfg.training, "obs_mode", "pointcloud+state_dict")),
-                control_mode=getattr(cfg.training, "control_mode", None),
-                render_mode=getattr(cfg.training, "render_mode", None),
-                sim_freq=getattr(cfg.training, "sim_freq", None),
-                control_freq=getattr(cfg.training, "control_freq", None),
-                sim_config=sim_config,
-                robot_uids=getattr(cfg.training, "robot_uids", None),
-                reward_mode=getattr(cfg.training, "reward_mode", None),
-            )
+            if num_envs > 1:
+                env = ManiSkillVectorFPORunner(
+                    task_name=cfg.task.name,
+                    num_envs=num_envs,
+                    base_seed=cfg.training.seed,
+                    action_type=str(getattr(cfg.training, "action_type", "pd_joint_delta_pos")),
+                    obs_mode=str(getattr(cfg.training, "obs_mode", "pointcloud+state_dict")),
+                    control_mode=getattr(cfg.training, "control_mode", None),
+                    render_mode=getattr(cfg.training, "render_mode", None),
+                    sim_freq=getattr(cfg.training, "sim_freq", None),
+                    control_freq=getattr(cfg.training, "control_freq", None),
+                    sim_config=sim_config,
+                    robot_uids=getattr(cfg.training, "robot_uids", None),
+                    reward_mode=getattr(cfg.training, "reward_mode", None),
+                )
+            else:
+                env = ManiSkillFPORunner(
+                    task_name=cfg.task.name,
+                    base_seed=cfg.training.seed,
+                    action_type=str(getattr(cfg.training, "action_type", "pd_joint_delta_pos")),
+                    obs_mode=str(getattr(cfg.training, "obs_mode", "pointcloud+state_dict")),
+                    control_mode=getattr(cfg.training, "control_mode", None),
+                    render_mode=getattr(cfg.training, "render_mode", None),
+                    sim_freq=getattr(cfg.training, "sim_freq", None),
+                    control_freq=getattr(cfg.training, "control_freq", None),
+                    sim_config=sim_config,
+                    robot_uids=getattr(cfg.training, "robot_uids", None),
+                    reward_mode=getattr(cfg.training, "reward_mode", None),
+                )
         elif num_envs > 1:
             env = VectorFPORunner(
                 task_name=cfg.task.name,

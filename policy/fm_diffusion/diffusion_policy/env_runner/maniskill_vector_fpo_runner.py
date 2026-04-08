@@ -37,6 +37,7 @@ class ManiSkillVectorFPORunner:
         self,
         task_name,
         num_envs=2,
+        base_seed=0,
         action_type="pd_joint_delta_pos",
         obs_mode="pointcloud+state_dict",
         control_mode=None,
@@ -48,7 +49,9 @@ class ManiSkillVectorFPORunner:
     ):
         self.task_name = task_name
         self.num_envs = int(num_envs)
+        self.base_seed = int(base_seed)
         self.action_type = action_type
+        self._episode_ids = [0 for _ in range(self.num_envs)]
         self.backend = ManiSkillTaskFactory().create_vector_env(
             task_name=task_name,
             num_envs=self.num_envs,
@@ -62,16 +65,47 @@ class ManiSkillVectorFPORunner:
             **backend_kwargs,
         )
 
+    def _seed_for_env(self, env_id: int) -> int:
+        return self.base_seed + self._episode_ids[env_id] * self.num_envs + env_id
+
     def reset(self):
-        observations = self.backend.reset()
+        seeds = [self._seed_for_env(env_id) for env_id in range(self.num_envs)]
+        observations = self.backend.reset(seeds=seeds)
         obs_list = [self._format_obs(dict(obs.data)) for obs in observations]
         info_list = [dict(obs.metadata) for obs in observations]
+        for env_id in range(self.num_envs):
+            self._episode_ids[env_id] += 1
         return obs_list, info_list
 
     def reset_at(self, env_ids):
-        raise NotImplementedError(
-            "ManiSkillVectorFPORunner.reset_at is intentionally deferred to stage 9B."
-        )
+        env_ids = [int(env_id) for env_id in env_ids]
+        if len(env_ids) == 0:
+            raise ValueError("env_ids must not be empty")
+
+        seeds = None
+        if len(env_ids) == self.num_envs:
+            seeds = [self._seed_for_env(env_id) for env_id in env_ids]
+            observations = self.backend.reset(seeds=seeds)
+            reset_out = {}
+            for env_id in env_ids:
+                obs = observations[env_id]
+                reset_out[env_id] = (
+                    self._format_obs(dict(obs.data)),
+                    dict(obs.metadata),
+                )
+                self._episode_ids[env_id] += 1
+            return reset_out
+
+        observations = self.backend.reset_at(env_ids)
+        reset_out = {}
+        for env_id in env_ids:
+            obs = observations[env_id]
+            reset_out[env_id] = (
+                self._format_obs(dict(obs.data)),
+                dict(obs.metadata),
+            )
+            self._episode_ids[env_id] += 1
+        return reset_out
 
     def step(self, actions):
         if len(actions) != self.num_envs:
