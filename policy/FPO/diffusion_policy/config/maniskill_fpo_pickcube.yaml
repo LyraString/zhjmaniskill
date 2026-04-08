@@ -1,0 +1,174 @@
+defaults:
+  - _self_
+  - task: maniskill_pickcube_task
+
+name: maniskill_fpo_pickcube
+_target_: diffusion_policy.workspace.fpo_robotworkspace.RobotWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "maniskill_pickcube"
+
+horizon: 8
+n_obs_steps: 3
+n_action_steps: 6
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+past_action_visible: False
+keypoint_visible_rate: 1.0
+obs_as_global_cond: True
+
+policy:
+  _target_: diffusion_policy.policy.FPO_image_policy.FPOImagePolicy
+  shape_meta: ${shape_meta}
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.pointcloud_obs_encoder.PointCloudObsEncoder
+    shape_meta: ${shape_meta}
+    pointnet_out_dim: 512
+    use_layernorm: True
+  horizon: ${horizon}
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 10
+  obs_as_global_cond: ${obs_as_global_cond}
+  diffusion_step_embed_dim: 128
+  down_dims: [256, 512, 1024]
+  kernel_size: 5
+  n_groups: 8
+  cond_predict_scale: True
+  sigma_min: 0.0
+  ode_solver: euler
+  discretize_t_for_training: True
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 64
+  num_workers: 0
+  shuffle: True
+  pin_memory: True
+  persistent_workers: False
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 0
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+critic:
+  _target_: diffusion_policy.model.rl.value_mlp.CriticMLP
+  input_dim: 1563
+  hidden_dims: [1024, 512, 256]
+  activation: tanh
+  use_layer_norm: true
+  orthogonal_init: true
+  output_gain: 1.0
+
+critic_optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: False
+  resume_ckpt_path: null
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 1
+  gradient_accumulate_every: 1
+  use_ema: True
+  freeze_encoder: False
+  rollout_every: 1
+  checkpoint_every: 100
+  val_every: 1
+  sample_every: 1
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+  gamma: 0.99
+  lmbda: 0.99
+  clip_coef: 0.02
+  timesteps_per_batch: 64
+  max_timesteps_per_episode: 50
+  n_updates_per_iteration: 1
+  num_fpo_samples: 2
+  max_total_fpo_samples_per_call: 8
+  online_iters: 1
+  ratio_mode: per_sample
+  clamp_logratio: 5.0
+  rho_min: 1.0e-6
+  rho_max: 100
+  num_minibatches: 1
+  max_grad_norm: 1.0
+  value_loss_coeff: 0.25
+  reward_scaling: 1.0
+  discounting: 1.0
+  num_envs: 1
+  env_backend: maniskill
+  online_only_no_dataset: True
+  action_type: pd_joint_delta_pos
+  obs_mode: pointcloud+state_dict
+  control_mode: null
+  render_mode: null
+  reward_mode: normalized_dense
+  robot_uids: panda
+  sim_freq: 200
+  control_freq: 20
+
+logging:
+  project: FPO_policy_debug
+  resume: True
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}", "FPO", "maniskill"]
+  id: null
+  group: null
+  tensorboard:
+    enabled: True
+    log_every: 1
+    flush_secs: 10
+
+checkpoint:
+  topk:
+    monitor_key: test_mean_score
+    mode: max
+    k: 5
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
+
+setting: null
+expert_data_num: null
+head_camera_type: null

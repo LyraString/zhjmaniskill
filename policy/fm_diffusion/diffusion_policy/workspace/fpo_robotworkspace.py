@@ -29,6 +29,7 @@ from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
+from diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 
 from diffusion_policy.model.rl.value_mlp import CriticMLP
 from collections import deque
@@ -36,6 +37,7 @@ import torch.nn.functional as F
 
 from diffusion_policy.env_runner.fpo_runner import FPORunner
 from diffusion_policy.env_runner.vector_fpo_runner import VectorFPORunner
+from diffusion_policy.env_runner.maniskill_fpo_runner import ManiSkillFPORunner
 
 # # Maniskill并行训练环境
 # import gymnasium as gym
@@ -79,6 +81,35 @@ def _format_online_progress(it, total, step_log):
         f"rho={rho_mean:.4f} clip_frac={clipped_ratio_frac:.4f}"
     )
 # --------------------------------新增结束--------------------------------
+
+
+def _create_identity_field_normalizer(dim: int) -> SingleFieldLinearNormalizer:
+    scale = torch.ones(dim, dtype=torch.float32)
+    offset = torch.zeros(dim, dtype=torch.float32)
+    input_stats = {
+        "min": -torch.ones(dim, dtype=torch.float32),
+        "max": torch.ones(dim, dtype=torch.float32),
+        "mean": torch.zeros(dim, dtype=torch.float32),
+        "std": torch.ones(dim, dtype=torch.float32),
+    }
+    return SingleFieldLinearNormalizer.create_manual(
+        scale=scale,
+        offset=offset,
+        input_stats_dict=input_stats,
+    )
+
+
+def _create_identity_normalizer_from_shape_meta(shape_meta: dict) -> LinearNormalizer:
+    obs_shape_meta = shape_meta["obs"]
+    point_cloud_dim = int(obs_shape_meta["point_cloud"]["shape"][-1])
+    agent_pos_dim = int(obs_shape_meta["agent_pos"]["shape"][0])
+    action_dim = int(shape_meta["action"]["shape"][0])
+
+    normalizer = LinearNormalizer()
+    normalizer["point_cloud"] = _create_identity_field_normalizer(point_cloud_dim)
+    normalizer["agent_pos"] = _create_identity_field_normalizer(agent_pos_dim)
+    normalizer["action"] = _create_identity_field_normalizer(action_dim)
+    return normalizer
 
 class RobotWorkspace(BaseWorkspace):
     include_keys = ["global_step", "epoch"]
@@ -134,32 +165,42 @@ class RobotWorkspace(BaseWorkspace):
                     print(f"Resuming from checkpoint {lastest_ckpt_path}")
                     self.load_checkpoint(path=lastest_ckpt_path)
 
-        # configure dataset
-        dataset: BaseImageDataset
-        dataset = hydra.utils.instantiate(cfg.task.dataset)
-        assert isinstance(dataset, BaseImageDataset)
-        train_dataloader = create_dataloader(dataset, **cfg.dataloader)
-        normalizer = dataset.get_normalizer()
+        env_backend = str(getattr(cfg.training, "env_backend", "robotwin_legacy"))
+        skip_offline_dataset = bool(getattr(cfg.training, "online_only_no_dataset", False))
 
-        # configure validation dataset
-        val_dataset = dataset.get_validation_dataset()
-        val_dataloader = create_dataloader(val_dataset, **cfg.val_dataloader)
+        dataset = None
+        train_dataloader = None
+        val_dataset = None
+        val_dataloader = None
+        if env_backend == "maniskill" and skip_offline_dataset:
+            normalizer = _create_identity_normalizer_from_shape_meta(cfg.shape_meta)
+        else:
+            dataset = hydra.utils.instantiate(cfg.task.dataset)
+            assert isinstance(dataset, BaseImageDataset)
+            train_dataloader = create_dataloader(dataset, **cfg.dataloader)
+            normalizer = dataset.get_normalizer()
+
+            # configure validation dataset
+            val_dataset = dataset.get_validation_dataset()
+            val_dataloader = create_dataloader(val_dataset, **cfg.val_dataloader)
 
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
             self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
-        lr_scheduler = get_scheduler(
-            cfg.training.lr_scheduler,
-            optimizer=self.optimizer,
-            num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=(len(train_dataloader) * cfg.training.num_epochs) //
-            cfg.training.gradient_accumulate_every,
-            # pytorch assumes stepping LRScheduler every epoch
-            # however huggingface diffusers steps it every batch
-            last_epoch=self.global_step - 1,
-        )
+        lr_scheduler = None
+        if train_dataloader is not None:
+            lr_scheduler = get_scheduler(
+                cfg.training.lr_scheduler,
+                optimizer=self.optimizer,
+                num_warmup_steps=cfg.training.lr_warmup_steps,
+                num_training_steps=(len(train_dataloader) * cfg.training.num_epochs) //
+                cfg.training.gradient_accumulate_every,
+                # pytorch assumes stepping LRScheduler every epoch
+                # however huggingface diffusers steps it every batch
+                last_epoch=self.global_step - 1,
+            )
 
         # configure ema
         ema: EMAModel = None
@@ -386,7 +427,25 @@ class RobotWorkspace(BaseWorkspace):
         # 在线训练部分
 
         num_envs = int(getattr(cfg.training, "num_envs", 1))
-        if num_envs > 1:
+        if env_backend == "maniskill":
+            if num_envs != 1:
+                raise ValueError("Stage 8 ManiSkill prototype only supports num_envs=1.")
+            sim_config = getattr(cfg.training, "sim_config", None)
+            sim_config = OmegaConf.to_container(sim_config, resolve=True) if sim_config is not None else None
+            env = ManiSkillFPORunner(
+                task_name=cfg.task.name,
+                base_seed=cfg.training.seed,
+                action_type=str(getattr(cfg.training, "action_type", "pd_joint_delta_pos")),
+                obs_mode=str(getattr(cfg.training, "obs_mode", "pointcloud+state_dict")),
+                control_mode=getattr(cfg.training, "control_mode", None),
+                render_mode=getattr(cfg.training, "render_mode", None),
+                sim_freq=getattr(cfg.training, "sim_freq", None),
+                control_freq=getattr(cfg.training, "control_freq", None),
+                sim_config=sim_config,
+                robot_uids=getattr(cfg.training, "robot_uids", None),
+                reward_mode=getattr(cfg.training, "reward_mode", None),
+            )
+        elif num_envs > 1:
             env = VectorFPORunner(
                 task_name=cfg.task.name,
                 setting=cfg.setting,
