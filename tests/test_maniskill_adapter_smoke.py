@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 from core.schemas.action import ActionSpec
 from sim.maniskill import (
     ManiSkillTaskFactory,
+    ManiSkillVectorEnvBackend,
     convert_action_to_maniskill,
     convert_maniskill_obs,
 )
@@ -68,6 +69,34 @@ class ManiSkillAdapterSmokeTest(unittest.TestCase):
             control_freq=40,
             sim_config={"spacing": 3},
             env_kwargs={},
+        )
+
+    def test_task_factory_passes_vector_kwargs(self) -> None:
+        factory = ManiSkillTaskFactory()
+        with patch("sim.maniskill.task_factory.ManiSkillVectorEnvBackend") as backend_cls:
+            backend_cls.return_value = object()
+            factory.create_vector_env(
+                task_name="PickCube-v1",
+                num_envs=4,
+                action_type="pd_joint_delta_pos",
+                obs_mode="pointcloud+state_dict",
+                sim_freq=200,
+                control_freq=40,
+                sim_config={"spacing": 3},
+                render_mode=None,
+                reward_mode="normalized_dense",
+            )
+
+        backend_cls.assert_called_once_with(
+            env_id="PickCube-v1",
+            num_envs=4,
+            obs_mode="pointcloud+state_dict",
+            control_mode="pd_joint_delta_pos",
+            render_mode=None,
+            sim_freq=200,
+            control_freq=40,
+            sim_config={"spacing": 3},
+            env_kwargs={"reward_mode": "normalized_dense"},
         )
 
 
