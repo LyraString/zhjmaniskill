@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +13,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from core.schemas.action import ActionSpec
-from sim.maniskill import convert_action_to_maniskill, convert_maniskill_obs
+from sim.maniskill import (
+    ManiSkillTaskFactory,
+    convert_action_to_maniskill,
+    convert_maniskill_obs,
+)
 
 
 class ManiSkillAdapterSmokeTest(unittest.TestCase):
@@ -39,6 +44,31 @@ class ManiSkillAdapterSmokeTest(unittest.TestCase):
             np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32),
         )
         self.assertEqual(obs.metadata["env_id"], "PickCube-v1")
+
+    def test_task_factory_passes_fixed_rate_kwargs(self) -> None:
+        factory = ManiSkillTaskFactory()
+        with patch("sim.maniskill.task_factory.ManiSkillEnvBackend") as backend_cls:
+            backend_cls.return_value = object()
+            factory.create_env(
+                task_name="PickCube-v1",
+                action_type="continuous",
+                obs_mode="state",
+                sim_freq=200,
+                control_freq=40,
+                sim_config={"spacing": 3},
+                render_mode=None,
+            )
+
+        backend_cls.assert_called_once_with(
+            env_id="PickCube-v1",
+            obs_mode="state",
+            control_mode=None,
+            render_mode=None,
+            sim_freq=200,
+            control_freq=40,
+            sim_config={"spacing": 3},
+            env_kwargs={},
+        )
 
 
 if __name__ == "__main__":

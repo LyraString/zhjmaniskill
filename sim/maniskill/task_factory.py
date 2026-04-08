@@ -18,6 +18,9 @@ class ManiSkillTaskFactory(TaskFactory):
         obs_mode = str(kwargs.pop("obs_mode", "state"))
         control_mode = kwargs.pop("control_mode", None)
         render_mode = kwargs.pop("render_mode", None)
+        sim_freq = kwargs.pop("sim_freq", None)
+        control_freq = kwargs.pop("control_freq", None)
+        sim_config = kwargs.pop("sim_config", None)
 
         if control_mode is None and action_type not in (None, "", "continuous"):
             control_mode = str(action_type)
@@ -27,6 +30,9 @@ class ManiSkillTaskFactory(TaskFactory):
             obs_mode=obs_mode,
             control_mode=control_mode,
             render_mode=render_mode,
+            sim_freq=int(sim_freq) if sim_freq is not None else None,
+            control_freq=int(control_freq) if control_freq is not None else None,
+            sim_config=dict(sim_config or {}),
             env_kwargs=dict(kwargs),
         )
 
