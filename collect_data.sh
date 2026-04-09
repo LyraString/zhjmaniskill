@@ -1,8 +1,21 @@
 #!/bin/bash
 
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 task_name task_config [gpu_id] [extra args passed to script/collect_data.py]"
+    exit 1
+fi
+
 task_name=${1}
 task_config=${2}
-gpu_id=${3}
+shift 2
+
+gpu_id=
+if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+    gpu_id=${1}
+    shift
+fi
+
+extra_args=("$@")
 
 ./script/.update_path.sh > /dev/null 2>&1
 
@@ -20,5 +33,16 @@ else
 fi
 
 PYTHONWARNINGS=ignore::UserWarning \
-python script/collect_data.py $task_name $task_config
-rm -rf data/${task_name}/${task_config}/.cache
+python script/collect_data.py "$task_name" "$task_config" "${extra_args[@]}"
+
+backend=robotwin
+for ((i=0; i<${#extra_args[@]}; i++)); do
+    if [ "${extra_args[$i]}" = "--backend" ] && [ $((i + 1)) -lt ${#extra_args[@]} ]; then
+        backend="${extra_args[$((i + 1))]}"
+        break
+    fi
+done
+
+if [ "${backend}" = "robotwin" ]; then
+    rm -rf data/${task_name}/${task_config}/.cache
+fi
