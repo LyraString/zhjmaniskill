@@ -2,11 +2,6 @@ import sys
 
 sys.path.append("./")
 
-import sapien.core as sapien
-from sapien.render import clear_cache
-from collections import OrderedDict
-import pdb
-from envs import *
 import yaml
 import importlib
 import json
@@ -37,6 +32,7 @@ def get_embodiment_config(robot_file):
 
 
 def main(task_name=None, task_config=None):
+    from envs import CONFIGS_PATH
 
     task = class_decorator(task_name)
     config_path = f"./task_config/{task_config}.yml"
@@ -104,6 +100,8 @@ def main(task_name=None, task_config=None):
 
 
 def run(TASK_ENV, args):
+    from envs.utils.create_actor import UnStableError
+
     epid, suc_num, fail_num, seed_list = 0, 0, 0, []
 
     print(f"Task Name: \033[34m{args['task_name']}\033[0m")
@@ -236,17 +234,32 @@ def run(TASK_ENV, args):
 
 
 if __name__ == "__main__":
-    from test_render import Sapien_TEST
-    Sapien_TEST()
-
-    import torch.multiprocessing as mp
-    mp.set_start_method("spawn", force=True)
-
     parser = ArgumentParser()
     parser.add_argument("task_name", type=str)
     parser.add_argument("task_config", type=str)
-    parser = parser.parse_args()
-    task_name = parser.task_name
-    task_config = parser.task_config
+    parser.add_argument("--backend", choices=("robotwin", "maniskill"), default="robotwin")
+    parser.add_argument("--episode-num", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max-episode-steps", type=int, default=50)
+    parser.add_argument("--action-type", type=str, default="pd_joint_delta_pos")
+    parser.add_argument("--obs-mode", type=str, default="pointcloud+state_dict")
+    parser.add_argument("--control-mode", type=str, default=None)
+    parser.add_argument("--render-mode", type=str, default=None)
+    parser.add_argument("--reward-mode", type=str, default="normalized_dense")
+    parser.add_argument("--robot-uids", type=str, default="panda")
+    parser.add_argument("--sim-freq", type=int, default=200)
+    parser.add_argument("--control-freq", type=int, default=20)
+    args = parser.parse_args()
 
-    main(task_name=task_name, task_config=task_config)
+    if args.backend == "maniskill":
+        from script.collect_maniskill_data import run_collection
+
+        run_collection(args)
+    else:
+        from test_render import Sapien_TEST
+        Sapien_TEST()
+
+        import torch.multiprocessing as mp
+        mp.set_start_method("spawn", force=True)
+
+        main(task_name=args.task_name, task_config=args.task_config)

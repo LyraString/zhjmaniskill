@@ -5,8 +5,6 @@ import subprocess
 sys.path.append("./")
 sys.path.append(f"./policy")
 sys.path.append("./description/utils")
-from envs import CONFIGS_PATH
-from envs.utils.create_actor import UnStableError
 
 import numpy as np
 from pathlib import Path
@@ -18,8 +16,6 @@ from datetime import datetime
 import importlib
 import argparse
 import pdb
-
-from generate_episode_instructions import *
 
 current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
@@ -62,6 +58,8 @@ def get_embodiment_config(robot_file):
 
 
 def main(usr_args):
+    from envs import CONFIGS_PATH
+
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     task_name = usr_args["task_name"]
     task_config = usr_args["task_config"]
@@ -196,6 +194,9 @@ def eval_policy(task_name,
                 test_num=100,
                 video_size=None,
                 instruction_type=None):
+    from envs.utils.create_actor import UnStableError
+    from generate_episode_instructions import generate_episode_descriptions
+
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
@@ -331,7 +332,18 @@ def eval_policy(task_name,
 
 
 def parse_args_and_config():
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--backend", choices=("robotwin", "maniskill"), default="robotwin")
+    pre_args, remaining = pre_parser.parse_known_args()
+
+    if pre_args.backend == "maniskill":
+        from script.eval_maniskill_policy import build_parser
+
+        parser = build_parser()
+        return parser.parse_args(remaining)
+
     parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", choices=("robotwin", "maniskill"), default="robotwin")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--overrides", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -360,9 +372,12 @@ def parse_args_and_config():
 
 
 if __name__ == "__main__":
-    from test_render import Sapien_TEST
-    Sapien_TEST()
-
     usr_args = parse_args_and_config()
+    if isinstance(usr_args, dict):
+        from test_render import Sapien_TEST
+        Sapien_TEST()
+        main(usr_args)
+    else:
+        from script.eval_maniskill_policy import run_evaluation
 
-    main(usr_args)
+        run_evaluation(usr_args)

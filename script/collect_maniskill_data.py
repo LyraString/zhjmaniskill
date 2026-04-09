@@ -11,7 +11,7 @@ from core.schemas.action import ActionSpec
 from sim.maniskill import ManiSkillTaskFactory, ManiSkillTrajectoryRecorder
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Collect ManiSkill episodes into `.npz` files.")
     parser.add_argument("task_name", type=str, help="ManiSkill env id, e.g. PickCube-v1")
     parser.add_argument("task_config", type=str, help="Dataset subdirectory name under data/<task_name>/")
@@ -26,8 +26,10 @@ def main() -> None:
     parser.add_argument("--robot-uids", type=str, default="panda")
     parser.add_argument("--sim-freq", type=int, default=200)
     parser.add_argument("--control-freq", type=int, default=20)
-    args = parser.parse_args()
+    return parser
 
+
+def run_collection(args) -> None:
     save_dir = REPO_ROOT / "data" / args.task_name / args.task_config
     recorder = ManiSkillTrajectoryRecorder(save_dir)
     env = ManiSkillTaskFactory().create_env(
@@ -60,6 +62,12 @@ def main() -> None:
             print(f"saved {out_path}")
     finally:
         env.close()
+
+
+def main(argv=None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    run_collection(args)
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ def _to_bool_scalar(value) -> bool:
     return bool(value)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate a ManiSkill checkpoint in a ManiSkill env.")
     parser.add_argument("policy_kind", choices=sorted(ADAPTER_MODULES.keys()))
     parser.add_argument("ckpt_path", type=str)
@@ -44,8 +44,10 @@ def main() -> None:
     parser.add_argument("--robot-uids", type=str, default="panda")
     parser.add_argument("--sim-freq", type=int, default=200)
     parser.add_argument("--control-freq", type=int, default=20)
-    args = parser.parse_args()
+    return parser
 
+
+def run_evaluation(args) -> None:
     adapter = importlib.import_module(ADAPTER_MODULES[args.policy_kind])
     model = adapter.get_model({"ckpt_path": args.ckpt_path})
 
@@ -108,6 +110,12 @@ def main() -> None:
         f"mean_length={float(np.mean(lengths)):.2f} "
         f"success_rate={float(np.mean(successes)):.4f}"
     )
+
+
+def main(argv=None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    run_evaluation(args)
 
 
 if __name__ == "__main__":
