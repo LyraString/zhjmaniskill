@@ -18,7 +18,7 @@ from sim.maniskill import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Collect ManiSkill episodes into `.npz` files.")
-    parser.add_argument("task_name", type=str, help="ManiSkill env id, e.g. PickCube-v1")
+    parser.add_argument("task_name", type=str, help="ManiSkill env id or the env id associated with --task-profile")
     parser.add_argument("task_config", type=str, help="Dataset subdirectory name under data/<task_name>/")
     parser.add_argument("episode_num", type=int, help="Number of episodes to collect")
     parser.add_argument("--task-profile", type=str, default=None, help="Optional registered ManiSkill task profile")
@@ -35,8 +35,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_task_key(args) -> tuple[str, str]:
+    if args.task_profile is None:
+        return args.task_name, args.task_name
+
+    profile = resolve_task_profile(args.task_profile)
+    if profile is None:
+        raise ValueError(f"Unknown ManiSkill task profile: {args.task_profile}")
+
+    env_id = str(profile["env_id"])
+    if args.task_name not in (args.task_profile, env_id):
+        raise ValueError(
+            f"task_name `{args.task_name}` does not match task profile "
+            f"`{args.task_profile}` (expected `{env_id}` or `{args.task_profile}`)."
+        )
+
+    return args.task_profile, env_id
+
+
 def run_collection(args) -> None:
-    task_key = args.task_profile or args.task_name
+    task_key, save_task_name = _resolve_task_key(args)
     profile = resolve_task_profile(task_key)
     runtime_kwargs = {
         "action_type": args.action_type,
@@ -48,7 +66,6 @@ def run_collection(args) -> None:
         "sim_freq": args.sim_freq,
         "control_freq": args.control_freq,
     }
-    save_task_name = str(profile["env_id"]) if profile is not None else args.task_name
     _, resolved_runtime, _profile_name = apply_task_profile(task_key, runtime_kwargs)
     save_dir = REPO_ROOT / "data" / save_task_name / args.task_config
     recorder = ManiSkillTrajectoryRecorder(save_dir)

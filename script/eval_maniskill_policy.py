@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate a ManiSkill checkpoint in a ManiSkill env.")
     parser.add_argument("policy_kind", choices=sorted(ADAPTER_MODULES.keys()))
     parser.add_argument("ckpt_path", type=str)
-    parser.add_argument("task_name", type=str, help="ManiSkill env id, e.g. PickCube-v1")
+    parser.add_argument("task_name", type=str, help="ManiSkill env id or the env id associated with --task-profile")
     parser.add_argument("--task-profile", type=str, default=None, help="Optional registered ManiSkill task profile")
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max-episode-steps", type=int, default=50)
@@ -48,10 +48,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_task_key(args) -> str:
+    if args.task_profile is None:
+        return args.task_name
+
+    from sim.maniskill import resolve_task_profile
+
+    profile = resolve_task_profile(args.task_profile)
+    if profile is None:
+        raise ValueError(f"Unknown ManiSkill task profile: {args.task_profile}")
+
+    env_id = str(profile["env_id"])
+    if args.task_name not in (args.task_profile, env_id):
+        raise ValueError(
+            f"task_name `{args.task_name}` does not match task profile "
+            f"`{args.task_profile}` (expected `{env_id}` or `{args.task_profile}`)."
+        )
+
+    return args.task_profile
+
+
 def run_evaluation(args) -> None:
     adapter = importlib.import_module(ADAPTER_MODULES[args.policy_kind])
     model = adapter.get_model({"ckpt_path": args.ckpt_path})
-    task_key = args.task_profile or args.task_name
+    task_key = _resolve_task_key(args)
     runtime_kwargs = {
         "action_type": args.action_type,
         "obs_mode": args.obs_mode,
