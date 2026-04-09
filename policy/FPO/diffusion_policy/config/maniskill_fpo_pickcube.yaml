@@ -125,14 +125,14 @@ training:
   num_envs: 2
   env_backend: maniskill
   online_only_no_dataset: True
-  action_type: pd_joint_delta_pos
-  obs_mode: pointcloud+state_dict
-  control_mode: null
-  render_mode: null
-  reward_mode: normalized_dense
-  robot_uids: panda
-  sim_freq: 200
-  control_freq: 20
+  action_type: ${task.maniskill.action_type}
+  obs_mode: ${task.maniskill.obs_mode}
+  control_mode: ${task.maniskill.control_mode}
+  render_mode: ${task.maniskill.render_mode}
+  reward_mode: ${task.maniskill.reward_mode}
+  robot_uids: ${task.maniskill.robot_uids}
+  sim_freq: ${task.maniskill.sim_freq}
+  control_freq: ${task.maniskill.control_freq}
 
 logging:
   project: FPO_policy_debug

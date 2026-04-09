@@ -11,7 +11,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from core.schemas.action import ActionSpec
-from sim.maniskill import ManiSkillTaskFactory
+from sim.maniskill import ManiSkillTaskFactory, apply_task_profile
 
 
 ADAPTER_MODULES = {
@@ -33,34 +33,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("policy_kind", choices=sorted(ADAPTER_MODULES.keys()))
     parser.add_argument("ckpt_path", type=str)
     parser.add_argument("task_name", type=str, help="ManiSkill env id, e.g. PickCube-v1")
+    parser.add_argument("--task-profile", type=str, default=None, help="Optional registered ManiSkill task profile")
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max-episode-steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--action-type", type=str, default="pd_joint_delta_pos")
-    parser.add_argument("--obs-mode", type=str, default="pointcloud+state_dict")
+    parser.add_argument("--action-type", type=str, default=None)
+    parser.add_argument("--obs-mode", type=str, default=None)
     parser.add_argument("--control-mode", type=str, default=None)
     parser.add_argument("--render-mode", type=str, default=None)
-    parser.add_argument("--reward-mode", type=str, default="normalized_dense")
-    parser.add_argument("--robot-uids", type=str, default="panda")
-    parser.add_argument("--sim-freq", type=int, default=200)
-    parser.add_argument("--control-freq", type=int, default=20)
+    parser.add_argument("--reward-mode", type=str, default=None)
+    parser.add_argument("--robot-uids", type=str, default=None)
+    parser.add_argument("--sim-freq", type=int, default=None)
+    parser.add_argument("--control-freq", type=int, default=None)
     return parser
 
 
 def run_evaluation(args) -> None:
     adapter = importlib.import_module(ADAPTER_MODULES[args.policy_kind])
     model = adapter.get_model({"ckpt_path": args.ckpt_path})
+    task_key = args.task_profile or args.task_name
+    runtime_kwargs = {
+        "action_type": args.action_type,
+        "obs_mode": args.obs_mode,
+        "control_mode": args.control_mode,
+        "render_mode": args.render_mode,
+        "reward_mode": args.reward_mode,
+        "robot_uids": args.robot_uids,
+        "sim_freq": args.sim_freq,
+        "control_freq": args.control_freq,
+    }
+    _, resolved_runtime, _profile_name = apply_task_profile(task_key, runtime_kwargs)
 
     env = ManiSkillTaskFactory().create_env(
-        task_name=args.task_name,
-        action_type=args.action_type,
-        obs_mode=args.obs_mode,
-        control_mode=args.control_mode,
-        render_mode=args.render_mode,
-        reward_mode=args.reward_mode,
-        robot_uids=args.robot_uids,
-        sim_freq=args.sim_freq,
-        control_freq=args.control_freq,
+        task_name=task_key,
+        **resolved_runtime,
     )
 
     returns = []
@@ -82,7 +88,9 @@ def run_evaluation(args) -> None:
                 action_chunk = model.get_action()
 
                 for action in action_chunk:
-                    result = env.step(ActionSpec.from_value(action, action_type=args.action_type))
+                    result = env.step(
+                        ActionSpec.from_value(action, action_type=resolved_runtime["action_type"])
+                    )
                     episode_return += float(result.reward)
                     episode_length += 1
                     encoded_obs = adapter.encode_obs(dict(result.observation.data))
