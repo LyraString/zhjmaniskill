@@ -1,0 +1,39 @@
+name: PickCube-v1
+
+shape_meta: &shape_meta
+  obs:
+    point_cloud:
+      shape: [512, 3]
+      type: point_cloud
+    agent_pos:
+      shape: [9]
+      type: low_dim
+  action:
+    shape: [8]
+
+env_runner:
+  _target_: diffusion_policy.env_runner.pusht_image_runner.PushTImageRunner
+  n_train: 0
+  n_train_vis: 0
+  train_start_seed: 0
+  n_test: 0
+  n_test_vis: 0
+  legacy_test: False
+  test_start_seed: 0
+  max_steps: 0
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 10
+  past_action: ${past_action_visible}
+  n_envs: null
+
+dataset:
+  _target_: diffusion_policy.dataset.robot_pointcloud_dataset.RobotPointCloudDataset
+  zarr_path: data/PickCube-v1-smoke_npz-1.zarr
+  batch_size: ${dataloader.batch_size}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.0
+  max_train_episodes: null
