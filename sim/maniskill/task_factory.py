@@ -8,7 +8,7 @@ from core.interfaces.env_backend import EnvBackend
 from core.interfaces.task_factory import TaskFactory
 from core.interfaces.vector_env_backend import VectorEnvBackend
 from sim.maniskill.runtime_env import ManiSkillEnvBackend
-from sim.maniskill.task_profiles import apply_task_profile
+from sim.maniskill.task_profiles import apply_task_profile, resolve_runtime_control_mode
 from sim.maniskill.vector_runtime_env import ManiSkillVectorEnvBackend
 
 
@@ -25,8 +25,10 @@ class ManiSkillTaskFactory(TaskFactory):
         control_freq = resolved_kwargs.pop("control_freq", None)
         sim_config = resolved_kwargs.pop("sim_config", None)
 
-        if control_mode is None and action_type not in (None, "", "continuous"):
-            control_mode = str(action_type)
+        _resolved_action_type, control_mode = resolve_runtime_control_mode(
+            action_type=action_type,
+            control_mode=control_mode,
+        )
 
         return ManiSkillEnvBackend(
             env_id=env_id,
@@ -54,8 +56,10 @@ class ManiSkillTaskFactory(TaskFactory):
         control_freq = resolved_kwargs.pop("control_freq", None)
         sim_config = resolved_kwargs.pop("sim_config", None)
 
-        if control_mode is None and action_type not in (None, "", "continuous"):
-            control_mode = str(action_type)
+        _resolved_action_type, control_mode = resolve_runtime_control_mode(
+            action_type=action_type,
+            control_mode=control_mode,
+        )
 
         return ManiSkillVectorEnvBackend(
             env_id=env_id,

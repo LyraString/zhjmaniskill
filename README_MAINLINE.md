@@ -45,6 +45,8 @@ bash mainline.sh <command> ...
 - 训练 / 评估 / 数据处理参数仍然以命令行显式参数为准
 - `task_profile` 目前只作为 ManiSkill 侧的辅助信息和一致性提示，不会替你自动补齐那串运行参数
 - 如果你后面要接自己的任务，可以在 shell 命令末尾加 `--`，把额外 override 原样透传给底层入口
+- 为了减少和 RoboTwin 现有使用习惯的差异，外部配置和命令仍然可以继续写 `action_type`
+- 但在 ManiSkill 内部，这一层会被解释成官方文档里的 `control_mode` 兼容别名
 
 目前支持：
 
@@ -226,6 +228,7 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
 - ManiSkill 运行时创建环境时，当前主线会优先使用 `task.maniskill.env_id`。这更符合 ManiSkill 原生用法。
 - `task.name` 可以继续作为你自己的训练任务别名，不必强行等于 env id。
 - `maniskill.profile` 现在是可选的默认参数模板层，不是创建 ManiSkill 环境的必需字段。
+- 你可以继续沿用当前仓库里的 `action_type` 写法；只有在直接参考 ManiSkill 官方文档时，记住它在本仓库内部对应的是 `control_mode`。
 - FM 这边主要由 `shape_meta` 驱动。
 - FPO 这边的 critic 输入维度现在也会根据 `shape_meta` 自动推导，不再写死在 `pickcube_smoke` 的 9 维 `agent_pos` 上。
 - 也就是说，只要你的 task yaml 里的 observation / action 维度写对，后面这两条主线都能跟着适配。

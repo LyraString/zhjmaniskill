@@ -39,6 +39,7 @@ from diffusion_policy.env_runner.fpo_runner import FPORunner
 from diffusion_policy.env_runner.vector_fpo_runner import VectorFPORunner
 from diffusion_policy.env_runner.maniskill_fpo_runner import ManiSkillFPORunner
 from diffusion_policy.env_runner.maniskill_vector_fpo_runner import ManiSkillVectorFPORunner
+from sim.maniskill.task_profiles import resolve_runtime_control_mode
 
 # # Maniskill并行训练环境
 # import gymnasium as gym
@@ -434,6 +435,10 @@ class RobotWorkspace(BaseWorkspace):
             task_maniskill_cfg = getattr(cfg.task, "maniskill", None)
             task_profile = getattr(task_maniskill_cfg, "profile", None) if task_maniskill_cfg is not None else None
             task_env_id = getattr(task_maniskill_cfg, "env_id", None) if task_maniskill_cfg is not None else None
+            runtime_action_type, runtime_control_mode = resolve_runtime_control_mode(
+                action_type=getattr(cfg.training, "action_type", "pd_joint_delta_pos"),
+                control_mode=getattr(cfg.training, "control_mode", None),
+            )
             if num_envs > 1:
                 env = ManiSkillVectorFPORunner(
                     task_name=cfg.task.name,
@@ -441,9 +446,9 @@ class RobotWorkspace(BaseWorkspace):
                     env_id=task_env_id,
                     num_envs=num_envs,
                     base_seed=cfg.training.seed,
-                    action_type=str(getattr(cfg.training, "action_type", "pd_joint_delta_pos")),
+                    action_type=runtime_action_type,
                     obs_mode=str(getattr(cfg.training, "obs_mode", "pointcloud+state_dict")),
-                    control_mode=getattr(cfg.training, "control_mode", None),
+                    control_mode=runtime_control_mode,
                     render_mode=getattr(cfg.training, "render_mode", None),
                     sim_freq=getattr(cfg.training, "sim_freq", None),
                     control_freq=getattr(cfg.training, "control_freq", None),
@@ -457,9 +462,9 @@ class RobotWorkspace(BaseWorkspace):
                     task_profile=task_profile,
                     env_id=task_env_id,
                     base_seed=cfg.training.seed,
-                    action_type=str(getattr(cfg.training, "action_type", "pd_joint_delta_pos")),
+                    action_type=runtime_action_type,
                     obs_mode=str(getattr(cfg.training, "obs_mode", "pointcloud+state_dict")),
-                    control_mode=getattr(cfg.training, "control_mode", None),
+                    control_mode=runtime_control_mode,
                     render_mode=getattr(cfg.training, "render_mode", None),
                     sim_freq=getattr(cfg.training, "sim_freq", None),
                     control_freq=getattr(cfg.training, "control_freq", None),

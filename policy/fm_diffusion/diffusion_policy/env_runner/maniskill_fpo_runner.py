@@ -13,7 +13,7 @@ if str(robotwin_root) not in sys.path:
 
 from runners.online_env_runner import OnlineEnvRunner
 from sim.maniskill import ManiSkillTaskFactory
-from sim.maniskill.task_profiles import resolve_runtime_task_target
+from sim.maniskill.task_profiles import resolve_runtime_control_mode, resolve_runtime_task_target
 
 
 class ManiSkillFPORunner(OnlineEnvRunner):
@@ -54,12 +54,16 @@ class ManiSkillFPORunner(OnlineEnvRunner):
             task_profile=task_profile,
             env_id=env_id,
         )
+        runtime_action_type, runtime_control_mode = resolve_runtime_control_mode(
+            action_type=action_type,
+            control_mode=control_mode,
+        )
         super().__init__(
             task_factory=ManiSkillTaskFactory(),
             task_name=runtime_task_name,
-            action_type=action_type,
+            action_type=runtime_action_type,
             obs_mode=obs_mode,
-            control_mode=control_mode,
+            control_mode=runtime_control_mode,
             render_mode=render_mode,
             sim_freq=sim_freq,
             control_freq=control_freq,
@@ -70,6 +74,7 @@ class ManiSkillFPORunner(OnlineEnvRunner):
         self.runtime_task_name = str(runtime_task_name)
         self.task_profile = resolved_profile_name
         self.env_id = str(env_id) if env_id not in (None, "") else self.runtime_task_name
+        self.control_mode = runtime_control_mode
         self.base_seed = int(base_seed)
         self.episode_id = 0
 

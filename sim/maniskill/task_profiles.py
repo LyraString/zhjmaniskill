@@ -19,6 +19,9 @@ RUNTIME_DEFAULT_KEYS = (
 
 
 DEFAULT_MANISKILL_RUNTIME: dict[str, Any] = {
+    # ``action_type`` is preserved as a RoboTwin-style compatibility alias.
+    # Internally we resolve it to ManiSkill's canonical ``control_mode`` when
+    # no explicit control_mode is provided.
     "action_type": "pd_joint_delta_pos",
     "obs_mode": "pointcloud+state_dict",
     "control_mode": None,
@@ -116,6 +119,27 @@ def resolve_runtime_task_target(
         return str(fallback_profile["env_id"]), str(fallback_profile["profile_name"])
 
     return normalized_task_name, None
+
+
+def resolve_runtime_control_mode(
+    *,
+    action_type: str | None = None,
+    control_mode: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve external RoboTwin-style action naming into ManiSkill semantics."""
+
+    normalized_action_type = None if action_type in (None, "") else str(action_type)
+    normalized_control_mode = None if control_mode in (None, "") else str(control_mode)
+
+    if normalized_control_mode is not None:
+        if normalized_action_type in (None, "continuous"):
+            normalized_action_type = normalized_control_mode
+        return normalized_action_type, normalized_control_mode
+
+    if normalized_action_type in (None, "continuous"):
+        return normalized_action_type, None
+
+    return normalized_action_type, normalized_action_type
 
 
 def apply_task_profile(
