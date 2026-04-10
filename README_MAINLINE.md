@@ -21,6 +21,7 @@
   - RoboTwin 自定义 ManiSkill env 注册入口
   - `BaseBimanualEnv` 负责通用双臂 env 骨架
   - `DualUR5WSG-v1` 只是一个默认 `UR5-WSG` 验证实例
+  - `HandoverBlock-v1` 是第一个真实 RoboTwin 任务 env
 - `data/converters/`
   - RoboTwin HDF5 converter 和 ManiSkill NPZ converter
 - `runners/`
@@ -258,6 +259,9 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
 - `DualUR5WSG-v1` 目前只是 embodiment 验证 env
   - 它用来确认 RoboTwin 的双臂 embodiment 能否在 ManiSkill 的固定频率 / GPU 并行语义下落地
   - 当前默认实例是 `UR5-WSG + UR5-WSG`
+- `HandoverBlock-v1` 目前只迁移了场景布局、reset 分布和空间成功条件
+  - 还没有迁移 RoboTwin 的 expert script
+  - 还没有把 `is_right_gripper_open()` 这一项接进 ManiSkill success 判定
   - 它还不是 `HandoverBlock-v1`，也没有迁移 RoboTwin 的脚本式 handover 逻辑
   - 任务逻辑和 embodiment 现在开始重新分层，对齐 RoboTwin2.0 原本结构
 
