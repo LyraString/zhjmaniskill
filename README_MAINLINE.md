@@ -39,6 +39,12 @@
 bash mainline.sh <command> ...
 ```
 
+这里的设计原则是：
+
+- `mainline.sh` 只负责把命令转发到现有脚本
+- 训练 / 评估 / 数据处理参数仍然以命令行显式参数为准
+- `task_profile` 目前只作为 ManiSkill 侧的辅助信息和一致性提示，不会替你自动补齐那串运行参数
+
 目前支持：
 
 - `collect`
@@ -66,6 +72,8 @@ bash mainline.sh collect PickCube-v1 smoke_npz 0 \
 ```text
 data/PickCube-v1/smoke_npz/data/episode0.npz
 ```
+
+根目录的 [collect_data.sh](/home/idiot/zhj/RoboTwin/collect_data.sh) 现在也已经改成对当前工作目录不敏感，可以从仓库外部目录直接调用。
 
 ### 2. ManiSkill 转 zarr
 

@@ -1,5 +1,8 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="${SCRIPT_DIR}"
+
 if [ $# -lt 2 ]; then
     echo "Usage: $0 task_name task_config [gpu_id] [extra args passed to script/collect_data.py]"
     exit 1
@@ -17,7 +20,8 @@ fi
 
 extra_args=("$@")
 
-./script/.update_path.sh > /dev/null 2>&1
+cd "${ROOT_DIR}"
+"${ROOT_DIR}/script/.update_path.sh" > /dev/null 2>&1
 
 # If caller passes a GPU id (arg 3), use it. Otherwise pick the GPU that has display attached.
 if [ -z "${gpu_id}" ]; then
@@ -33,7 +37,7 @@ else
 fi
 
 PYTHONWARNINGS=ignore::UserWarning \
-python script/collect_data.py "$task_name" "$task_config" "${extra_args[@]}"
+python "${ROOT_DIR}/script/collect_data.py" "$task_name" "$task_config" "${extra_args[@]}"
 
 backend=robotwin
 for ((i=0; i<${#extra_args[@]}; i++)); do
@@ -44,5 +48,5 @@ for ((i=0; i<${#extra_args[@]}; i++)); do
 done
 
 if [ "${backend}" = "robotwin" ]; then
-    rm -rf data/${task_name}/${task_config}/.cache
+    rm -rf "${ROOT_DIR}/data/${task_name}/${task_config}/.cache"
 fi
