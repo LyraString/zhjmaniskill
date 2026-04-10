@@ -223,6 +223,9 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
 
 说明：
 
+- ManiSkill 运行时创建环境时，当前主线会优先使用 `task.maniskill.env_id`。这更符合 ManiSkill 原生用法。
+- `task.name` 可以继续作为你自己的训练任务别名，不必强行等于 env id。
+- `maniskill.profile` 现在是可选的默认参数模板层，不是创建 ManiSkill 环境的必需字段。
 - FM 这边主要由 `shape_meta` 驱动。
 - FPO 这边的 critic 输入维度现在也会根据 `shape_meta` 自动推导，不再写死在 `pickcube_smoke` 的 9 维 `agent_pos` 上。
 - 也就是说，只要你的 task yaml 里的 observation / action 维度写对，后面这两条主线都能跟着适配。

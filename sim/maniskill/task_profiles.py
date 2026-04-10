@@ -70,6 +70,54 @@ def resolve_task_profile(task_name_or_profile: str | None) -> dict[str, Any] | N
     return None
 
 
+def resolve_runtime_task_target(
+    *,
+    task_name: str | None = None,
+    task_profile: str | None = None,
+    env_id: str | None = None,
+) -> tuple[str, str | None]:
+    """Resolve the canonical ManiSkill env identifier for runtime creation.
+
+    Priority is intentionally aligned with ManiSkill-native usage:
+    explicit ``env_id`` first, then optional profile indirection, and finally
+    ``task_name`` as a backward-compatible fallback.
+    """
+
+    normalized_task_name = str(task_name) if task_name not in (None, "") else None
+    normalized_task_profile = str(task_profile) if task_profile not in (None, "") else None
+    normalized_env_id = str(env_id) if env_id not in (None, "") else None
+
+    resolved_profile_name: str | None = None
+    profile = None
+    if normalized_task_profile is not None:
+        profile = resolve_task_profile(normalized_task_profile)
+        if profile is None:
+            raise KeyError(f"Unknown ManiSkill task profile: {normalized_task_profile}")
+        resolved_profile_name = str(profile["profile_name"])
+        profile_env_id = str(profile["env_id"])
+        if normalized_env_id is not None and normalized_env_id != profile_env_id:
+            raise ValueError(
+                "Conflicting ManiSkill task identifiers: "
+                f"profile `{resolved_profile_name}` resolves to env_id `{profile_env_id}`, "
+                f"but explicit env_id `{normalized_env_id}` was also provided."
+            )
+
+    if normalized_env_id is not None:
+        return normalized_env_id, resolved_profile_name
+
+    if profile is not None:
+        return str(profile["env_id"]), resolved_profile_name
+
+    if normalized_task_name is None:
+        raise ValueError("At least one of task_name, task_profile, or env_id must be provided.")
+
+    fallback_profile = resolve_task_profile(normalized_task_name)
+    if fallback_profile is not None:
+        return str(fallback_profile["env_id"]), str(fallback_profile["profile_name"])
+
+    return normalized_task_name, None
+
+
 def apply_task_profile(
     task_name: str,
     runtime_kwargs: dict[str, Any],

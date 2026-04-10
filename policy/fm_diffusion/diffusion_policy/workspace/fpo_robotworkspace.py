@@ -431,9 +431,14 @@ class RobotWorkspace(BaseWorkspace):
         if env_backend == "maniskill":
             sim_config = getattr(cfg.training, "sim_config", None)
             sim_config = OmegaConf.to_container(sim_config, resolve=True) if sim_config is not None else None
+            task_maniskill_cfg = getattr(cfg.task, "maniskill", None)
+            task_profile = getattr(task_maniskill_cfg, "profile", None) if task_maniskill_cfg is not None else None
+            task_env_id = getattr(task_maniskill_cfg, "env_id", None) if task_maniskill_cfg is not None else None
             if num_envs > 1:
                 env = ManiSkillVectorFPORunner(
                     task_name=cfg.task.name,
+                    task_profile=task_profile,
+                    env_id=task_env_id,
                     num_envs=num_envs,
                     base_seed=cfg.training.seed,
                     action_type=str(getattr(cfg.training, "action_type", "pd_joint_delta_pos")),
@@ -449,6 +454,8 @@ class RobotWorkspace(BaseWorkspace):
             else:
                 env = ManiSkillFPORunner(
                     task_name=cfg.task.name,
+                    task_profile=task_profile,
+                    env_id=task_env_id,
                     base_seed=cfg.training.seed,
                     action_type=str(getattr(cfg.training, "action_type", "pd_joint_delta_pos")),
                     obs_mode=str(getattr(cfg.training, "obs_mode", "pointcloud+state_dict")),

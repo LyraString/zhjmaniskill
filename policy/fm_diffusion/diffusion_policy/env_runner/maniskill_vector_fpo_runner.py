@@ -13,6 +13,7 @@ if str(robotwin_root) not in sys.path:
 
 from core.schemas.action import ActionSpec
 from sim.maniskill import ManiSkillTaskFactory
+from sim.maniskill.task_profiles import resolve_runtime_task_target
 
 
 class ManiSkillVectorFPORunner:
@@ -36,6 +37,8 @@ class ManiSkillVectorFPORunner:
     def __init__(
         self,
         task_name,
+        task_profile=None,
+        env_id=None,
         num_envs=2,
         base_seed=0,
         action_type="pd_joint_delta_pos",
@@ -47,13 +50,21 @@ class ManiSkillVectorFPORunner:
         sim_config=None,
         **backend_kwargs,
     ):
-        self.task_name = task_name
+        runtime_task_name, resolved_profile_name = resolve_runtime_task_target(
+            task_name=task_name,
+            task_profile=task_profile,
+            env_id=env_id,
+        )
+        self.task_name = str(task_name)
+        self.runtime_task_name = str(runtime_task_name)
+        self.task_profile = resolved_profile_name
+        self.env_id = str(env_id) if env_id not in (None, "") else self.runtime_task_name
         self.num_envs = int(num_envs)
         self.base_seed = int(base_seed)
         self.action_type = action_type
         self._episode_ids = [0 for _ in range(self.num_envs)]
         self.backend = ManiSkillTaskFactory().create_vector_env(
-            task_name=task_name,
+            task_name=runtime_task_name,
             num_envs=self.num_envs,
             action_type=action_type,
             obs_mode=obs_mode,
