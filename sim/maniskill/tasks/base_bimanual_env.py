@@ -22,7 +22,7 @@ class BaseBimanualEnv(BaseEnv):
     """Minimal ManiSkill base env that validates a RoboTwin-style bimanual embodiment."""
 
     SUPPORTED_ROBOTS = ["none"]
-    SUPPORTED_OBS_MODES = ("state_dict", "state", "none")
+    SUPPORTED_OBS_MODES = ("state_dict", "state", "none", "pointcloud+state_dict")
     SUPPORTED_REWARD_MODES = ("none", "dense", "normalized_dense", "sparse")
     ARM_DOF = 6
     GRIPPER_OPEN_THRESHOLD = 0.8
