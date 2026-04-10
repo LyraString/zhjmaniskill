@@ -261,7 +261,9 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
   - 当前默认实例是 `UR5-WSG + UR5-WSG`
 - `HandoverBlock-v1` 目前只迁移了场景布局、reset 分布和空间成功条件
   - 还没有迁移 RoboTwin 的 expert script
-  - 还没有把 `is_right_gripper_open()` 这一项接进 ManiSkill success 判定
+  - 当前已经补了最小 `14` 维动作接口：左臂 `6 + 1`、右臂 `6 + 1`
+  - 臂动作是 joint delta，gripper 动作是归一化开合目标
+  - `is_right_gripper_open()` 已经接回 ManiSkill success 判定
   - 它还不是 `HandoverBlock-v1`，也没有迁移 RoboTwin 的脚本式 handover 逻辑
   - 任务逻辑和 embodiment 现在开始重新分层，对齐 RoboTwin2.0 原本结构
 

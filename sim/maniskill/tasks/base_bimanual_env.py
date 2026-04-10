@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import copy
 from typing import Any
 
+import gymnasium as gym
 import numpy as np
 import sapien
 import torch
 
 from mani_skill.envs.sapien_env import BaseEnv
+from mani_skill.utils import common
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
 from mani_skill.utils.building.ground import build_ground
@@ -21,6 +24,10 @@ class BaseBimanualEnv(BaseEnv):
     SUPPORTED_ROBOTS = ["none"]
     SUPPORTED_OBS_MODES = ("state_dict", "state", "none")
     SUPPORTED_REWARD_MODES = ("none", "dense", "normalized_dense", "sparse")
+    ARM_DOF = 6
+    GRIPPER_OPEN_THRESHOLD = 0.8
+    ARM_DELTA_SCALE = 0.05
+    ACTION_DIM = 14
 
     def __init__(
         self,
@@ -30,7 +37,17 @@ class BaseBimanualEnv(BaseEnv):
         **kwargs,
     ):
         self.embodiment_spec = embodiment_spec
+        self.left_gripper_val = 0.0
+        self.right_gripper_val = 0.0
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
+        self.single_action_space = gym.spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(self.ACTION_DIM,),
+            dtype=np.float32,
+        )
+        self.action_space = self.single_action_space
+        self._orig_single_action_space = copy.deepcopy(self.single_action_space)
 
     @property
     def _default_sim_config(self):
@@ -66,6 +83,33 @@ class BaseBimanualEnv(BaseEnv):
         self.workspace_table = table_builder.build_static(name="workspace_table")
         self.left_robot = self._load_robot(arm_index=0, name="left_embodiment")
         self.right_robot = self._load_robot(arm_index=1, name="right_embodiment")
+        self.left_arm_joints = self._get_arm_joints(self.left_robot, arm_index=0)
+        self.right_arm_joints = self._get_arm_joints(self.right_robot, arm_index=1)
+        self.left_gripper = self._get_gripper_joints(self.left_robot, arm_index=0)
+        self.right_gripper = self._get_gripper_joints(self.right_robot, arm_index=1)
+        self._configure_robot_drives(self.left_arm_joints, self.left_gripper, arm_index=0)
+        self._configure_robot_drives(self.right_arm_joints, self.right_gripper, arm_index=1)
+
+    def _get_arm_joints(self, robot, arm_index: int):
+        return [
+            robot.find_joint_by_name(joint_name)
+            for joint_name in self.embodiment_spec.arm_joint_names(arm_index)
+        ]
+
+    def _get_gripper_joints(self, robot, arm_index: int):
+        gripper_name = self.embodiment_spec.gripper_name(arm_index)
+        joints = [(robot.find_joint_by_name(gripper_name["base"]), 1.0, 0.0)]
+        for joint_name, sign, offset in gripper_name["mimic"]:
+            joints.append((robot.find_joint_by_name(joint_name), float(sign), float(offset)))
+        return joints
+
+    def _configure_robot_drives(self, arm_joints, gripper_joints, arm_index: int):
+        joint_stiffness, joint_damping = self.embodiment_spec.joint_drive_params(arm_index)
+        gripper_stiffness, gripper_damping = self.embodiment_spec.gripper_drive_params(arm_index)
+        for joint in arm_joints:
+            joint.set_drive_properties(joint_stiffness, joint_damping)
+        for joint, _, _ in gripper_joints:
+            joint.set_drive_properties(gripper_stiffness, gripper_damping)
 
     def _initialize_robot_state(self, robot, env_idx: torch.Tensor, arm_index: int):
         qpos = robot.get_qpos().clone()
@@ -83,14 +127,99 @@ class BaseBimanualEnv(BaseEnv):
 
         robot.set_qpos(qpos)
         robot.set_qvel(qvel)
+        arm_joints = self.left_arm_joints if arm_index == 0 else self.right_arm_joints
+        for joint_index, joint in enumerate(arm_joints[: qpos.shape[1]]):
+            joint.set_drive_target(qpos[:, joint.active_index])
+            joint.set_drive_velocity_target(torch.zeros_like(qvel[:, joint.active_index]))
+
+    def _set_gripper(self, gripper_val: torch.Tensor, arm_index: int):
+        gripper_val = torch.clamp(gripper_val, 0.0, 1.0)
+        gripper_scale = self.embodiment_spec.gripper_scale(arm_index)
+        real_gripper_val = gripper_scale[0] + gripper_val * (gripper_scale[1] - gripper_scale[0])
+
+        joints = self.left_gripper if arm_index == 0 else self.right_gripper
+        if arm_index == 0:
+            self.left_gripper_val = float(gripper_val[0].item()) if self.num_envs == 1 else float(gripper_val.mean().item())
+        else:
+            self.right_gripper_val = float(gripper_val[0].item()) if self.num_envs == 1 else float(gripper_val.mean().item())
+
+        for joint, sign, offset in joints:
+            drive_target = real_gripper_val * sign + offset
+            current_target = common.to_tensor(joint.get_drive_target(), device=self.device).reshape(-1)
+            if current_target.shape[0] == 1 and self.num_envs > 1:
+                current_target = current_target.repeat(self.num_envs)
+            drive_velocity_target = torch.clamp(drive_target - current_target, -1.0, 1.0) * 0.05
+            joint.set_drive_target(drive_target)
+            joint.set_drive_velocity_target(drive_velocity_target)
+
+    def get_left_gripper_val(self):
+        return self.left_gripper_val
+
+    def get_right_gripper_val(self):
+        return self.right_gripper_val
+
+    def is_left_gripper_open(self):
+        return self.left_gripper_val > self.GRIPPER_OPEN_THRESHOLD
+
+    def is_right_gripper_open(self):
+        return self.right_gripper_val > self.GRIPPER_OPEN_THRESHOLD
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
             self._initialize_robot_state(self.left_robot, env_idx, arm_index=0)
             self._initialize_robot_state(self.right_robot, env_idx, arm_index=1)
+            self._set_gripper(torch.zeros(self.num_envs, device=self.device), arm_index=0)
+            self._set_gripper(torch.zeros(self.num_envs, device=self.device), arm_index=1)
+
+    def _apply_arm_action(self, robot, arm_joints, delta: torch.Tensor):
+        qpos = robot.get_qpos().clone()
+        qvel = robot.get_qvel().clone()
+        current_arm_qpos = torch.stack([joint.qpos.reshape(-1) for joint in arm_joints], dim=1)
+        target_arm_qpos = current_arm_qpos + delta * self.ARM_DELTA_SCALE
+        for joint_index, joint in enumerate(arm_joints):
+            qpos[:, joint.active_index] = target_arm_qpos[:, joint_index]
+            joint.set_drive_target(target_arm_qpos[:, joint_index])
+            joint.set_drive_velocity_target(torch.zeros_like(qvel[:, joint.active_index]))
+        robot.set_qpos(qpos)
+
+    def _step_action(self, action):
+        if action is None:
+            parsed_action = None
+        else:
+            parsed_action = common.to_tensor(action, device=self.device).to(torch.float32)
+            if parsed_action.shape == self._orig_single_action_space.shape:
+                parsed_action = common.batch(parsed_action)
+            parsed_action = torch.clamp(parsed_action, -1.0, 1.0)
+            self._apply_arm_action(self.left_robot, self.left_arm_joints, parsed_action[:, 0:6])
+            self._set_gripper((parsed_action[:, 6] + 1.0) / 2.0, arm_index=0)
+            self._apply_arm_action(self.right_robot, self.right_arm_joints, parsed_action[:, 7:13])
+            self._set_gripper((parsed_action[:, 13] + 1.0) / 2.0, arm_index=1)
+
+        self._before_control_step()
+        for _ in range(self._sim_steps_per_control):
+            self._before_simulation_step()
+            self.scene.step()
+            self._after_simulation_step()
+        self._after_control_step()
+        if self.gpu_sim_enabled:
+            self.scene._gpu_fetch_all()
+        return parsed_action
 
     def _get_obs_agent(self):
-        return dict()
+        return dict(
+            left_gripper_val=torch.full(
+                (self.num_envs, 1),
+                self.left_gripper_val,
+                device=self.device,
+                dtype=torch.float32,
+            ),
+            right_gripper_val=torch.full(
+                (self.num_envs, 1),
+                self.right_gripper_val,
+                device=self.device,
+                dtype=torch.float32,
+            ),
+        )
 
     def get_state_dict(self):
         return self.scene.get_sim_state()
@@ -124,6 +253,8 @@ class BaseBimanualEnv(BaseEnv):
                 left_qpos=self.left_robot.get_qpos(),
                 right_qpos=self.right_robot.get_qpos(),
                 workspace_table_pose=self.workspace_table.pose.raw_pose,
+                left_gripper_val=torch.full((self.num_envs, 1), self.left_gripper_val, device=self.device, dtype=torch.float32),
+                right_gripper_val=torch.full((self.num_envs, 1), self.right_gripper_val, device=self.device, dtype=torch.float32),
             )
         return obs
 

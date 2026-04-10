@@ -89,6 +89,36 @@ class BimanualEmbodimentSpec:
         config = self._config(arm_index)
         return _select_arm_value(config.get("homestate", []), arm_index)
 
+    def arm_joint_names(self, arm_index: int):
+        config = self._config(arm_index)
+        return list(_select_arm_value(config.get("arm_joints_name", []), arm_index))
+
+    def gripper_name(self, arm_index: int):
+        config = self._config(arm_index)
+        return _select_arm_value(config.get("gripper_name", []), arm_index)
+
+    def gripper_scale(self, arm_index: int):
+        config = self._config(arm_index)
+        return list(config.get("gripper_scale", [0.0, 1.0]))
+
+    def gripper_bias(self, arm_index: int):
+        config = self._config(arm_index)
+        return float(config.get("gripper_bias", 0.0))
+
+    def joint_drive_params(self, arm_index: int):
+        config = self._config(arm_index)
+        return (
+            float(config.get("joint_stiffness", 1000.0)),
+            float(config.get("joint_damping", 200.0)),
+        )
+
+    def gripper_drive_params(self, arm_index: int):
+        config = self._config(arm_index)
+        return (
+            float(config.get("gripper_stiffness", config.get("gripper_stiffnes", 1000.0))),
+            float(config.get("gripper_damping", 200.0)),
+        )
+
     def build_robot(self, scene, *, arm_index: int, name: str):
         loader = scene.create_urdf_loader()
         loader.name = name

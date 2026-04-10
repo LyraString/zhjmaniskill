@@ -88,10 +88,19 @@ class HandoverBlockEnv(DualUR5WSGEnv):
                 "xy_aligned": xy_aligned,
                 "z_aligned": z_aligned,
                 "spatial_success": spatial_success,
-                # RoboTwin additionally checks the right gripper open state.
-                # This env does not expose controller/gripper state yet, so the
-                # current ManiSkill success term is spatial-only.
-                "success": success,
+                "right_gripper_open": torch.full(
+                    (self.num_envs,),
+                    self.is_right_gripper_open(),
+                    device=self.device,
+                    dtype=torch.bool,
+                ),
+                "success": success
+                & torch.full(
+                    (self.num_envs,),
+                    self.is_right_gripper_open(),
+                    device=self.device,
+                    dtype=torch.bool,
+                ),
             }
         )
         return base_info
@@ -124,4 +133,5 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         reward = reward + info["xy_aligned"].to(torch.float32)
         reward = reward + info["z_aligned"].to(torch.float32)
         reward = reward + 2.0 * info["spatial_success"].to(torch.float32)
+        reward = reward + info["right_gripper_open"].to(torch.float32)
         return reward
