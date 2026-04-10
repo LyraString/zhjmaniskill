@@ -1,6 +1,6 @@
 defaults:
   - maniskill_fm_base
-  - task: maniskill_pickcube_task
+  - task: maniskill_task
   - _self_
 
 name: maniskill_fm

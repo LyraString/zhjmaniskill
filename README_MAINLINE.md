@@ -181,7 +181,7 @@ bash mainline.sh eval-fm PickCube-v1 smoke_npz dummy 1 42 0 \
 
 ## 自定义 ManiSkill 任务
 
-当前这些 `pickcube` 配置只是第一份 ManiSkill smoke 模板，不代表仓库以后只能用 `PickCube-v1`。
+当前默认的 ManiSkill task 文件虽然内容还是 `pickcube_smoke`，但文件名已经改成通用的 `maniskill_task.yaml`，不代表仓库以后只能用 `PickCube-v1`。
 
 当前推荐的组织方式是：
 
@@ -195,8 +195,8 @@ bash mainline.sh eval-fm PickCube-v1 smoke_npz dummy 1 42 0 \
 
 1. 复制一份 task yaml
    - 例如从：
-     - `policy/FlowMatching/diffusion_policy/config/task/maniskill_pickcube_task.yaml`
-     - `policy/FPO/diffusion_policy/config/task/maniskill_pickcube_task.yaml`
+     - `policy/FlowMatching/diffusion_policy/config/task/maniskill_task.yaml`
+     - `policy/FPO/diffusion_policy/config/task/maniskill_task.yaml`
    - 分别复制成你自己的 task 文件
 
 2. 改这几项任务描述
