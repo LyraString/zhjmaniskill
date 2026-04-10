@@ -9,6 +9,8 @@ from .task_profiles import (
     MANISKILL_TASK_PROFILES,
     apply_task_profile,
     get_task_profile,
+    resolve_runtime_control_mode,
+    resolve_runtime_task_target,
     resolve_task_profile,
 )
 from .trajectory_recorder import ManiSkillTrajectoryRecorder
@@ -25,5 +27,7 @@ __all__ = [
     "ManiSkillVectorEnvBackend",
     "apply_task_profile",
     "get_task_profile",
+    "resolve_runtime_control_mode",
+    "resolve_runtime_task_target",
     "resolve_task_profile",
 ]

@@ -229,6 +229,7 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
 - `task.name` 可以继续作为你自己的训练任务别名，不必强行等于 env id。
 - `maniskill.profile` 现在是可选的默认参数模板层，不是创建 ManiSkill 环境的必需字段。
 - 你可以继续沿用当前仓库里的 `action_type` 写法；只有在直接参考 ManiSkill 官方文档时，记住它在本仓库内部对应的是 `control_mode`。
+- collect / eval 的 ManiSkill 专用脚本现在也和 FPO 在线链保持一致，统一按 `env_id > profile > task_name` 的顺序解析任务身份。
 - FM 这边主要由 `shape_meta` 驱动。
 - FPO 这边的 critic 输入维度现在也会根据 `shape_meta` 自动推导，不再写死在 `pickcube_smoke` 的 9 维 `agent_pos` 上。
 - 也就是说，只要你的 task yaml 里的 observation / action 维度写对，后面这两条主线都能跟着适配。

@@ -12,7 +12,8 @@ from sim.maniskill import (
     ManiSkillTaskFactory,
     ManiSkillTrajectoryRecorder,
     apply_task_profile,
-    resolve_task_profile,
+    resolve_runtime_control_mode,
+    resolve_runtime_task_target,
 )
 
 
@@ -35,27 +36,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_task_key(args) -> tuple[str, str]:
-    if args.task_profile is None:
-        return args.task_name, args.task_name
-
-    profile = resolve_task_profile(args.task_profile)
-    if profile is None:
-        raise ValueError(f"Unknown ManiSkill task profile: {args.task_profile}")
-
-    env_id = str(profile["env_id"])
-    if args.task_name not in (args.task_profile, env_id):
-        raise ValueError(
-            f"task_name `{args.task_name}` does not match task profile "
-            f"`{args.task_profile}` (expected `{env_id}` or `{args.task_profile}`)."
-        )
-
-    return args.task_profile, env_id
-
-
 def run_collection(args) -> None:
-    task_key, save_task_name = _resolve_task_key(args)
-    profile = resolve_task_profile(task_key)
+    runtime_env_id = args.task_name
+    if args.task_profile is not None and args.task_name == args.task_profile:
+        runtime_env_id = None
+    runtime_task_name, resolved_profile_name = resolve_runtime_task_target(
+        task_name=args.task_name,
+        task_profile=args.task_profile,
+        env_id=runtime_env_id,
+    )
     runtime_kwargs = {
         "action_type": args.action_type,
         "obs_mode": args.obs_mode,
@@ -66,11 +55,16 @@ def run_collection(args) -> None:
         "sim_freq": args.sim_freq,
         "control_freq": args.control_freq,
     }
-    _, resolved_runtime, _profile_name = apply_task_profile(task_key, runtime_kwargs)
-    save_dir = REPO_ROOT / "data" / save_task_name / args.task_config
+    _resolved_action_type, resolved_control_mode = resolve_runtime_control_mode(
+        action_type=runtime_kwargs["action_type"],
+        control_mode=runtime_kwargs["control_mode"],
+    )
+    runtime_kwargs["control_mode"] = resolved_control_mode
+    _, resolved_runtime, _profile_name = apply_task_profile(runtime_task_name, runtime_kwargs)
+    save_dir = REPO_ROOT / "data" / runtime_task_name / args.task_config
     recorder = ManiSkillTrajectoryRecorder(save_dir)
     env = ManiSkillTaskFactory().create_env(
-        task_name=task_key,
+        task_name=runtime_task_name,
         **resolved_runtime,
     )
 
