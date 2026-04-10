@@ -175,6 +175,58 @@ bash mainline.sh eval-fm PickCube-v1 smoke_npz dummy 1 42 0 \
   -- --render-mode human
 ```
 
+## 自定义 ManiSkill 任务
+
+当前这些 `pickcube` 配置只是第一份 ManiSkill smoke 模板，不代表仓库以后只能用 `PickCube-v1`。
+
+如果你要接自己的 ManiSkill 任务，最小做法是：
+
+1. 复制一份 task yaml
+   - 例如从：
+     - `policy/FlowMatching/diffusion_policy/config/task/maniskill_pickcube_task.yaml`
+     - `policy/FPO/diffusion_policy/config/task/maniskill_pickcube_task.yaml`
+   - 分别复制成你自己的 task 文件
+
+2. 改这几项任务描述
+   - `name`
+   - `maniskill.profile`
+   - `maniskill.env_id`
+   - `maniskill.zarr_path`
+   - `shape_meta.obs.agent_pos.shape`
+   - `shape_meta.action.shape`
+
+3. 保持 ManiSkill 运行参数和你的任务一致
+   - `action_type`
+   - `obs_mode`
+   - `reward_mode`
+   - `robot_uids`
+   - `sim_freq`
+   - `control_freq`
+
+4. 用 shell 入口透传 override 切到你的 task
+
+Flow Matching：
+
+```bash
+bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
+  --backend maniskill \
+  -- task=my_custom_maniskill_task exp_name=my_exp
+```
+
+FPO：
+
+```bash
+bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
+  --backend maniskill \
+  -- task=my_custom_maniskill_task exp_name=my_exp
+```
+
+说明：
+
+- FM 这边主要由 `shape_meta` 驱动。
+- FPO 这边的 critic 输入维度现在也会根据 `shape_meta` 自动推导，不再写死在 `pickcube_smoke` 的 9 维 `agent_pos` 上。
+- 也就是说，只要你的 task yaml 里的 observation / action 维度写对，后面这两条主线都能跟着适配。
+
 ## 当前边界
 
 - `PickCube-v1` 目前只是 ManiSkill smoke task，不是正式研究任务

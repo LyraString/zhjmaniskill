@@ -70,7 +70,7 @@ optimizer:
 
 critic:
   _target_: diffusion_policy.model.rl.value_mlp.CriticMLP
-  input_dim: 1563
+  input_dim: ${eval:'${n_obs_steps} * (${policy.obs_encoder.pointnet_out_dim} + ${task.shape_meta.obs.agent_pos.shape[0]})'}
   hidden_dims: [1024, 512, 256]
   activation: tanh
   use_layer_norm: true
