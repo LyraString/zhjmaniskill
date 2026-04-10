@@ -4,9 +4,15 @@ backend=robotwin
 task_profile=
 config_name=
 positional=()
+hydra_overrides=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --)
+            shift
+            hydra_overrides=("$@")
+            break
+            ;;
         --backend)
             backend="$2"
             shift 2
@@ -27,7 +33,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ ${#positional[@]} -lt 6 ]; then
-    echo "Usage: $0 task_name task_config expert_data_num seed action_dim gpu_id [resume_ckpt_path] [--backend robotwin|maniskill] [--task-profile PROFILE] [--config-name CONFIG]"
+    echo "Usage: $0 task_name task_config expert_data_num seed action_dim gpu_id [resume_ckpt_path] [--backend robotwin|maniskill] [--task-profile PROFILE] [--config-name CONFIG] [-- HYDRA_OVERRIDE ...]"
     exit 1
 fi
 
@@ -96,7 +102,8 @@ if [ "${backend}" = "maniskill" ]; then
                                 training.device="cuda:0" \
                                 exp_name=${exp_name} \
                                 logging.mode=${wandb_mode} \
-                                training.resume_ckpt_path=${resume_ckpt_path}
+                                training.resume_ckpt_path=${resume_ckpt_path} \
+                                "${hydra_overrides[@]}"
 else
     python "${SCRIPT_DIR}/train.py" --config-name=${config_name}.yaml \
                                 task.name=${task_name} \
@@ -109,7 +116,8 @@ else
                                 setting=${task_config} \
                                 expert_data_num=${expert_data_num} \
                                 head_camera_type=$head_camera_type \
-                                training.resume_ckpt_path=${resume_ckpt_path}
+                                training.resume_ckpt_path=${resume_ckpt_path} \
+                                "${hydra_overrides[@]}"
 fi
                             # checkpoint.save_ckpt=${save_ckpt}
                             # hydra.run.dir=${run_dir} \

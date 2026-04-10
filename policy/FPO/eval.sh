@@ -10,9 +10,15 @@ ckpt_path=
 episodes=1
 max_episode_steps=50
 positional=()
+extra_eval_args=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --)
+            shift
+            extra_eval_args=("$@")
+            break
+            ;;
         --backend)
             backend="$2"
             shift 2
@@ -41,7 +47,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ ${#positional[@]} -lt 6 ]; then
-    echo "Usage: $0 task_name task_config ckpt_setting expert_data_num seed gpu_id [--backend robotwin|maniskill] [--task-profile PROFILE] [--ckpt-path CKPT] [--episodes N] [--max-episode-steps N]"
+    echo "Usage: $0 task_name task_config ckpt_setting expert_data_num seed gpu_id [--backend robotwin|maniskill] [--task-profile PROFILE] [--ckpt-path CKPT] [--episodes N] [--max-episode-steps N] [-- EVAL_OVERRIDE ...]"
     exit 1
 fi
 
@@ -80,6 +86,7 @@ if [ "${backend}" = "maniskill" ]; then
         cmd+=(--task-profile "${task_profile}")
     fi
 
+    cmd+=("${extra_eval_args[@]}")
     PYTHONWARNINGS=ignore::UserWarning "${cmd[@]}"
 else
     PYTHONWARNINGS=ignore::UserWarning \
@@ -90,6 +97,7 @@ else
         --ckpt_setting ${ckpt_setting} \
         --expert_data_num ${expert_data_num} \
         --seed ${seed} \
-        --policy_name ${policy_name} 
+        --policy_name ${policy_name} \
+        "${extra_eval_args[@]}"
         # [TODO] add parameters here
 fi

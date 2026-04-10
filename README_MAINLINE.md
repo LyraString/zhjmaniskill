@@ -44,6 +44,7 @@ bash mainline.sh <command> ...
 - `mainline.sh` 只负责把命令转发到现有脚本
 - 训练 / 评估 / 数据处理参数仍然以命令行显式参数为准
 - `task_profile` 目前只作为 ManiSkill 侧的辅助信息和一致性提示，不会替你自动补齐那串运行参数
+- 如果你后面要接自己的任务，可以在 shell 命令末尾加 `--`，把额外 override 原样透传给底层入口
 
 目前支持：
 
@@ -101,6 +102,15 @@ bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
 
 - `policy/FlowMatching/diffusion_policy/config/maniskill_fm_pickcube.yaml`
 
+如果你要显式覆盖 task/config 里的字段，可以这样写：
+
+```bash
+bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
+  --backend maniskill \
+  --task-profile pickcube_smoke \
+  -- task.name=my_task task.dataset.zarr_path=data/my_task.zarr exp_name=my_exp
+```
+
 ### 4. ManiSkill FPO smoke
 
 ```bash
@@ -112,6 +122,15 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
 默认配置：
 
 - `policy/FPO/diffusion_policy/config/maniskill_fpo_pickcube.yaml`
+
+同样支持透传 Hydra override：
+
+```bash
+bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
+  --backend maniskill \
+  --task-profile pickcube_smoke \
+  -- training.num_envs=1 task.name=my_task
+```
 
 ### 5. ManiSkill FM -> FPO finetune smoke
 
@@ -144,6 +163,16 @@ bash mainline.sh eval-fpo PickCube-v1 smoke_npz dummy 1 42 0 \
   --ckpt-path /ABS/PATH/TO/FPO.ckpt \
   --episodes 1 \
   --max-episode-steps 10
+```
+
+如果你要给评估入口继续传额外参数，也可以在末尾加 `--`：
+
+```bash
+bash mainline.sh eval-fm PickCube-v1 smoke_npz dummy 1 42 0 \
+  --backend maniskill \
+  --task-profile pickcube_smoke \
+  --ckpt-path /ABS/PATH/TO/FM.ckpt \
+  -- --render-mode human
 ```
 
 ## 当前边界

@@ -24,22 +24,6 @@ shape_meta: &shape_meta
   action:
     shape: [8]
 
-env_runner:
-  _target_: diffusion_policy.env_runner.pusht_image_runner.PushTImageRunner
-  n_train: 0
-  n_train_vis: 0
-  train_start_seed: 0
-  n_test: 0
-  n_test_vis: 0
-  legacy_test: False
-  test_start_seed: 0
-  max_steps: 0
-  n_obs_steps: ${n_obs_steps}
-  n_action_steps: ${n_action_steps}
-  fps: 10
-  past_action: ${past_action_visible}
-  n_envs: null
-
 dataset:
   _target_: diffusion_policy.dataset.robot_pointcloud_dataset.RobotPointCloudDataset
   zarr_path: ${task.maniskill.zarr_path}
