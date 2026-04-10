@@ -1,6 +1,8 @@
 #!/bin/bash
 
 policy_name=FlowMatching # [TODO] 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 backend=robotwin
 task_profile=
@@ -55,7 +57,7 @@ DEBUG=False
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
 
-cd ../.. # move to root
+cd "${ROOT_DIR}"
 
 if [ "${backend}" = "maniskill" ]; then
     if [ -z "${ckpt_path}" ]; then

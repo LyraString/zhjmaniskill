@@ -31,12 +31,30 @@
 
 ## 当前主线命令
 
+## 推荐入口
+
+优先使用根目录统一入口：
+
+```bash
+bash mainline.sh <command> ...
+```
+
+目前支持：
+
+- `collect`
+- `process-fm`
+- `process-fpo`
+- `train-fm`
+- `train-fpo`
+- `eval-fm`
+- `eval-fpo`
+
 ### 1. ManiSkill 采集
 
 根目录入口：
 
 ```bash
-bash collect_data.sh PickCube-v1 smoke_npz 0 \
+bash mainline.sh collect PickCube-v1 smoke_npz 0 \
   --backend maniskill \
   --task-profile pickcube_smoke \
   --episode-num 1 \
@@ -54,22 +72,19 @@ data/PickCube-v1/smoke_npz/data/episode0.npz
 Flow Matching：
 
 ```bash
-cd policy/FlowMatching
-bash process_data.sh PickCube-v1 smoke_npz 1 --backend maniskill
+bash mainline.sh process-fm PickCube-v1 smoke_npz 1 --backend maniskill
 ```
 
 FPO：
 
 ```bash
-cd policy/FPO
-bash process_data.sh PickCube-v1 smoke_npz 1 --backend maniskill
+bash mainline.sh process-fpo PickCube-v1 smoke_npz 1 --backend maniskill
 ```
 
 ### 3. ManiSkill Flow Matching smoke
 
 ```bash
-cd policy/FlowMatching
-bash train_fm.sh PickCube-v1 smoke_npz 1 42 8 0 \
+bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
   --backend maniskill \
   --task-profile pickcube_smoke
 ```
@@ -81,8 +96,7 @@ bash train_fm.sh PickCube-v1 smoke_npz 1 42 8 0 \
 ### 4. ManiSkill FPO smoke
 
 ```bash
-cd policy/FPO
-bash train_fpo.sh PickCube-v1 smoke_npz 1 42 8 0 \
+bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
   --backend maniskill \
   --task-profile pickcube_smoke
 ```
@@ -94,8 +108,7 @@ bash train_fpo.sh PickCube-v1 smoke_npz 1 42 8 0 \
 ### 5. ManiSkill FM -> FPO finetune smoke
 
 ```bash
-cd policy/FPO
-bash train_fpo.sh PickCube-v1 smoke_npz 1 42 8 0 /ABS/PATH/TO/FM.ckpt \
+bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 /ABS/PATH/TO/FM.ckpt \
   --backend maniskill \
   --task-profile pickcube_smoke \
   --config-name maniskill_fpo_pickcube_finetune
@@ -106,8 +119,7 @@ bash train_fpo.sh PickCube-v1 smoke_npz 1 42 8 0 /ABS/PATH/TO/FM.ckpt \
 Flow Matching：
 
 ```bash
-cd policy/FlowMatching
-bash eval.sh PickCube-v1 smoke_npz dummy 1 42 0 \
+bash mainline.sh eval-fm PickCube-v1 smoke_npz dummy 1 42 0 \
   --backend maniskill \
   --task-profile pickcube_smoke \
   --ckpt-path /ABS/PATH/TO/FM.ckpt \
@@ -118,8 +130,7 @@ bash eval.sh PickCube-v1 smoke_npz dummy 1 42 0 \
 FPO：
 
 ```bash
-cd policy/FPO
-bash eval.sh PickCube-v1 smoke_npz dummy 1 42 0 \
+bash mainline.sh eval-fpo PickCube-v1 smoke_npz dummy 1 42 0 \
   --backend maniskill \
   --task-profile pickcube_smoke \
   --ckpt-path /ABS/PATH/TO/FPO.ckpt \
