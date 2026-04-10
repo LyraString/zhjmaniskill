@@ -1,6 +1,8 @@
 """ManiSkill backend integration package."""
 
+from . import tasks  # noqa: F401
 from .action_adapter import convert_action_to_maniskill
+from .bimanual_embodiment import BimanualEmbodimentSpec, load_embodiment_config
 from .obs_adapter import convert_maniskill_obs
 from .runtime_env import ManiSkillEnvBackend
 from .task_factory import ManiSkillTaskFactory
@@ -19,8 +21,10 @@ from .vector_runtime_env import ManiSkillVectorEnvBackend
 __all__ = [
     "DEFAULT_MANISKILL_RUNTIME",
     "MANISKILL_TASK_PROFILES",
+    "BimanualEmbodimentSpec",
     "convert_action_to_maniskill",
     "convert_maniskill_obs",
+    "load_embodiment_config",
     "ManiSkillEnvBackend",
     "ManiSkillTrajectoryRecorder",
     "ManiSkillTaskFactory",

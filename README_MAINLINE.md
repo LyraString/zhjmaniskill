@@ -15,6 +15,12 @@
   - RoboTwin 旧运行时 adapter
 - `sim/maniskill/`
   - ManiSkill backend、vector backend、task profile、trajectory recorder
+- `sim/maniskill/bimanual_embodiment.py`
+  - RoboTwin2.0 风格的双臂 embodiment 加载层
+- `sim/maniskill/tasks/`
+  - RoboTwin 自定义 ManiSkill env 注册入口
+  - `BaseBimanualEnv` 负责通用双臂 env 骨架
+  - `DualUR5WSG-v1` 只是一个默认 `UR5-WSG` 验证实例
 - `data/converters/`
   - RoboTwin HDF5 converter 和 ManiSkill NPZ converter
 - `runners/`
@@ -249,6 +255,11 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
 - `PickCube-v1` 目前只是 ManiSkill smoke task，不是正式研究任务
 - 训练、评估、数据链已经能走 ManiSkill 主线
 - RoboTwin 相关脚本和运行时仍然在仓库内，但不应继续作为主依赖
+- `DualUR5WSG-v1` 目前只是 embodiment 验证 env
+  - 它用来确认 RoboTwin 的双臂 embodiment 能否在 ManiSkill 的固定频率 / GPU 并行语义下落地
+  - 当前默认实例是 `UR5-WSG + UR5-WSG`
+  - 它还不是 `HandoverBlock-v1`，也没有迁移 RoboTwin 的脚本式 handover 逻辑
+  - 任务逻辑和 embodiment 现在开始重新分层，对齐 RoboTwin2.0 原本结构
 
 ## 后续建议
 
