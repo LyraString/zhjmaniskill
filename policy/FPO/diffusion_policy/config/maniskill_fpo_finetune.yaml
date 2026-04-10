@@ -3,8 +3,8 @@ defaults:
   - task: maniskill_pickcube_task
   - _self_
 
-name: maniskill_fpo_pickcube_finetune
-exp_name: "maniskill_pickcube_finetune"
+name: maniskill_fpo_finetune
+exp_name: "maniskill_finetune"
 training:
   resume: True
   timesteps_per_batch: 16

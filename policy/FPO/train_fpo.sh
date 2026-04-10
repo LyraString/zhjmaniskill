@@ -53,7 +53,7 @@ save_ckpt=True
 alg_name=robot_fpo_$action_dim
 if [ -z "${config_name}" ]; then
     if [ "${backend}" = "maniskill" ]; then
-        config_name=maniskill_fpo_pickcube
+        config_name=maniskill_fpo
     else
         config_name=${alg_name}
     fi

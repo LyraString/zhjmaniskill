@@ -3,5 +3,5 @@ defaults:
   - task: maniskill_pickcube_task
   - _self_
 
-name: maniskill_fm_pickcube
-exp_name: "maniskill_pickcube"
+name: maniskill_fm
+exp_name: "maniskill"

@@ -3,5 +3,5 @@ defaults:
   - task: maniskill_pickcube_task
   - _self_
 
-name: maniskill_fpo_pickcube
-exp_name: "maniskill_pickcube"
+name: maniskill_fpo
+exp_name: "maniskill"

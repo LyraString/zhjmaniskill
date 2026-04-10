@@ -102,7 +102,9 @@ bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
 
 默认配置：
 
-- `policy/FlowMatching/diffusion_policy/config/maniskill_fm_pickcube.yaml`
+- `policy/FlowMatching/diffusion_policy/config/maniskill_fm.yaml`
+
+这里的顶层算法配置现在是通用命名，`pickcube` 只保留在 task yaml 里。
 
 如果你要显式覆盖 task/config 里的字段，可以这样写：
 
@@ -123,7 +125,7 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
 
 默认配置：
 
-- `policy/FPO/diffusion_policy/config/maniskill_fpo_pickcube.yaml`
+- `policy/FPO/diffusion_policy/config/maniskill_fpo.yaml`
 
 同样支持透传 Hydra override：
 
@@ -140,7 +142,7 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
 bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 /ABS/PATH/TO/FM.ckpt \
   --backend maniskill \
   --task-profile pickcube_smoke \
-  --config-name maniskill_fpo_pickcube_finetune
+  --config-name maniskill_fpo_finetune
 ```
 
 ### 6. ManiSkill 评估
@@ -180,6 +182,14 @@ bash mainline.sh eval-fm PickCube-v1 smoke_npz dummy 1 42 0 \
 ## 自定义 ManiSkill 任务
 
 当前这些 `pickcube` 配置只是第一份 ManiSkill smoke 模板，不代表仓库以后只能用 `PickCube-v1`。
+
+当前推荐的组织方式是：
+
+- 顶层算法配置使用通用名字
+  - `maniskill_fm`
+  - `maniskill_fpo`
+  - `maniskill_fpo_finetune`
+- 具体任务差异放在 task yaml 里
 
 如果你要接自己的 ManiSkill 任务，最小做法是：
 

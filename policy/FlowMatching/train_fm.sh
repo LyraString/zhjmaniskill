@@ -53,7 +53,7 @@ save_ckpt=True
 alg_name=robot_fm_$action_dim
 if [ -z "${config_name}" ]; then
     if [ "${backend}" = "maniskill" ]; then
-        config_name=maniskill_fm_pickcube
+        config_name=maniskill_fm
     else
         config_name=${alg_name}
     fi
