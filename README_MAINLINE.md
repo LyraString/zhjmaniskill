@@ -90,12 +90,19 @@ data/PickCube-v1/smoke_npz/data/episode0.npz
 Flow Matching：
 
 ```bash
-bash mainline.sh process-fm PickCube-v1 smoke_npz 1 --backend maniskill
+bash mainline.sh process-fm --backend maniskill --task-profile pickcube_smoke
 ```
 
 FPO：
 
 ```bash
+bash mainline.sh process-fpo --backend maniskill --task-profile pickcube_smoke
+```
+
+旧的 triplet 写法仍然兼容：
+
+```bash
+bash mainline.sh process-fm PickCube-v1 smoke_npz 1 --backend maniskill
 bash mainline.sh process-fpo PickCube-v1 smoke_npz 1 --backend maniskill
 ```
 
@@ -320,7 +327,8 @@ bash mainline.sh collect HandoverBlock-v1 smoke_npz 1 \
 process：
 
 ```bash
-bash mainline.sh process-fm HandoverBlock-v1 smoke_npz 1 --backend maniskill
+bash mainline.sh process-fm --backend maniskill --task-profile handover_block_native_smoke
+bash mainline.sh process-fpo --backend maniskill --task-profile handover_block_native_smoke
 ```
 
 Flow Matching：
