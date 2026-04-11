@@ -205,8 +205,35 @@ class BaseBimanualEnv(BaseEnv):
             self.scene._gpu_fetch_all()
         return parsed_action
 
+    def _get_agent_qpos(self):
+        left_arm_qpos = torch.stack(
+            [joint.qpos.reshape(-1) for joint in self.left_arm_joints],
+            dim=1,
+        )
+        right_arm_qpos = torch.stack(
+            [joint.qpos.reshape(-1) for joint in self.right_arm_joints],
+            dim=1,
+        )
+        left_gripper = torch.full(
+            (self.num_envs, 1),
+            self.left_gripper_val,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        right_gripper = torch.full(
+            (self.num_envs, 1),
+            self.right_gripper_val,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        return torch.cat(
+            [left_arm_qpos, left_gripper, right_arm_qpos, right_gripper],
+            dim=1,
+        )
+
     def _get_obs_agent(self):
         return dict(
+            qpos=self._get_agent_qpos(),
             left_gripper_val=torch.full(
                 (self.num_envs, 1),
                 self.left_gripper_val,
