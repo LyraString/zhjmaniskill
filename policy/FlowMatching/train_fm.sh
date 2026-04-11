@@ -61,6 +61,36 @@ resolve_task_group_zarr_path() {
     fi
 }
 
+resolve_process_triplet_from_zarr_path() {
+    local resolved_zarr_path="$1"
+    local data_prefix="${SCRIPT_DIR}/data/"
+    local base stem expert_num remainder task_cfg task_nm
+
+    if [[ "${resolved_zarr_path}" != "${data_prefix}"* ]]; then
+        return 1
+    fi
+
+    base="$(basename "${resolved_zarr_path}")"
+    [[ "${base}" == *.zarr ]] || return 1
+
+    stem="${base%.zarr}"
+    expert_num="${stem##*-}"
+    [[ "${expert_num}" =~ ^[0-9]+$ ]] || return 1
+
+    remainder="${stem%-${expert_num}}"
+    [[ "${remainder}" != "${stem}" ]] || return 1
+
+    task_cfg="${remainder##*-}"
+    task_nm="${remainder%-${task_cfg}}"
+    task_nm="${task_nm%-}"
+
+    if [[ -z "${task_nm}" || -z "${task_cfg}" ]]; then
+        return 1
+    fi
+
+    printf '%s\t%s\t%s\n' "${task_nm}" "${task_cfg}" "${expert_num}"
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --)
@@ -136,12 +166,7 @@ export HYDRA_FULL_ERROR=1
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 zarr_path="${SCRIPT_DIR}/data/${task_name}-${task_config}-${expert_data_num}.zarr"
-
-if [ ! -d "${zarr_path}" ]; then
-    bash "${SCRIPT_DIR}/process_data.sh" "${task_name}" "${task_config}" "${expert_data_num}" --backend "${backend}"
-fi
 
 hydra_task_name=${task_name}
 if [ -n "${task_profile}" ]; then
@@ -173,6 +198,27 @@ else
     if has_override_prefix "task.dataset.zarr_path=" || has_override_prefix "+task.dataset.zarr_path="; then
         inject_dataset_zarr_path=false
     fi
+fi
+
+process_target_zarr_path=
+if [ "${inject_dataset_zarr_path}" = true ]; then
+    process_target_zarr_path="${resolved_dataset_zarr_path}"
+fi
+
+if [ -n "${process_target_zarr_path}" ] && [ ! -d "${process_target_zarr_path}" ]; then
+    process_task_name="${task_name}"
+    process_task_config="${task_config}"
+    process_expert_data_num="${expert_data_num}"
+
+    if process_triplet="$(resolve_process_triplet_from_zarr_path "${process_target_zarr_path}")"; then
+        IFS=$'\t' read -r process_task_name process_task_config process_expert_data_num <<< "${process_triplet}"
+    fi
+
+    bash "${SCRIPT_DIR}/process_data.sh" \
+        "${process_task_name}" \
+        "${process_task_config}" \
+        "${process_expert_data_num}" \
+        --backend "${backend}"
 fi
 
 maniskill_overrides=(

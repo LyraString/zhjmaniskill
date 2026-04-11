@@ -361,6 +361,8 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 1 \
 - `maniskill_handover_block_native_task`
   - 默认吃 ManiSkill 原生 collect/process 生成的 zarr：`data/HandoverBlock-v1-smoke_npz-1.zarr`
 
+现在 `train-fm` / `train-fpo` 在使用 `task=...` 切到 handover task 时，自动 `process` 也会优先跟随 task yaml 里的默认 zarr 路径，而不是继续按位置参数里的 `PickCube-v1` 去猜。
+
 ## 当前边界
 
 - `PickCube-v1` 目前只是 ManiSkill smoke task，不是正式研究任务
