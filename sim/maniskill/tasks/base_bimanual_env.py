@@ -26,7 +26,6 @@ class BaseBimanualEnv(BaseEnv):
     SUPPORTED_REWARD_MODES = ("none", "dense", "normalized_dense", "sparse")
     ARM_DOF = 6
     GRIPPER_OPEN_THRESHOLD = 0.8
-    ARM_DELTA_SCALE = 0.05
     ACTION_DIM = 14
 
     def __init__(
@@ -40,9 +39,11 @@ class BaseBimanualEnv(BaseEnv):
         self.left_gripper_val = 0.0
         self.right_gripper_val = 0.0
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
+        action_low = np.asarray([-np.pi] * self.ARM_DOF + [0.0] + [-np.pi] * self.ARM_DOF + [0.0], dtype=np.float32)
+        action_high = np.asarray([np.pi] * self.ARM_DOF + [1.0] + [np.pi] * self.ARM_DOF + [1.0], dtype=np.float32)
         self.single_action_space = gym.spaces.Box(
-            low=-1.0,
-            high=1.0,
+            low=action_low,
+            high=action_high,
             shape=(self.ACTION_DIM,),
             dtype=np.float32,
         )
@@ -188,9 +189,8 @@ class BaseBimanualEnv(BaseEnv):
             self._set_gripper(torch.zeros(len(env_idx), device=self.device), arm_index=0, env_idx=env_idx)
             self._set_gripper(torch.zeros(len(env_idx), device=self.device), arm_index=1, env_idx=env_idx)
 
-    def _apply_arm_action(self, robot, arm_joints, delta: torch.Tensor):
-        current_arm_qpos = torch.stack([joint.qpos.reshape(-1) for joint in arm_joints], dim=1)
-        target_arm_qpos = current_arm_qpos + delta * self.ARM_DELTA_SCALE
+    def _apply_arm_action(self, robot, arm_joints, target_qpos: torch.Tensor):
+        target_arm_qpos = torch.clamp(target_qpos, min=-np.pi, max=np.pi)
         robot.set_joint_drive_targets(target_arm_qpos, joints=arm_joints)
         robot.set_joint_drive_velocity_targets(
             torch.zeros_like(target_arm_qpos),
@@ -204,11 +204,10 @@ class BaseBimanualEnv(BaseEnv):
             parsed_action = common.to_tensor(action, device=self.device).to(torch.float32)
             if parsed_action.shape == self._orig_single_action_space.shape:
                 parsed_action = common.batch(parsed_action)
-            parsed_action = torch.clamp(parsed_action, -1.0, 1.0)
             self._apply_arm_action(self.left_robot, self.left_arm_joints, parsed_action[:, 0:6])
-            self._set_gripper((parsed_action[:, 6] + 1.0) / 2.0, arm_index=0)
+            self._set_gripper(parsed_action[:, 6], arm_index=0)
             self._apply_arm_action(self.right_robot, self.right_arm_joints, parsed_action[:, 7:13])
-            self._set_gripper((parsed_action[:, 13] + 1.0) / 2.0, arm_index=1)
+            self._set_gripper(parsed_action[:, 13], arm_index=1)
 
         self._before_control_step()
         for _ in range(self._sim_steps_per_control):

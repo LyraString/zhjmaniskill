@@ -355,7 +355,8 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
 - `HandoverBlock-v1` 目前只迁移了场景布局、reset 分布和空间成功条件
   - 还没有迁移 RoboTwin 的 expert script
   - 当前已经补了最小 `14` 维动作接口：左臂 `6 + 1`、右臂 `6 + 1`
-  - 臂动作是 joint delta，gripper 动作是归一化开合目标
+  - 臂动作现在按 RoboTwin 现有数据语义解释为绝对 joint qpos 目标
+  - gripper 动作是 `[0,1]` 归一化开合目标
   - `is_right_gripper_open()` 已经接回 ManiSkill success 判定
   - 当前也已经开通 `pointcloud+state_dict` 观测模式，用来对接 ManiSkill 主线数据链
   - 当前 `agent.qpos` 也已经对齐成 `14` 维：左臂 `6` + 左 gripper `1` + 右臂 `6` + 右 gripper `1`
