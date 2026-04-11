@@ -435,6 +435,8 @@ class RobotWorkspace(BaseWorkspace):
             task_maniskill_cfg = getattr(cfg.task, "maniskill", None)
             task_profile = getattr(task_maniskill_cfg, "profile", None) if task_maniskill_cfg is not None else None
             task_env_id = getattr(task_maniskill_cfg, "env_id", None) if task_maniskill_cfg is not None else None
+            sim_backend = getattr(cfg.training, "sim_backend", None)
+            render_backend = getattr(cfg.training, "render_backend", None)
             runtime_action_type, runtime_control_mode = resolve_runtime_control_mode(
                 action_type=getattr(cfg.training, "action_type", "pd_joint_delta_pos"),
                 control_mode=getattr(cfg.training, "control_mode", None),
@@ -450,6 +452,8 @@ class RobotWorkspace(BaseWorkspace):
                     obs_mode=str(getattr(cfg.training, "obs_mode", "pointcloud+state_dict")),
                     control_mode=runtime_control_mode,
                     render_mode=getattr(cfg.training, "render_mode", None),
+                    sim_backend=sim_backend,
+                    render_backend=render_backend,
                     sim_freq=getattr(cfg.training, "sim_freq", None),
                     control_freq=getattr(cfg.training, "control_freq", None),
                     sim_config=sim_config,
@@ -466,6 +470,8 @@ class RobotWorkspace(BaseWorkspace):
                     obs_mode=str(getattr(cfg.training, "obs_mode", "pointcloud+state_dict")),
                     control_mode=runtime_control_mode,
                     render_mode=getattr(cfg.training, "render_mode", None),
+                    sim_backend=sim_backend,
+                    render_backend=render_backend,
                     sim_freq=getattr(cfg.training, "sim_freq", None),
                     control_freq=getattr(cfg.training, "control_freq", None),
                     sim_config=sim_config,

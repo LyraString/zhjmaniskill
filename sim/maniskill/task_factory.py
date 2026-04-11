@@ -21,6 +21,8 @@ class ManiSkillTaskFactory(TaskFactory):
         obs_mode = str(resolved_kwargs.pop("obs_mode", "state"))
         control_mode = resolved_kwargs.pop("control_mode", None)
         render_mode = resolved_kwargs.pop("render_mode", None)
+        sim_backend = resolved_kwargs.pop("sim_backend", None)
+        render_backend = resolved_kwargs.pop("render_backend", None)
         sim_freq = resolved_kwargs.pop("sim_freq", None)
         control_freq = resolved_kwargs.pop("control_freq", None)
         sim_config = resolved_kwargs.pop("sim_config", None)
@@ -35,6 +37,8 @@ class ManiSkillTaskFactory(TaskFactory):
             obs_mode=obs_mode,
             control_mode=control_mode,
             render_mode=render_mode,
+            sim_backend=str(sim_backend) if sim_backend not in (None, "") else None,
+            render_backend=str(render_backend) if render_backend not in (None, "") else None,
             sim_freq=int(sim_freq) if sim_freq is not None else None,
             control_freq=int(control_freq) if control_freq is not None else None,
             sim_config=dict(sim_config or {}),
@@ -52,6 +56,8 @@ class ManiSkillTaskFactory(TaskFactory):
         obs_mode = str(resolved_kwargs.pop("obs_mode", "state"))
         control_mode = resolved_kwargs.pop("control_mode", None)
         render_mode = resolved_kwargs.pop("render_mode", None)
+        sim_backend = resolved_kwargs.pop("sim_backend", None)
+        render_backend = resolved_kwargs.pop("render_backend", None)
         sim_freq = resolved_kwargs.pop("sim_freq", None)
         control_freq = resolved_kwargs.pop("control_freq", None)
         sim_config = resolved_kwargs.pop("sim_config", None)
@@ -67,6 +73,8 @@ class ManiSkillTaskFactory(TaskFactory):
             obs_mode=obs_mode,
             control_mode=control_mode,
             render_mode=render_mode,
+            sim_backend=str(sim_backend) if sim_backend not in (None, "") else None,
+            render_backend=str(render_backend) if render_backend not in (None, "") else None,
             sim_freq=int(sim_freq) if sim_freq is not None else None,
             control_freq=int(control_freq) if control_freq is not None else None,
             sim_config=dict(sim_config or {}),

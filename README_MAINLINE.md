@@ -337,6 +337,23 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
   -- task=maniskill_handover_block_native_task exp_name=handover_block_native_smoke
 ```
 
+如果你要显式控制 ManiSkill 环境 backend，现在也可以直接透传：
+
+```bash
+bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 1 \
+  --backend maniskill \
+  -- task=maniskill_handover_block_task \
+     training.sim_backend=physx_cuda \
+     training.render_backend=sapien_cuda \
+     exp_name=handover_block_smoke
+```
+
+说明：
+
+- `training.device` 控制的是 PyTorch 训练设备
+- `training.sim_backend` / `training.render_backend` 控制的是 ManiSkill 环境创建 backend
+- 这两层现在已经在 FPO 的 ManiSkill single/vector 路径里显式打通
+
 当前两套 handover 配置的区别是：
 
 - `maniskill_handover_block_task`

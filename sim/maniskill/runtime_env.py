@@ -24,6 +24,8 @@ class ManiSkillEnvBackend:
         obs_mode: str = "state",
         control_mode: str | None = None,
         render_mode: str | None = None,
+        sim_backend: str | None = None,
+        render_backend: str | None = None,
         sim_freq: int | None = None,
         control_freq: int | None = None,
         sim_config: dict[str, Any] | None = None,
@@ -33,6 +35,8 @@ class ManiSkillEnvBackend:
         self.obs_mode = obs_mode
         self.control_mode = control_mode
         self.render_mode = render_mode
+        self.sim_backend = sim_backend
+        self.render_backend = render_backend
         self.requested_sim_freq = sim_freq
         self.requested_control_freq = control_freq
         self.requested_sim_config = dict(sim_config or {})
@@ -44,6 +48,10 @@ class ManiSkillEnvBackend:
             make_kwargs.setdefault("control_mode", control_mode)
         if render_mode is not None:
             make_kwargs.setdefault("render_mode", render_mode)
+        if sim_backend is not None:
+            make_kwargs.setdefault("sim_backend", sim_backend)
+        if render_backend is not None:
+            make_kwargs.setdefault("render_backend", render_backend)
         merged_sim_config = dict(self.requested_sim_config)
         if sim_freq is not None:
             merged_sim_config["sim_freq"] = int(sim_freq)
@@ -64,6 +72,8 @@ class ManiSkillEnvBackend:
             "sim_freq": sim_freq,
             "control_freq": control_freq,
             "sim_steps_per_control": sim_steps_per_control,
+            "sim_backend": self.sim_backend,
+            "render_backend": self.render_backend,
         }
         if sim_freq:
             info["sim_dt"] = 1.0 / float(sim_freq)
