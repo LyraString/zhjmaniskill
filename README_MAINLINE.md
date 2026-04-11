@@ -312,7 +312,9 @@ bash mainline.sh collect HandoverBlock-v1 smoke_npz 1 \
   --backend maniskill \
   --task-profile handover_block_native_smoke \
   --episode-num 1 \
-  --max-episode-steps 50
+  --max-episode-steps 50 \
+  --sim-backend physx_cuda \
+  --render-backend sapien_cuda
 ```
 
 process：
@@ -335,6 +337,18 @@ FPO：
 bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
   --backend maniskill \
   -- task=maniskill_handover_block_native_task exp_name=handover_block_native_smoke
+```
+
+评估也可以显式控制 ManiSkill backend：
+
+```bash
+bash mainline.sh eval-fpo PickCube-v1 smoke_npz dummy 1 1 \
+  --backend maniskill \
+  --task-profile handover_block_smoke \
+  --ckpt-path /ABS/PATH/TO/FPO.ckpt \
+  --episodes 1 \
+  --max-episode-steps 50 \
+  -- --sim-backend physx_cuda --render-backend sapien_cuda
 ```
 
 如果你要显式控制 ManiSkill 环境 backend，现在也可以直接透传：

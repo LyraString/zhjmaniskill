@@ -246,6 +246,8 @@ if __name__ == "__main__":
     parser.add_argument("--obs-mode", type=str, default=None)
     parser.add_argument("--control-mode", type=str, default=None)
     parser.add_argument("--render-mode", type=str, default=None)
+    parser.add_argument("--sim-backend", type=str, default=None)
+    parser.add_argument("--render-backend", type=str, default=None)
     parser.add_argument("--reward-mode", type=str, default=None)
     parser.add_argument("--robot-uids", type=str, default=None)
     parser.add_argument("--sim-freq", type=int, default=None)

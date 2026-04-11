@@ -3,7 +3,9 @@ import importlib
 import sys
 from pathlib import Path
 
+import dill
 import numpy as np
+import torch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--obs-mode", type=str, default=None)
     parser.add_argument("--control-mode", type=str, default=None)
     parser.add_argument("--render-mode", type=str, default=None)
+    parser.add_argument("--sim-backend", type=str, default=None)
+    parser.add_argument("--render-backend", type=str, default=None)
     parser.add_argument("--reward-mode", type=str, default=None)
     parser.add_argument("--robot-uids", type=str, default=None)
     parser.add_argument("--sim-freq", type=int, default=None)
@@ -51,6 +55,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run_evaluation(args) -> None:
     adapter = importlib.import_module(ADAPTER_MODULES[args.policy_kind])
+    payload = torch.load(open(args.ckpt_path, "rb"), pickle_module=dill, map_location="cpu")
+    ckpt_cfg = payload["cfg"]
     model = adapter.get_model({"ckpt_path": args.ckpt_path})
     runtime_env_id = args.task_name
     if args.task_profile is not None and args.task_name == args.task_profile:
@@ -65,6 +71,8 @@ def run_evaluation(args) -> None:
         "obs_mode": args.obs_mode,
         "control_mode": args.control_mode,
         "render_mode": args.render_mode,
+        "sim_backend": args.sim_backend,
+        "render_backend": args.render_backend,
         "reward_mode": args.reward_mode,
         "robot_uids": args.robot_uids,
         "sim_freq": args.sim_freq,
@@ -91,6 +99,20 @@ def run_evaluation(args) -> None:
             obs = env.reset(seed=args.seed + episode_idx)
             adapter.reset_model(model)
             encoded_obs = adapter.encode_obs(dict(obs.data))
+            expected_obs_dim = int(ckpt_cfg.task.shape_meta.obs.agent_pos.shape[0])
+            actual_obs_dim = int(np.asarray(encoded_obs["agent_pos"]).shape[-1])
+            expected_action_dim = int(ckpt_cfg.task.shape_meta.action.shape[0])
+            actual_action_dim = int(env.action_space.shape[0])
+            if expected_obs_dim != actual_obs_dim or expected_action_dim != actual_action_dim:
+                ckpt_task_name = str(getattr(ckpt_cfg.task, "name", "<unknown>"))
+                raise ValueError(
+                    "Checkpoint/env shape mismatch: "
+                    f"checkpoint task={ckpt_task_name} "
+                    f"agent_pos={expected_obs_dim} action={expected_action_dim}, "
+                    f"runtime task={runtime_task_name} "
+                    f"agent_pos={actual_obs_dim} action={actual_action_dim}. "
+                    "Use a checkpoint trained for this task, or evaluate against the task the checkpoint was trained on."
+                )
             episode_return = 0.0
             episode_length = 0
             success = False

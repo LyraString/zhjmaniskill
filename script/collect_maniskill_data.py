@@ -29,6 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--obs-mode", type=str, default=None)
     parser.add_argument("--control-mode", type=str, default=None)
     parser.add_argument("--render-mode", type=str, default=None)
+    parser.add_argument("--sim-backend", type=str, default=None)
+    parser.add_argument("--render-backend", type=str, default=None)
     parser.add_argument("--reward-mode", type=str, default=None)
     parser.add_argument("--robot-uids", type=str, default=None)
     parser.add_argument("--sim-freq", type=int, default=None)
@@ -50,6 +52,8 @@ def run_collection(args) -> None:
         "obs_mode": args.obs_mode,
         "control_mode": args.control_mode,
         "render_mode": args.render_mode,
+        "sim_backend": args.sim_backend,
+        "render_backend": args.render_backend,
         "reward_mode": args.reward_mode,
         "robot_uids": args.robot_uids,
         "sim_freq": args.sim_freq,
