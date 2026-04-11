@@ -47,8 +47,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ "${backend}" = "maniskill" ]; then
-    if [ ${#positional[@]} -lt 5 ]; then
-        echo "Usage: $0 task_name task_config ckpt_setting expert_data_num gpu_id [seed] [--backend robotwin|maniskill] [--task-profile PROFILE] [--ckpt-path CKPT] [--episodes N] [--max-episode-steps N] [-- EVAL_OVERRIDE ...]"
+    if ! [[ ${#positional[@]} -eq 2 || ${#positional[@]} -eq 3 || ${#positional[@]} -eq 5 || ${#positional[@]} -eq 6 ]]; then
+        echo "Usage: $0 task_name gpu_id [seed] [--backend maniskill] [--task-profile PROFILE] [--ckpt-path CKPT] [--episodes N] [--max-episode-steps N] [-- EVAL_OVERRIDE ...]"
+        echo "Legacy ManiSkill form is also accepted: $0 task_name task_config ckpt_setting expert_data_num gpu_id [seed] ..."
         exit 1
     fi
 else
@@ -59,14 +60,34 @@ else
 fi
 
 task_name=${positional[0]}
-task_config=${positional[1]}
-ckpt_setting=${positional[2]}
-expert_data_num=${positional[3]}
 
-if [ "${backend}" = "maniskill" ] && [ ${#positional[@]} -eq 5 ]; then
-    seed=42
-    gpu_id=${positional[4]}
+if [ "${backend}" = "maniskill" ]; then
+    task_config=
+    ckpt_setting=
+    expert_data_num=
+    if [ ${#positional[@]} -eq 2 ]; then
+        seed=42
+        gpu_id=${positional[1]}
+    elif [ ${#positional[@]} -eq 3 ]; then
+        gpu_id=${positional[1]}
+        seed=${positional[2]}
+    elif [ ${#positional[@]} -eq 5 ]; then
+        task_config=${positional[1]}
+        ckpt_setting=${positional[2]}
+        expert_data_num=${positional[3]}
+        seed=42
+        gpu_id=${positional[4]}
+    else
+        task_config=${positional[1]}
+        ckpt_setting=${positional[2]}
+        expert_data_num=${positional[3]}
+        seed=${positional[4]}
+        gpu_id=${positional[5]}
+    fi
 else
+    task_config=${positional[1]}
+    ckpt_setting=${positional[2]}
+    expert_data_num=${positional[3]}
     seed=${positional[4]}
     gpu_id=${positional[5]}
 fi

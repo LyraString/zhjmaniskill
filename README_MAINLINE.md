@@ -157,7 +157,7 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 /ABS/PATH/TO/FM.ckpt \
 Flow Matching：
 
 ```bash
-bash mainline.sh eval-fm pickcube_smoke smoke_npz dummy 1 0 \
+bash mainline.sh eval-fm pickcube_smoke 0 \
   --backend maniskill \
   --task-profile pickcube_smoke \
   --ckpt-path /ABS/PATH/TO/FM.ckpt \
@@ -168,7 +168,7 @@ bash mainline.sh eval-fm pickcube_smoke smoke_npz dummy 1 0 \
 FPO：
 
 ```bash
-bash mainline.sh eval-fpo pickcube_smoke smoke_npz dummy 1 0 \
+bash mainline.sh eval-fpo pickcube_smoke 0 \
   --backend maniskill \
   --task-profile pickcube_smoke \
   --ckpt-path /ABS/PATH/TO/FPO.ckpt \
@@ -179,7 +179,7 @@ bash mainline.sh eval-fpo pickcube_smoke smoke_npz dummy 1 0 \
 如果你要给评估入口继续传额外参数，也可以在末尾加 `--`：
 
 ```bash
-bash mainline.sh eval-fm pickcube_smoke smoke_npz dummy 1 0 \
+bash mainline.sh eval-fm pickcube_smoke 0 \
   --backend maniskill \
   --task-profile pickcube_smoke \
   --ckpt-path /ABS/PATH/TO/FM.ckpt \
@@ -342,7 +342,7 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
 评估也可以显式控制 ManiSkill backend：
 
 ```bash
-bash mainline.sh eval-fpo handover_block_smoke smoke_npz dummy 1 1 \
+bash mainline.sh eval-fpo handover_block_smoke 1 \
   --backend maniskill \
   --task-profile handover_block_smoke \
   --ckpt-path /ABS/PATH/TO/FPO.ckpt \
@@ -351,16 +351,22 @@ bash mainline.sh eval-fpo handover_block_smoke smoke_npz dummy 1 1 \
   -- --sim-backend physx_cuda --render-backend sapien_cuda
 ```
 
-这里 ManiSkill 评估入口的 5 个位置参数分别是：
+这里 ManiSkill 评估入口现在推荐的 2 个位置参数是：
 
 ```bash
-task_name task_config ckpt_setting expert_data_num gpu_id
+task_name gpu_id
 ```
 
-如果还想显式指定评估 seed，可以继续传第 6 个位置参数：
+如果还想显式指定评估 seed，可以继续传第 3 个位置参数：
 
 ```bash
-task_name task_config ckpt_setting expert_data_num seed gpu_id
+task_name gpu_id seed
+```
+
+旧的 legacy 兼容写法仍然保留：
+
+```bash
+task_name task_config ckpt_setting expert_data_num gpu_id [seed]
 ```
 
 如果你要显式控制 ManiSkill 环境 backend，现在也可以直接透传：
