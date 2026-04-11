@@ -251,6 +251,45 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
 - FPO 这边的 critic 输入维度现在也会根据 `shape_meta` 自动推导，不再写死在 `pickcube_smoke` 的 9 维 `agent_pos` 上。
 - 也就是说，只要你的 task yaml 里的 observation / action 维度写对，后面这两条主线都能跟着适配。
 
+## HandoverBlock 配置入口
+
+当前已经新增了 `handover_block_smoke` 的配置入口：
+
+- ManiSkill profile:
+  - `sim/maniskill/task_profiles.py`
+- FM task:
+  - `policy/FlowMatching/diffusion_policy/config/task/maniskill_handover_block_task.yaml`
+- FPO task:
+  - `policy/FPO/diffusion_policy/config/task/maniskill_handover_block_task.yaml`
+
+当前约定是：
+
+- `env_id: HandoverBlock-v1`
+- `agent_pos: [14]`
+- `action: [14]`
+- `action_type: continuous`
+- `robot_uids: none`
+
+这里的 `continuous` 是刻意保守的写法。因为 `HandoverBlock-v1` 目前走的是仓库内自定义双臂动作接口，不是 ManiSkill 官方 Panda controller 路径。
+
+你现在可以直接通过 override 切到它：
+
+Flow Matching：
+
+```bash
+bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
+  --backend maniskill \
+  -- task=maniskill_handover_block_task exp_name=handover_block_smoke
+```
+
+FPO：
+
+```bash
+bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
+  --backend maniskill \
+  -- task=maniskill_handover_block_task exp_name=handover_block_smoke
+```
+
 ## 当前边界
 
 - `PickCube-v1` 目前只是 ManiSkill smoke task，不是正式研究任务

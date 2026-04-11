@@ -112,6 +112,7 @@ class BaseBimanualEnv(BaseEnv):
             joint.set_drive_properties(gripper_stiffness, gripper_damping)
 
     def _initialize_robot_state(self, robot, env_idx: torch.Tensor, arm_index: int):
+        env_idx = common.to_tensor(env_idx, device=self.device).to(torch.long).reshape(-1)
         qpos = robot.get_qpos().clone()
         qvel = robot.get_qvel().clone()
         if qpos.numel() == 0:
@@ -128,29 +129,45 @@ class BaseBimanualEnv(BaseEnv):
         robot.set_qpos(qpos)
         robot.set_qvel(qvel)
         arm_joints = self.left_arm_joints if arm_index == 0 else self.right_arm_joints
-        for joint_index, joint in enumerate(arm_joints[: qpos.shape[1]]):
-            joint.set_drive_target(qpos[:, joint.active_index])
-            joint.set_drive_velocity_target(torch.zeros_like(qvel[:, joint.active_index]))
+        arm_dof = min(len(arm_joints), qpos.shape[1])
+        if arm_dof > 0:
+            robot.set_joint_drive_targets(qpos[env_idx, :arm_dof], joints=arm_joints[:arm_dof])
+            robot.set_joint_drive_velocity_targets(
+                torch.zeros((len(env_idx), arm_dof), device=self.device, dtype=qvel.dtype),
+                joints=arm_joints[:arm_dof],
+            )
 
-    def _set_gripper(self, gripper_val: torch.Tensor, arm_index: int):
+    def _set_gripper(self, gripper_val: torch.Tensor, arm_index: int, env_idx: torch.Tensor | None = None):
+        if env_idx is not None:
+            env_idx = common.to_tensor(env_idx, device=self.device).to(torch.long).reshape(-1)
+            target_envs = len(env_idx)
+        else:
+            target_envs = self.num_envs
+
+        gripper_val = common.to_tensor(gripper_val, device=self.device).to(torch.float32).reshape(-1)
+        if gripper_val.numel() == 1 and target_envs > 1:
+            gripper_val = gripper_val.repeat(target_envs)
         gripper_val = torch.clamp(gripper_val, 0.0, 1.0)
         gripper_scale = self.embodiment_spec.gripper_scale(arm_index)
         real_gripper_val = gripper_scale[0] + gripper_val * (gripper_scale[1] - gripper_scale[0])
 
         joints = self.left_gripper if arm_index == 0 else self.right_gripper
         if arm_index == 0:
-            self.left_gripper_val = float(gripper_val[0].item()) if self.num_envs == 1 else float(gripper_val.mean().item())
+            self.left_gripper_val = float(gripper_val[0].item()) if target_envs == 1 else float(gripper_val.mean().item())
         else:
-            self.right_gripper_val = float(gripper_val[0].item()) if self.num_envs == 1 else float(gripper_val.mean().item())
+            self.right_gripper_val = float(gripper_val[0].item()) if target_envs == 1 else float(gripper_val.mean().item())
 
-        for joint, sign, offset in joints:
-            drive_target = real_gripper_val * sign + offset
-            current_target = common.to_tensor(joint.get_drive_target(), device=self.device).reshape(-1)
-            if current_target.shape[0] == 1 and self.num_envs > 1:
-                current_target = current_target.repeat(self.num_envs)
-            drive_velocity_target = torch.clamp(drive_target - current_target, -1.0, 1.0) * 0.05
-            joint.set_drive_target(drive_target)
-            joint.set_drive_velocity_target(drive_velocity_target)
+        joint_objs = [joint for joint, _, _ in joints]
+        drive_targets = torch.stack(
+            [real_gripper_val * sign + offset for _, sign, offset in joints],
+            dim=1,
+        )
+        articulation = joint_objs[0].articulation
+        articulation.set_joint_drive_targets(drive_targets, joints=joint_objs)
+        articulation.set_joint_drive_velocity_targets(
+            torch.zeros_like(drive_targets),
+            joints=joint_objs,
+        )
 
     def get_left_gripper_val(self):
         return self.left_gripper_val
@@ -168,19 +185,17 @@ class BaseBimanualEnv(BaseEnv):
         with torch.device(self.device):
             self._initialize_robot_state(self.left_robot, env_idx, arm_index=0)
             self._initialize_robot_state(self.right_robot, env_idx, arm_index=1)
-            self._set_gripper(torch.zeros(self.num_envs, device=self.device), arm_index=0)
-            self._set_gripper(torch.zeros(self.num_envs, device=self.device), arm_index=1)
+            self._set_gripper(torch.zeros(len(env_idx), device=self.device), arm_index=0, env_idx=env_idx)
+            self._set_gripper(torch.zeros(len(env_idx), device=self.device), arm_index=1, env_idx=env_idx)
 
     def _apply_arm_action(self, robot, arm_joints, delta: torch.Tensor):
-        qpos = robot.get_qpos().clone()
-        qvel = robot.get_qvel().clone()
         current_arm_qpos = torch.stack([joint.qpos.reshape(-1) for joint in arm_joints], dim=1)
         target_arm_qpos = current_arm_qpos + delta * self.ARM_DELTA_SCALE
-        for joint_index, joint in enumerate(arm_joints):
-            qpos[:, joint.active_index] = target_arm_qpos[:, joint_index]
-            joint.set_drive_target(target_arm_qpos[:, joint_index])
-            joint.set_drive_velocity_target(torch.zeros_like(qvel[:, joint.active_index]))
-        robot.set_qpos(qpos)
+        robot.set_joint_drive_targets(target_arm_qpos, joints=arm_joints)
+        robot.set_joint_drive_velocity_targets(
+            torch.zeros_like(target_arm_qpos),
+            joints=arm_joints,
+        )
 
     def _step_action(self, action):
         if action is None:

@@ -46,6 +46,20 @@ MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
             "zarr_path": "data/PickCube-v1-smoke_npz-1.zarr",
         },
     },
+    "handover_block_smoke": {
+        "env_id": "HandoverBlock-v1",
+        **DEFAULT_MANISKILL_RUNTIME,
+        "action_type": "continuous",
+        "robot_uids": "none",
+        "shape_meta": {
+            "point_cloud": [512, 3],
+            "agent_pos": [14],
+            "action": [14],
+        },
+        "dataset": {
+            "zarr_path": "data/handover_block-demo_clean-50.zarr",
+        },
+    },
 }
 
 

@@ -1,0 +1,36 @@
+name: handover_block_smoke
+
+maniskill:
+  profile: handover_block_smoke
+  env_id: HandoverBlock-v1
+  action_type: continuous
+  obs_mode: pointcloud+state_dict
+  control_mode: null
+  render_mode: null
+  reward_mode: normalized_dense
+  robot_uids: none
+  sim_freq: 200
+  control_freq: 20
+  zarr_path: data/handover_block-demo_clean-50.zarr
+
+shape_meta: &shape_meta
+  obs:
+    point_cloud:
+      shape: [512, 3]
+      type: point_cloud
+    agent_pos:
+      shape: [14]
+      type: low_dim
+  action:
+    shape: [14]
+
+dataset:
+  _target_: diffusion_policy.dataset.robot_pointcloud_dataset.RobotPointCloudDataset
+  zarr_path: ${task.maniskill.zarr_path}
+  batch_size: ${dataloader.batch_size}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.0
+  max_train_episodes: null

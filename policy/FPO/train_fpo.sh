@@ -6,6 +6,61 @@ config_name=
 positional=()
 hydra_overrides=()
 
+has_override_prefix() {
+    local prefix="$1"
+    local override
+    for override in "${hydra_overrides[@]}"; do
+        if [[ "${override}" == "${prefix}"* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+get_task_group_override() {
+    local override
+    for override in "${hydra_overrides[@]}"; do
+        case "${override}" in
+            task=*|+task=*)
+                echo "${override#*=}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+resolve_task_group_zarr_path() {
+    local task_group="$1"
+    local task_yaml="${SCRIPT_DIR}/diffusion_policy/config/task/${task_group}.yaml"
+    local raw_path=
+
+    if [ ! -f "${task_yaml}" ]; then
+        return 1
+    fi
+
+    raw_path=$(
+        awk '
+            $1 == "maniskill:" { in_maniskill = 1; next }
+            in_maniskill && $1 == "dataset:" { in_maniskill = 0 }
+            in_maniskill && $1 == "zarr_path:" { print $2; exit }
+        ' "${task_yaml}"
+    )
+
+    if [ -z "${raw_path}" ]; then
+        return 1
+    fi
+
+    raw_path="${raw_path%\"}"
+    raw_path="${raw_path#\"}"
+
+    if [[ "${raw_path}" = /* ]]; then
+        echo "${raw_path}"
+    else
+        echo "${SCRIPT_DIR}/${raw_path}"
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --)
@@ -98,16 +153,53 @@ if [ -n "${task_profile}" ]; then
     hydra_task_name=${task_profile}
 fi
 
+inject_task_name=true
+inject_dataset_zarr_path=true
+resolved_dataset_zarr_path="${zarr_path}"
+task_group_override=
+
+if task_group_override="$(get_task_group_override)"; then
+    inject_task_name=false
+
+    if has_override_prefix "task.dataset.zarr_path=" || has_override_prefix "+task.dataset.zarr_path="; then
+        inject_dataset_zarr_path=false
+    else
+        resolved_task_zarr_path="$(resolve_task_group_zarr_path "${task_group_override}")"
+        if [ -n "${resolved_task_zarr_path}" ]; then
+            resolved_dataset_zarr_path="${resolved_task_zarr_path}"
+        else
+            inject_dataset_zarr_path=false
+        fi
+    fi
+else
+    if has_override_prefix "task.name=" || has_override_prefix "+task.name="; then
+        inject_task_name=false
+    fi
+    if has_override_prefix "task.dataset.zarr_path=" || has_override_prefix "+task.dataset.zarr_path="; then
+        inject_dataset_zarr_path=false
+    fi
+fi
+
+maniskill_overrides=(
+    training.debug=$DEBUG
+    training.seed=${seed}
+    training.device="cuda:0"
+    exp_name=${exp_name}
+    logging.mode=${wandb_mode}
+    training.resume_ckpt_path=${resume_ckpt_path}
+)
+
+if [ "${inject_task_name}" = true ]; then
+    maniskill_overrides=(task.name=${hydra_task_name} "${maniskill_overrides[@]}")
+fi
+
+if [ "${inject_dataset_zarr_path}" = true ]; then
+    maniskill_overrides=(task.dataset.zarr_path="${resolved_dataset_zarr_path}" "${maniskill_overrides[@]}")
+fi
+
 if [ "${backend}" = "maniskill" ]; then
     python "${SCRIPT_DIR}/train.py" --config-name=${config_name}.yaml \
-                                task.name=${hydra_task_name} \
-                                task.dataset.zarr_path="${zarr_path}" \
-                                training.debug=$DEBUG \
-                                training.seed=${seed} \
-                                training.device="cuda:0" \
-                                exp_name=${exp_name} \
-                                logging.mode=${wandb_mode} \
-                                training.resume_ckpt_path=${resume_ckpt_path} \
+                                "${maniskill_overrides[@]}" \
                                 "${hydra_overrides[@]}"
 else
     python "${SCRIPT_DIR}/train.py" --config-name=${config_name}.yaml \
