@@ -290,6 +290,60 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
   -- task=maniskill_handover_block_task exp_name=handover_block_smoke
 ```
 
+另外现在单独增加了一套 `handover_block_native_smoke` 配置入口，用来走 ManiSkill 原生 `collect -> process -> train` 数据链：
+
+- ManiSkill profile:
+  - `sim/maniskill/task_profiles.py`
+- FM task:
+  - `policy/FlowMatching/diffusion_policy/config/task/maniskill_handover_block_native_task.yaml`
+- FPO task:
+  - `policy/FPO/diffusion_policy/config/task/maniskill_handover_block_native_task.yaml`
+
+这套 native smoke 的默认 zarr 路径是：
+
+- `data/HandoverBlock-v1-smoke_npz-1.zarr`
+
+推荐命令模板：
+
+collect：
+
+```bash
+bash mainline.sh collect HandoverBlock-v1 smoke_npz 1 \
+  --backend maniskill \
+  --task-profile handover_block_native_smoke \
+  --episode-num 1 \
+  --max-episode-steps 50
+```
+
+process：
+
+```bash
+bash mainline.sh process-fm HandoverBlock-v1 smoke_npz 1 --backend maniskill
+```
+
+Flow Matching：
+
+```bash
+bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
+  --backend maniskill \
+  -- task=maniskill_handover_block_native_task exp_name=handover_block_native_smoke
+```
+
+FPO：
+
+```bash
+bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
+  --backend maniskill \
+  -- task=maniskill_handover_block_native_task exp_name=handover_block_native_smoke
+```
+
+当前两套 handover 配置的区别是：
+
+- `maniskill_handover_block_task`
+  - 默认吃现有 legacy zarr：`data/handover_block-demo_clean-50.zarr`
+- `maniskill_handover_block_native_task`
+  - 默认吃 ManiSkill 原生 collect/process 生成的 zarr：`data/HandoverBlock-v1-smoke_npz-1.zarr`
+
 ## 当前边界
 
 - `PickCube-v1` 目前只是 ManiSkill smoke task，不是正式研究任务
