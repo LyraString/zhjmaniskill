@@ -5,6 +5,7 @@ task_profile=
 config_name=
 positional=()
 hydra_overrides=()
+short_maniskill_syntax=false
 
 has_override_prefix() {
     local prefix="$1"
@@ -91,6 +92,27 @@ resolve_process_triplet_from_zarr_path() {
     printf '%s\t%s\t%s\n' "${task_nm}" "${task_cfg}" "${expert_num}"
 }
 
+resolve_task_profile_zarr_path() {
+    local profile_name="$1"
+    local raw_path=
+
+    raw_path=$(
+        PYTHONPATH="${ROOT_DIR}:${PYTHONPATH}" python -c \
+        "from sim.maniskill.task_profiles import resolve_task_profile; p = resolve_task_profile('${profile_name}'); print(p['dataset']['zarr_path'] if p and 'dataset' in p else '')" \
+        2>/dev/null
+    )
+
+    if [ -z "${raw_path}" ]; then
+        return 1
+    fi
+
+    if [[ "${raw_path}" = /* ]]; then
+        echo "${raw_path}"
+    else
+        echo "${SCRIPT_DIR}/${raw_path}"
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --)
@@ -117,18 +139,54 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ ${#positional[@]} -lt 6 ]; then
-    echo "Usage: $0 task_name task_config expert_data_num seed action_dim gpu_id [resume_ckpt_path] [--backend robotwin|maniskill] [--task-profile PROFILE] [--config-name CONFIG] [-- HYDRA_OVERRIDE ...]"
-    exit 1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+if [ "${backend}" = "maniskill" ]; then
+    if ! [[ ${#positional[@]} -eq 2 || ${#positional[@]} -eq 3 || ${#positional[@]} -eq 6 || ${#positional[@]} -eq 7 ]]; then
+        echo "Usage: $0 seed gpu_id [resume_ckpt_path] [--backend maniskill] [--task-profile PROFILE] [--config-name CONFIG] [-- HYDRA_OVERRIDE ...]"
+        echo "Legacy ManiSkill form is also accepted: $0 task_name task_config expert_data_num seed action_dim gpu_id [resume_ckpt_path] ..."
+        exit 1
+    fi
+else
+    if [ ${#positional[@]} -lt 6 ]; then
+        echo "Usage: $0 task_name task_config expert_data_num seed action_dim gpu_id [resume_ckpt_path] [--backend robotwin|maniskill] [--task-profile PROFILE] [--config-name CONFIG] [-- HYDRA_OVERRIDE ...]"
+        exit 1
+    fi
 fi
 
-task_name=${positional[0]}
-task_config=${positional[1]}
-expert_data_num=${positional[2]}
-seed=${positional[3]}
-action_dim=${positional[4]}
-gpu_id=${positional[5]}
-resume_ckpt_path=${positional[6]:-null}  # 可选：指定恢复训练的 checkpoint 路径，例如 checkpoints/handover_block-demo_clean-50-42/300.ckpt
+task_name=
+task_config=
+expert_data_num=
+seed=
+action_dim=
+gpu_id=
+resume_ckpt_path=null
+
+if [ "${backend}" = "maniskill" ]; then
+    if [ ${#positional[@]} -eq 2 ] || [ ${#positional[@]} -eq 3 ]; then
+        short_maniskill_syntax=true
+        seed=${positional[0]}
+        gpu_id=${positional[1]}
+        resume_ckpt_path=${positional[2]:-null}
+    else
+        task_name=${positional[0]}
+        task_config=${positional[1]}
+        expert_data_num=${positional[2]}
+        seed=${positional[3]}
+        action_dim=${positional[4]}
+        gpu_id=${positional[5]}
+        resume_ckpt_path=${positional[6]:-null}
+    fi
+else
+    task_name=${positional[0]}
+    task_config=${positional[1]}
+    expert_data_num=${positional[2]}
+    seed=${positional[3]}
+    action_dim=${positional[4]}
+    gpu_id=${positional[5]}
+    resume_ckpt_path=${positional[6]:-null}
+fi
 
 head_camera_type=D435
 
@@ -145,7 +203,23 @@ if [ -z "${config_name}" ]; then
 fi
 addition_info=train
 exp_backend=${backend}
-exp_name=${task_name}-${exp_backend}_fm-${addition_info}
+task_group_override=
+if task_group_override="$(get_task_group_override)"; then
+    :
+fi
+
+exp_task_label=${task_name}
+if [ -z "${exp_task_label}" ]; then
+    if [ -n "${task_group_override}" ]; then
+        exp_task_label=${task_group_override}
+    elif [ -n "${task_profile}" ]; then
+        exp_task_label=${task_profile}
+    else
+        exp_task_label=${config_name}
+    fi
+fi
+
+exp_name=${exp_task_label}-${exp_backend}_fm-${addition_info}
 run_dir="data/outputs/${exp_name}_seed${seed}"
 
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
@@ -164,8 +238,6 @@ fi
 
 export HYDRA_FULL_ERROR=1 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 zarr_path="${SCRIPT_DIR}/data/${task_name}-${task_config}-${expert_data_num}.zarr"
 
 hydra_task_name=${task_name}
@@ -176,9 +248,7 @@ fi
 inject_task_name=true
 inject_dataset_zarr_path=true
 resolved_dataset_zarr_path="${zarr_path}"
-task_group_override=
-
-if task_group_override="$(get_task_group_override)"; then
+if [ -n "${task_group_override}" ]; then
     inject_task_name=false
 
     if has_override_prefix "task.dataset.zarr_path=" || has_override_prefix "+task.dataset.zarr_path="; then
@@ -192,11 +262,27 @@ if task_group_override="$(get_task_group_override)"; then
         fi
     fi
 else
+    if [ "${short_maniskill_syntax}" = true ]; then
+        inject_task_name=false
+        inject_dataset_zarr_path=false
+    fi
     if has_override_prefix "task.name=" || has_override_prefix "+task.name="; then
         inject_task_name=false
     fi
     if has_override_prefix "task.dataset.zarr_path=" || has_override_prefix "+task.dataset.zarr_path="; then
         inject_dataset_zarr_path=false
+    fi
+fi
+
+if [ "${short_maniskill_syntax}" = true ] && [ -n "${task_profile}" ] && [ -z "${task_group_override}" ] && [ "${inject_dataset_zarr_path}" = false ]; then
+    hydra_task_name=${task_profile}
+    inject_task_name=true
+    if ! has_override_prefix "task.dataset.zarr_path=" && ! has_override_prefix "+task.dataset.zarr_path="; then
+        resolved_profile_zarr_path="$(resolve_task_profile_zarr_path "${task_profile}")"
+        if [ -n "${resolved_profile_zarr_path}" ]; then
+            resolved_dataset_zarr_path="${resolved_profile_zarr_path}"
+            inject_dataset_zarr_path=true
+        fi
     fi
 fi
 

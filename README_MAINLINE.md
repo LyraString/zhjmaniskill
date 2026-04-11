@@ -102,7 +102,7 @@ bash mainline.sh process-fpo PickCube-v1 smoke_npz 1 --backend maniskill
 ### 3. ManiSkill Flow Matching smoke
 
 ```bash
-bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
+bash mainline.sh train-fm 42 0 \
   --backend maniskill \
   --task-profile pickcube_smoke
 ```
@@ -116,7 +116,7 @@ bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
 如果你要显式覆盖 task/config 里的字段，可以这样写：
 
 ```bash
-bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
+bash mainline.sh train-fm 42 0 \
   --backend maniskill \
   --task-profile pickcube_smoke \
   -- task.name=my_task task.dataset.zarr_path=data/my_task.zarr exp_name=my_exp
@@ -125,7 +125,7 @@ bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
 ### 4. ManiSkill FPO smoke
 
 ```bash
-bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
+bash mainline.sh train-fpo 42 0 \
   --backend maniskill \
   --task-profile pickcube_smoke
 ```
@@ -137,7 +137,7 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
 同样支持透传 Hydra override：
 
 ```bash
-bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
+bash mainline.sh train-fpo 42 0 \
   --backend maniskill \
   --task-profile pickcube_smoke \
   -- training.num_envs=1 task.name=my_task
@@ -146,7 +146,7 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
 ### 5. ManiSkill FM -> FPO finetune smoke
 
 ```bash
-bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 /ABS/PATH/TO/FM.ckpt \
+bash mainline.sh train-fpo 42 0 /ABS/PATH/TO/FM.ckpt \
   --backend maniskill \
   --task-profile pickcube_smoke \
   --config-name maniskill_fpo_finetune
@@ -227,7 +227,7 @@ bash mainline.sh eval-fm pickcube_smoke 0 \
 Flow Matching：
 
 ```bash
-bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
+bash mainline.sh train-fm 42 0 \
   --backend maniskill \
   -- task=my_custom_maniskill_task exp_name=my_exp
 ```
@@ -235,7 +235,7 @@ bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
 FPO：
 
 ```bash
-bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
+bash mainline.sh train-fpo 42 0 \
   --backend maniskill \
   -- task=my_custom_maniskill_task exp_name=my_exp
 ```
@@ -277,7 +277,7 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
 Flow Matching：
 
 ```bash
-bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
+bash mainline.sh train-fm 42 0 \
   --backend maniskill \
   -- task=maniskill_handover_block_task exp_name=handover_block_smoke
 ```
@@ -285,7 +285,7 @@ bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
 FPO：
 
 ```bash
-bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
+bash mainline.sh train-fpo 42 0 \
   --backend maniskill \
   -- task=maniskill_handover_block_task exp_name=handover_block_smoke
 ```
@@ -326,7 +326,7 @@ bash mainline.sh process-fm HandoverBlock-v1 smoke_npz 1 --backend maniskill
 Flow Matching：
 
 ```bash
-bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
+bash mainline.sh train-fm 42 0 \
   --backend maniskill \
   -- task=maniskill_handover_block_native_task exp_name=handover_block_native_smoke
 ```
@@ -334,7 +334,7 @@ bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 \
 FPO：
 
 ```bash
-bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
+bash mainline.sh train-fpo 42 0 \
   --backend maniskill \
   -- task=maniskill_handover_block_native_task exp_name=handover_block_native_smoke
 ```
@@ -372,12 +372,30 @@ task_name task_config ckpt_setting expert_data_num gpu_id [seed]
 如果你要显式控制 ManiSkill 环境 backend，现在也可以直接透传：
 
 ```bash
-bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 1 \
+bash mainline.sh train-fpo 42 1 \
   --backend maniskill \
   -- task=maniskill_handover_block_task \
      training.sim_backend=physx_cuda \
      training.render_backend=sapien_cuda \
      exp_name=handover_block_smoke
+```
+
+这里 ManiSkill 训练入口现在推荐的 2 个位置参数是：
+
+```bash
+seed gpu_id
+```
+
+如果需要继续传恢复训练或 finetune 的 checkpoint，可以追加第 3 个位置参数：
+
+```bash
+seed gpu_id resume_ckpt_path
+```
+
+旧的 legacy 兼容写法仍然保留：
+
+```bash
+task_name task_config expert_data_num seed action_dim gpu_id [resume_ckpt_path]
 ```
 
 说明：

@@ -18,8 +18,8 @@ Usage:
 Examples:
   bash mainline.sh collect PickCube-v1 smoke_npz 0 --backend maniskill --task-profile pickcube_smoke --episode-num 1 --max-episode-steps 5
   bash mainline.sh process-fm PickCube-v1 smoke_npz 1 --backend maniskill
-  bash mainline.sh train-fm PickCube-v1 smoke_npz 1 42 8 0 --backend maniskill --task-profile pickcube_smoke
-  bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 --backend maniskill --task-profile pickcube_smoke
+  bash mainline.sh train-fm 42 0 --backend maniskill --task-profile pickcube_smoke
+  bash mainline.sh train-fpo 42 0 --backend maniskill --task-profile pickcube_smoke
   bash mainline.sh eval-fm pickcube_smoke 0 --backend maniskill --task-profile pickcube_smoke --ckpt-path /ABS/PATH/TO/FM.ckpt
   bash mainline.sh eval-fpo pickcube_smoke 0 --backend maniskill --task-profile pickcube_smoke --ckpt-path /ABS/PATH/TO/FPO.ckpt
 EOF
