@@ -46,17 +46,30 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ ${#positional[@]} -lt 6 ]; then
-    echo "Usage: $0 task_name task_config ckpt_setting expert_data_num seed gpu_id [--backend robotwin|maniskill] [--task-profile PROFILE] [--ckpt-path CKPT] [--episodes N] [--max-episode-steps N] [-- EVAL_OVERRIDE ...]"
-    exit 1
+if [ "${backend}" = "maniskill" ]; then
+    if [ ${#positional[@]} -lt 5 ]; then
+        echo "Usage: $0 task_name task_config ckpt_setting expert_data_num gpu_id [seed] [--backend robotwin|maniskill] [--task-profile PROFILE] [--ckpt-path CKPT] [--episodes N] [--max-episode-steps N] [-- EVAL_OVERRIDE ...]"
+        exit 1
+    fi
+else
+    if [ ${#positional[@]} -lt 6 ]; then
+        echo "Usage: $0 task_name task_config ckpt_setting expert_data_num seed gpu_id [--backend robotwin|maniskill] [--task-profile PROFILE] [--ckpt-path CKPT] [--episodes N] [--max-episode-steps N] [-- EVAL_OVERRIDE ...]"
+        exit 1
+    fi
 fi
 
 task_name=${positional[0]}
 task_config=${positional[1]}
 ckpt_setting=${positional[2]}
 expert_data_num=${positional[3]}
-seed=${positional[4]}
-gpu_id=${positional[5]}
+
+if [ "${backend}" = "maniskill" ] && [ ${#positional[@]} -eq 5 ]; then
+    seed=42
+    gpu_id=${positional[4]}
+else
+    seed=${positional[4]}
+    gpu_id=${positional[5]}
+fi
 DEBUG=False
 # [TODO] add parameters here
 
@@ -71,12 +84,17 @@ if [ "${backend}" = "maniskill" ]; then
         exit 1
     fi
 
+    runtime_task_name="${task_name}"
+    if [ -n "${task_profile}" ]; then
+        runtime_task_name="${task_profile}"
+    fi
+
     cmd=(
         python script/eval_policy.py
         --backend maniskill
         flowmatching
         "${ckpt_path}"
-        "${task_name}"
+        "${runtime_task_name}"
         --episodes "${episodes}"
         --max-episode-steps "${max_episode_steps}"
         --seed "${seed}"

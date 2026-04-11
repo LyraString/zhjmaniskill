@@ -63,6 +63,14 @@ class ManiSkillEnvBackend:
         self.env = gym.make(env_id, **make_kwargs)
         self._fixed_rate_info = self._collect_fixed_rate_info()
 
+    @property
+    def action_space(self):
+        return self.env.action_space
+
+    @property
+    def observation_space(self):
+        return self.env.observation_space
+
     def _collect_fixed_rate_info(self) -> dict[str, Any]:
         unwrapped = self.env.unwrapped
         sim_freq = getattr(unwrapped, "sim_freq", None)
