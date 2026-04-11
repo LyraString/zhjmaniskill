@@ -81,6 +81,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             torch.abs(box_bottom_center[:, 2] - target_top_center[:, 2]) < SUCCESS_Z_EPS
         )
         spatial_success = xy_aligned & z_aligned
+        right_gripper_open = self._get_gripper_open_mask(arm_index=1)
         success = base_info["robots_ready"] & spatial_success
 
         base_info.update(
@@ -88,19 +89,8 @@ class HandoverBlockEnv(DualUR5WSGEnv):
                 "xy_aligned": xy_aligned,
                 "z_aligned": z_aligned,
                 "spatial_success": spatial_success,
-                "right_gripper_open": torch.full(
-                    (self.num_envs,),
-                    self.is_right_gripper_open(),
-                    device=self.device,
-                    dtype=torch.bool,
-                ),
-                "success": success
-                & torch.full(
-                    (self.num_envs,),
-                    self.is_right_gripper_open(),
-                    device=self.device,
-                    dtype=torch.bool,
-                ),
+                "right_gripper_open": right_gripper_open,
+                "success": success & right_gripper_open,
             }
         )
         return base_info

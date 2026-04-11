@@ -112,6 +112,41 @@ class BaseBimanualEnv(BaseEnv):
         for joint, _, _ in gripper_joints:
             joint.set_drive_properties(gripper_stiffness, gripper_damping)
 
+    def _get_gripper_state_tensor(self, arm_index: int) -> torch.Tensor:
+        attr_name = "left_gripper_val" if arm_index == 0 else "right_gripper_val"
+        value = getattr(self, attr_name)
+        if isinstance(value, torch.Tensor):
+            tensor_value = value.to(device=self.device, dtype=torch.float32)
+            if tensor_value.ndim == 1:
+                tensor_value = tensor_value.unsqueeze(-1)
+            if tensor_value.shape == (self.num_envs, 1):
+                setattr(self, attr_name, tensor_value)
+                return tensor_value
+
+        fill_value = float(value)
+        tensor_value = torch.full(
+            (self.num_envs, 1),
+            fill_value,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        setattr(self, attr_name, tensor_value)
+        return tensor_value
+
+    def _set_gripper_state_tensor(self, gripper_val: torch.Tensor, arm_index: int, env_idx: torch.Tensor | None = None):
+        state = self._get_gripper_state_tensor(arm_index).clone()
+        if env_idx is None:
+            state[:, 0] = gripper_val.reshape(-1)
+        else:
+            state[env_idx, 0] = gripper_val.reshape(-1)
+        if arm_index == 0:
+            self.left_gripper_val = state
+        else:
+            self.right_gripper_val = state
+
+    def _get_gripper_open_mask(self, arm_index: int) -> torch.Tensor:
+        return self._get_gripper_state_tensor(arm_index).squeeze(-1) > self.GRIPPER_OPEN_THRESHOLD
+
     def _initialize_robot_state(self, robot, env_idx: torch.Tensor, arm_index: int):
         env_idx = common.to_tensor(env_idx, device=self.device).to(torch.long).reshape(-1)
         qpos = robot.get_qpos().clone()
@@ -153,10 +188,7 @@ class BaseBimanualEnv(BaseEnv):
         real_gripper_val = gripper_scale[0] + gripper_val * (gripper_scale[1] - gripper_scale[0])
 
         joints = self.left_gripper if arm_index == 0 else self.right_gripper
-        if arm_index == 0:
-            self.left_gripper_val = float(gripper_val[0].item()) if target_envs == 1 else float(gripper_val.mean().item())
-        else:
-            self.right_gripper_val = float(gripper_val[0].item()) if target_envs == 1 else float(gripper_val.mean().item())
+        self._set_gripper_state_tensor(gripper_val, arm_index=arm_index, env_idx=env_idx)
 
         joint_objs = [joint for joint, _, _ in joints]
         drive_targets = torch.stack(
@@ -171,16 +203,28 @@ class BaseBimanualEnv(BaseEnv):
         )
 
     def get_left_gripper_val(self):
-        return self.left_gripper_val
+        value = self._get_gripper_state_tensor(arm_index=0).squeeze(-1)
+        if self.num_envs == 1:
+            return float(value[0].item())
+        return value
 
     def get_right_gripper_val(self):
-        return self.right_gripper_val
+        value = self._get_gripper_state_tensor(arm_index=1).squeeze(-1)
+        if self.num_envs == 1:
+            return float(value[0].item())
+        return value
 
     def is_left_gripper_open(self):
-        return self.left_gripper_val > self.GRIPPER_OPEN_THRESHOLD
+        value = self._get_gripper_open_mask(arm_index=0)
+        if self.num_envs == 1:
+            return bool(value[0].item())
+        return value
 
     def is_right_gripper_open(self):
-        return self.right_gripper_val > self.GRIPPER_OPEN_THRESHOLD
+        value = self._get_gripper_open_mask(arm_index=1)
+        if self.num_envs == 1:
+            return bool(value[0].item())
+        return value
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
@@ -230,16 +274,18 @@ class BaseBimanualEnv(BaseEnv):
         )
         left_gripper = torch.full(
             (self.num_envs, 1),
-            self.left_gripper_val,
+            0.0,
             device=self.device,
             dtype=torch.float32,
         )
         right_gripper = torch.full(
             (self.num_envs, 1),
-            self.right_gripper_val,
+            0.0,
             device=self.device,
             dtype=torch.float32,
         )
+        left_gripper[:] = self._get_gripper_state_tensor(arm_index=0)
+        right_gripper[:] = self._get_gripper_state_tensor(arm_index=1)
         return torch.cat(
             [left_arm_qpos, left_gripper, right_arm_qpos, right_gripper],
             dim=1,
@@ -248,18 +294,8 @@ class BaseBimanualEnv(BaseEnv):
     def _get_obs_agent(self):
         return dict(
             qpos=self._get_agent_qpos(),
-            left_gripper_val=torch.full(
-                (self.num_envs, 1),
-                self.left_gripper_val,
-                device=self.device,
-                dtype=torch.float32,
-            ),
-            right_gripper_val=torch.full(
-                (self.num_envs, 1),
-                self.right_gripper_val,
-                device=self.device,
-                dtype=torch.float32,
-            ),
+            left_gripper_val=self._get_gripper_state_tensor(arm_index=0),
+            right_gripper_val=self._get_gripper_state_tensor(arm_index=1),
         )
 
     def get_state_dict(self):
@@ -294,8 +330,8 @@ class BaseBimanualEnv(BaseEnv):
                 left_qpos=self.left_robot.get_qpos(),
                 right_qpos=self.right_robot.get_qpos(),
                 workspace_table_pose=self.workspace_table.pose.raw_pose,
-                left_gripper_val=torch.full((self.num_envs, 1), self.left_gripper_val, device=self.device, dtype=torch.float32),
-                right_gripper_val=torch.full((self.num_envs, 1), self.right_gripper_val, device=self.device, dtype=torch.float32),
+                left_gripper_val=self._get_gripper_state_tensor(arm_index=0),
+                right_gripper_val=self._get_gripper_state_tensor(arm_index=1),
             )
         return obs
 

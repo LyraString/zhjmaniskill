@@ -358,6 +358,7 @@ bash mainline.sh train-fpo PickCube-v1 smoke_npz 1 42 8 0 \
   - 臂动作现在按 RoboTwin 现有数据语义解释为绝对 joint qpos 目标
   - gripper 动作是 `[0,1]` 归一化开合目标
   - `is_right_gripper_open()` 已经接回 ManiSkill success 判定
+  - batched env 现在会按 env 维度分别维护 gripper 状态，不再把并行环境压成一个全局标量
   - 当前也已经开通 `pointcloud+state_dict` 观测模式，用来对接 ManiSkill 主线数据链
   - 当前 `agent.qpos` 也已经对齐成 `14` 维：左臂 `6` + 左 gripper `1` + 右臂 `6` + 右 gripper `1`
   - 它还不是 `HandoverBlock-v1`，也没有迁移 RoboTwin 的脚本式 handover 逻辑
