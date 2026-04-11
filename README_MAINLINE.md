@@ -70,7 +70,7 @@ bash mainline.sh <command> ...
 根目录入口：
 
 ```bash
-bash mainline.sh collect PickCube-v1 smoke_npz 0 \
+bash mainline.sh collect 0 \
   --backend maniskill \
   --task-profile pickcube_smoke \
   --episode-num 1 \
@@ -84,6 +84,16 @@ data/PickCube-v1/smoke_npz/data/episode0.npz
 ```
 
 根目录的 [collect_data.sh](/home/idiot/zhj/RoboTwin/collect_data.sh) 现在也已经改成对当前工作目录不敏感，可以从仓库外部目录直接调用。
+
+旧的写法仍然兼容：
+
+```bash
+bash mainline.sh collect PickCube-v1 smoke_npz 0 \
+  --backend maniskill \
+  --task-profile pickcube_smoke \
+  --episode-num 1 \
+  --max-episode-steps 5
+```
 
 ### 2. ManiSkill 转 zarr
 
@@ -315,7 +325,7 @@ bash mainline.sh train-fpo 42 0 \
 collect：
 
 ```bash
-bash mainline.sh collect HandoverBlock-v1 smoke_npz 1 \
+bash mainline.sh collect 1 \
   --backend maniskill \
   --task-profile handover_block_native_smoke \
   --episode-num 1 \

@@ -16,7 +16,7 @@ Usage:
   bash mainline.sh eval-fpo ...
 
 Examples:
-  bash mainline.sh collect PickCube-v1 smoke_npz 0 --backend maniskill --task-profile pickcube_smoke --episode-num 1 --max-episode-steps 5
+  bash mainline.sh collect 0 --backend maniskill --task-profile pickcube_smoke --episode-num 1 --max-episode-steps 5
   bash mainline.sh process-fm --backend maniskill --task-profile pickcube_smoke
   bash mainline.sh process-fpo --backend maniskill --task-profile pickcube_smoke
   bash mainline.sh train-fm 42 0 --backend maniskill --task-profile pickcube_smoke
