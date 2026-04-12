@@ -8,6 +8,7 @@ print_usage() {
     cat <<'EOF'
 Usage:
   bash mainline.sh collect ...
+  bash mainline.sh process ...
   bash mainline.sh process-fm ...
   bash mainline.sh process-fpo ...
   bash mainline.sh train-fm ...
@@ -17,6 +18,7 @@ Usage:
 
 Examples:
   bash mainline.sh collect 0 --backend maniskill --task-profile pickcube_smoke --episode-num 1 --max-episode-steps 5
+  bash mainline.sh process fm --backend maniskill --task-profile pickcube_smoke
   bash mainline.sh process-fm --backend maniskill --task-profile pickcube_smoke
   bash mainline.sh process-fpo --backend maniskill --task-profile pickcube_smoke
   bash mainline.sh train-fm 42 0 --backend maniskill --task-profile pickcube_smoke
@@ -37,6 +39,9 @@ shift
 case "$command" in
     collect)
         bash "${ROOT_DIR}/collect_data.sh" "$@"
+        ;;
+    process)
+        bash "${ROOT_DIR}/process_data.sh" "$@"
         ;;
     process-fm)
         bash "${ROOT_DIR}/policy/FlowMatching/process_data.sh" "$@"

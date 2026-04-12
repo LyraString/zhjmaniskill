@@ -58,6 +58,7 @@ bash mainline.sh <command> ...
 目前支持：
 
 - `collect`
+- `process`
 - `process-fm`
 - `process-fpo`
 - `train-fm`
@@ -97,21 +98,23 @@ bash mainline.sh collect PickCube-v1 smoke_npz 0 \
 
 ### 2. ManiSkill 转 zarr
 
-Flow Matching：
+共享入口：
+
+```bash
+bash mainline.sh process fm --backend maniskill --task-profile pickcube_smoke
+bash mainline.sh process fpo --backend maniskill --task-profile pickcube_smoke
+```
+
+兼容别名：
 
 ```bash
 bash mainline.sh process-fm --backend maniskill --task-profile pickcube_smoke
-```
-
-FPO：
-
-```bash
 bash mainline.sh process-fpo --backend maniskill --task-profile pickcube_smoke
 ```
 
-旧的 triplet 写法仍然兼容：
-
 ```bash
+bash mainline.sh process fm PickCube-v1 smoke_npz 1 --backend maniskill
+bash mainline.sh process fpo PickCube-v1 smoke_npz 1 --backend maniskill
 bash mainline.sh process-fm PickCube-v1 smoke_npz 1 --backend maniskill
 bash mainline.sh process-fpo PickCube-v1 smoke_npz 1 --backend maniskill
 ```
@@ -337,8 +340,8 @@ bash mainline.sh collect 1 \
 process：
 
 ```bash
-bash mainline.sh process-fm --backend maniskill --task-profile handover_block_native_smoke
-bash mainline.sh process-fpo --backend maniskill --task-profile handover_block_native_smoke
+bash mainline.sh process fm --backend maniskill --task-profile handover_block_native_smoke
+bash mainline.sh process fpo --backend maniskill --task-profile handover_block_native_smoke
 ```
 
 Flow Matching：
