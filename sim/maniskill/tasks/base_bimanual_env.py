@@ -27,6 +27,12 @@ class BaseBimanualEnv(BaseEnv):
     ARM_DOF = 6
     GRIPPER_OPEN_THRESHOLD = 0.8
     ACTION_DIM = 14
+    TABLE_LENGTH = 1.2
+    TABLE_WIDTH = 0.7
+    TABLE_HEIGHT = 0.74
+    TABLE_THICKNESS = 0.05
+    WALL_HALF_SIZE = [3.0, 0.6, 1.5]
+    WALL_POSE = [0.0, 1.0, 1.5]
 
     def __init__(
         self,
@@ -73,14 +79,48 @@ class BaseBimanualEnv(BaseEnv):
 
     def _load_scene(self, options: dict):
         self.ground = build_ground(self.scene, altitude=0)
+        wall_builder = self.scene.create_actor_builder()
+        wall_builder.add_box_collision(half_size=self.WALL_HALF_SIZE)
+        if self.scene.can_render():
+            wall_builder.add_box_visual(
+                half_size=self.WALL_HALF_SIZE,
+                material=sapien.render.RenderMaterial(base_color=[1.0, 0.9, 0.9, 1.0]),
+            )
+        wall_builder.set_initial_pose(sapien.Pose(p=self.WALL_POSE))
+        self.workspace_wall = wall_builder.build_static(name="workspace_wall")
+
         table_builder = self.scene.create_actor_builder()
-        table_builder.add_box_collision(half_size=[0.55, 0.4, 0.02])
+        tabletop_pose = sapien.Pose([0.0, 0.0, -self.TABLE_THICKNESS / 2])
+        tabletop_half_size = [self.TABLE_LENGTH / 2, self.TABLE_WIDTH / 2, self.TABLE_THICKNESS / 2]
+        table_builder.add_box_collision(pose=tabletop_pose, half_size=tabletop_half_size)
         if self.scene.can_render():
             table_builder.add_box_visual(
-                half_size=[0.55, 0.4, 0.02],
-                material=sapien.render.RenderMaterial(base_color=[0.5, 0.5, 0.5, 1.0]),
+                pose=tabletop_pose,
+                half_size=tabletop_half_size,
+                material=sapien.render.RenderMaterial(base_color=[1.0, 1.0, 1.0, 1.0]),
             )
-        table_builder.set_initial_pose(sapien.Pose(p=[0.0, 0.0, 0.82]))
+
+        leg_spacing = 0.1
+        leg_half_size = [self.TABLE_THICKNESS / 2, self.TABLE_THICKNESS / 2, self.TABLE_HEIGHT / 2 - 0.002]
+        leg_z = -self.TABLE_HEIGHT / 2 - 0.002
+        for i in (-1, 1):
+            for j in (-1, 1):
+                leg_pose = sapien.Pose(
+                    [
+                        i * (self.TABLE_LENGTH / 2 - leg_spacing / 2),
+                        j * (self.TABLE_WIDTH / 2 - leg_spacing / 2),
+                        leg_z,
+                    ]
+                )
+                table_builder.add_box_collision(pose=leg_pose, half_size=leg_half_size)
+                if self.scene.can_render():
+                    table_builder.add_box_visual(
+                        pose=leg_pose,
+                        half_size=leg_half_size,
+                        material=sapien.render.RenderMaterial(base_color=[1.0, 1.0, 1.0, 1.0]),
+                    )
+
+        table_builder.set_initial_pose(sapien.Pose(p=[0.0, 0.0, self.TABLE_HEIGHT]))
         self.workspace_table = table_builder.build_static(name="workspace_table")
         self.left_robot = self._load_robot(arm_index=0, name="left_embodiment")
         self.right_robot = self._load_robot(arm_index=1, name="right_embodiment")

@@ -16,6 +16,8 @@ TARGET_HALF_SIZE = torch.tensor([0.05, 0.05, 0.005])
 SUCCESS_XY_EPS = 0.03
 SUCCESS_Z_EPS = 0.01
 BLOCK_MIDDLE_POSE = [0.0, 0.1, 0.9, 0.0, 1.0, 0.0, 0.0]
+BOX_CENTER_Z = 0.842
+TARGET_CENTER_Z = 0.741
 
 
 @register_env("HandoverBlock-v1", max_episode_steps=100)
@@ -32,7 +34,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
                 half_size=BOX_HALF_SIZE.tolist(),
                 material=sapien.render.RenderMaterial(base_color=[1.0, 0.0, 0.0, 1.0]),
             )
-        box_builder.set_initial_pose(sapien.Pose(p=[-0.15, 0.1, 0.842]))
+        box_builder.set_initial_pose(sapien.Pose(p=[-0.15, 0.1, BOX_CENTER_Z]))
         self.box = box_builder.build(name="box")
 
         target_builder = self.scene.create_actor_builder()
@@ -42,7 +44,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
                 half_size=TARGET_HALF_SIZE.tolist(),
                 material=sapien.render.RenderMaterial(base_color=[0.0, 0.0, 1.0, 1.0]),
             )
-        target_builder.set_initial_pose(sapien.Pose(p=[0.18, 0.175, 0.845]))
+        target_builder.set_initial_pose(sapien.Pose(p=[0.18, 0.175, TARGET_CENTER_Z]))
         self.target_box = target_builder.build_kinematic(name="target_box")
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
@@ -53,14 +55,14 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             box_xyz = torch.zeros((b, 3), device=self.device)
             box_xyz[:, 0] = -0.25 + torch.rand((b,), device=self.device) * 0.20
             box_xyz[:, 1] = torch.rand((b,), device=self.device) * 0.25
-            box_xyz[:, 2] = 0.842
+            box_xyz[:, 2] = BOX_CENTER_Z
             box_q = random_quaternions(b, device=self.device, lock_x=True, lock_y=True)
             self.box.set_pose(Pose.create_from_pq(p=box_xyz, q=box_q))
 
             target_xyz = torch.zeros((b, 3), device=self.device)
             target_xyz[:, 0] = 0.10 + torch.rand((b,), device=self.device) * 0.15
             target_xyz[:, 1] = 0.15 + torch.rand((b,), device=self.device) * 0.05
-            target_xyz[:, 2] = 0.845
+            target_xyz[:, 2] = TARGET_CENTER_Z
             self.target_box.set_pose(Pose.create_from_pq(p=target_xyz))
 
     def evaluate(self):
