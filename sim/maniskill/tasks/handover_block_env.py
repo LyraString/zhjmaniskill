@@ -4,7 +4,6 @@ from typing import Any
 
 import sapien
 import torch
-from mani_skill.envs.utils.randomization.pose import random_quaternions
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.structs.pose import Pose
 
@@ -18,9 +17,25 @@ SUCCESS_Z_EPS = 0.01
 BLOCK_MIDDLE_POSE = [0.0, 0.1, 0.9, 0.0, 1.0, 0.0, 0.0]
 BOX_CENTER_Z = 0.842
 TARGET_CENTER_Z = 0.741
+BOX_BASE_QUAT = [0.981, 0.0, 0.0, 0.195]
+BOX_YAW_LIMIT = 0.2
 
 
-@register_env("HandoverBlock-v1", max_episode_steps=100)
+def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    w1, x1, y1, z1 = q1.unbind(dim=-1)
+    w2, x2, y2, z2 = q2.unbind(dim=-1)
+    return torch.stack(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        dim=-1,
+    )
+
+
+@register_env("HandoverBlock-v1", max_episode_steps=400)
 class HandoverBlockEnv(DualUR5WSGEnv):
     """Minimal ManiSkill port of RoboTwin handover_block scene and spatial success condition."""
 
@@ -56,7 +71,20 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             box_xyz[:, 0] = -0.25 + torch.rand((b,), device=self.device) * 0.20
             box_xyz[:, 1] = torch.rand((b,), device=self.device) * 0.25
             box_xyz[:, 2] = BOX_CENTER_Z
-            box_q = random_quaternions(b, device=self.device, lock_x=True, lock_y=True)
+            yaw = (torch.rand((b,), device=self.device) * 2.0 - 1.0) * BOX_YAW_LIMIT
+            yaw_half = yaw / 2.0
+            yaw_q = torch.stack(
+                [
+                    torch.cos(yaw_half),
+                    torch.zeros_like(yaw_half),
+                    torch.zeros_like(yaw_half),
+                    torch.sin(yaw_half),
+                ],
+                dim=-1,
+            )
+            base_q = torch.tensor(BOX_BASE_QUAT, device=self.device, dtype=box_xyz.dtype).repeat(b, 1)
+            box_q = _quat_multiply(base_q, yaw_q)
+            box_q = box_q / torch.linalg.norm(box_q, dim=-1, keepdim=True)
             self.box.set_pose(Pose.create_from_pq(p=box_xyz, q=box_q))
 
             target_xyz = torch.zeros((b, 3), device=self.device)

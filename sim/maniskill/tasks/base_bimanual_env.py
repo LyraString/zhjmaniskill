@@ -33,6 +33,11 @@ class BaseBimanualEnv(BaseEnv):
     TABLE_THICKNESS = 0.05
     WALL_HALF_SIZE = [3.0, 0.6, 1.5]
     WALL_POSE = [0.0, 1.0, 1.5]
+    HEAD_CAMERA_FOVY_DEG = 37.0
+    HEAD_CAMERA_WIDTH = 320
+    HEAD_CAMERA_HEIGHT = 240
+    HEAD_CAMERA_NEAR = 0.1
+    HEAD_CAMERA_FAR = 100.0
 
     def __init__(
         self,
@@ -62,8 +67,47 @@ class BaseBimanualEnv(BaseEnv):
 
     @property
     def _default_sensor_configs(self):
-        pose = sapien_utils.look_at(eye=[1.4, 0.0, 1.3], target=[0.0, -0.3, 0.8])
-        return [CameraConfig("base_camera", pose, 128, 128, np.pi / 2, 0.01, 100)]
+        static_camera_list = self.embodiment_spec.left_config.get("static_camera_list", [])
+        if len(static_camera_list) == 0:
+            pose = sapien_utils.look_at(eye=[-0.032, -0.45, 1.35], target=[0.0, -0.15, 0.95])
+            return [
+                CameraConfig(
+                    "head_camera",
+                    pose,
+                    self.HEAD_CAMERA_WIDTH,
+                    self.HEAD_CAMERA_HEIGHT,
+                    np.deg2rad(self.HEAD_CAMERA_FOVY_DEG),
+                    self.HEAD_CAMERA_NEAR,
+                    self.HEAD_CAMERA_FAR,
+                )
+            ]
+
+        camera_info = static_camera_list[0]
+        cam_pos = np.asarray(camera_info["position"], dtype=np.float32)
+        cam_forward = np.asarray(camera_info.get("forward", -cam_pos), dtype=np.float32)
+        cam_forward = cam_forward / np.linalg.norm(cam_forward)
+        cam_left = np.asarray(
+            camera_info.get("left", [-cam_forward[1], cam_forward[0], 0.0]),
+            dtype=np.float32,
+        )
+        cam_left = cam_left / np.linalg.norm(cam_left)
+        cam_up = np.cross(cam_forward, cam_left)
+        cam_up = cam_up / np.linalg.norm(cam_up)
+        transform = np.eye(4, dtype=np.float32)
+        transform[:3, :3] = np.stack([cam_forward, cam_left, cam_up], axis=1)
+        transform[:3, 3] = cam_pos
+        pose = sapien.Pose(transform)
+        return [
+            CameraConfig(
+                camera_info.get("name", "head_camera"),
+                pose,
+                self.HEAD_CAMERA_WIDTH,
+                self.HEAD_CAMERA_HEIGHT,
+                np.deg2rad(self.HEAD_CAMERA_FOVY_DEG),
+                self.HEAD_CAMERA_NEAR,
+                self.HEAD_CAMERA_FAR,
+            )
+        ]
 
     @property
     def _default_human_render_camera_configs(self):
