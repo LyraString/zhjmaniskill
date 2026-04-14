@@ -14,6 +14,7 @@ import torch
 from omegaconf import OmegaConf
 import pathlib
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import copy
 
 import tqdm, random
@@ -161,163 +162,190 @@ class RobotWorkspace(BaseWorkspace):
 
         # training loop
         log_path = os.path.join(self.output_dir, "logs.json.txt")
+        tb_enabled = bool(getattr(cfg.logging, "tensorboard", {}).get("enabled", True))
+        tb_log_every = int(getattr(cfg.logging, "tensorboard", {}).get("log_every", 1))
+        tb_flush_secs = int(getattr(cfg.logging, "tensorboard", {}).get("flush_secs", 10))
+        tb_dir = os.path.join(self.output_dir, "tensorboard")
+        tb_writer = SummaryWriter(log_dir=tb_dir, flush_secs=tb_flush_secs) if tb_enabled else None
 
-        with JsonLogger(log_path) as json_logger:
-            for local_epoch_idx in range(cfg.training.num_epochs):
-                step_log = dict()
-                # ========= train for this epoch ==========
-                if cfg.training.freeze_encoder:
-                    self.model.obs_encoder.eval()
-                    self.model.obs_encoder.requires_grad_(False)
+        try:
+            with JsonLogger(log_path) as json_logger:
+                for local_epoch_idx in range(cfg.training.num_epochs):
+                    step_log = dict()
+                    # ========= train for this epoch ==========
+                    if cfg.training.freeze_encoder:
+                        self.model.obs_encoder.eval()
+                        self.model.obs_encoder.requires_grad_(False)
 
-                train_losses = list()
-                with tqdm.tqdm(
-                        train_dataloader,
-                        desc=f"Training epoch {self.epoch}",
-                        leave=False,
-                        mininterval=cfg.training.tqdm_interval_sec,
-                ) as tepoch:
-                    for batch_idx, batch in enumerate(tepoch):
-                        batch = dataset.postprocess(batch, device)
-                        if train_sampling_batch is None:
-                            train_sampling_batch = batch
+                    train_losses = list()
+                    with tqdm.tqdm(
+                            train_dataloader,
+                            desc=f"Training epoch {self.epoch}",
+                            leave=False,
+                            mininterval=cfg.training.tqdm_interval_sec,
+                    ) as tepoch:
+                        for batch_idx, batch in enumerate(tepoch):
+                            batch = dataset.postprocess(batch, device)
+                            if train_sampling_batch is None:
+                                train_sampling_batch = batch
 
-                        # one-time FPO checks on the first train batch
-                        if (not fpo_checks_done) and hasattr(self.model, "run_fpo_forward_smoke_test") and hasattr(self.model, "run_fpo_reproducibility_check"):
-                            smoke_info = self.model.run_fpo_forward_smoke_test(
-                                batch=batch,
-                                num_fpo_samples=4,
-                                batch_size=min(2, batch["action"].shape[0]),
+                            # one-time FPO checks on the first train batch
+                            if (not fpo_checks_done) and hasattr(self.model, "run_fpo_forward_smoke_test") and hasattr(self.model, "run_fpo_reproducibility_check"):
+                                smoke_info = self.model.run_fpo_forward_smoke_test(
+                                    batch=batch,
+                                    num_fpo_samples=4,
+                                    batch_size=min(2, batch["action"].shape[0]),
+                                )
+                                repro_info = self.model.run_fpo_reproducibility_check(
+                                    batch=batch,
+                                    num_fpo_samples=4,
+                                    seed=seed,
+                                    batch_size=min(2, batch["action"].shape[0]),
+                                    atol=0.0,
+                                    rtol=0.0,
+                                )
+                                print(f"[FPO CHECK] smoke test passed: {smoke_info}")
+                                print(f"[FPO CHECK] reproducibility passed: {repro_info}")
+                                fpo_smoke_status = smoke_info.get("status", "unknown")
+                                fpo_repro_status = repro_info.get("status", "unknown")
+                                fpo_smoke_cfm_loss_mean = smoke_info.get("cfm_loss_mean", None)
+                                fpo_checks_done = True
+
+                            # compute loss
+                            raw_loss = self.model.compute_loss(batch)
+                            loss = raw_loss / cfg.training.gradient_accumulate_every
+                            loss.backward()
+
+                            # step optimizer
+                            if (self.global_step % cfg.training.gradient_accumulate_every == 0):
+                                self.optimizer.step()
+                                self.optimizer.zero_grad()
+                                lr_scheduler.step()
+
+                            # update ema
+                            if cfg.training.use_ema:
+                                ema.step(self.model)
+
+                            # logging
+                            raw_loss_cpu = raw_loss.item()
+                            tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
+                            train_losses.append(raw_loss_cpu)
+                            step_log = {
+                                "train_loss": raw_loss_cpu,
+                                "global_step": self.global_step,
+                                "epoch": self.epoch,
+                                "lr": lr_scheduler.get_last_lr()[0],
+                            }
+                            if fpo_smoke_status is not None:
+                                step_log["fpo_smoke_status"] = fpo_smoke_status
+                            if fpo_repro_status is not None:
+                                step_log["fpo_repro_status"] = fpo_repro_status
+                            if fpo_smoke_cfm_loss_mean is not None:
+                                step_log["fpo_smoke_cfm_loss_mean"] = fpo_smoke_cfm_loss_mean
+
+                            if (tb_writer is not None) and (((self.global_step + 1) % max(1, tb_log_every)) == 0):
+                                tb_step = int(self.global_step)
+                                tb_writer.add_scalar("train/train_loss_step", raw_loss_cpu, tb_step)
+                                tb_writer.add_scalar("train/lr", float(step_log["lr"]), tb_step)
+
+                            is_last_batch = batch_idx == (len(train_dataloader) - 1)
+                            if not is_last_batch:
+                                # log of last step is combined with validation and rollout
+                                json_logger.log(step_log)
+                                self.global_step += 1
+
+                            if (cfg.training.max_train_steps
+                                    is not None) and batch_idx >= (cfg.training.max_train_steps - 1):
+                                break
+
+                    # at the end of each epoch
+                    # replace train_loss with epoch average
+                    train_loss = np.mean(train_losses)
+                    step_log["train_loss"] = train_loss
+
+                    # ========= eval for this epoch ==========
+                    policy = self.model
+                    if cfg.training.use_ema:
+                        policy = self.ema_model
+                    policy.eval()
+
+                    # run rollout
+                    # if (self.epoch % cfg.training.rollout_every) == 0:
+                    #     runner_log = env_runner.run(policy)
+                    #     # log all
+                    #     step_log.update(runner_log)
+
+                    # run validation
+                    if (self.epoch % cfg.training.val_every) == 0:
+                        with torch.no_grad():
+                            val_losses = list()
+                            with tqdm.tqdm(
+                                    val_dataloader,
+                                    desc=f"Validation epoch {self.epoch}",
+                                    leave=False,
+                                    mininterval=cfg.training.tqdm_interval_sec,
+                            ) as tepoch:
+                                for batch_idx, batch in enumerate(tepoch):
+                                    batch = dataset.postprocess(batch, device)
+                                    loss = self.model.compute_loss(batch)
+                                    val_losses.append(loss)
+                                    if (cfg.training.max_val_steps
+                                            is not None) and batch_idx >= (cfg.training.max_val_steps - 1):
+                                        break
+                            if len(val_losses) > 0:
+                                val_loss = torch.mean(torch.tensor(val_losses)).item()
+                                # log epoch average validation loss
+                                step_log["val_loss"] = val_loss
+
+                    # run diffusion sampling on a training batch
+                    if (self.epoch % cfg.training.sample_every) == 0:
+                        with torch.no_grad():
+                            # sample trajectory from training set, and evaluate difference
+                            batch = train_sampling_batch
+                            obs_dict = batch["obs"]
+                            gt_action = batch["action"]
+
+                            result = policy.predict_action(obs_dict)
+                            pred_action = result["action_pred"]
+                            mse = torch.nn.functional.mse_loss(pred_action, gt_action)
+                            step_log["train_action_mse_error"] = mse.item()
+                            del batch
+                            del obs_dict
+                            del gt_action
+                            del result
+                            del pred_action
+                            del mse
+
+                    # checkpoint
+                    if ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
+                        # checkpointing
+                        save_name = pathlib.Path(self.cfg.task.dataset.zarr_path).stem
+                        self.save_checkpoint(f"checkpoints/{save_name}-{seed}/{self.epoch + 1}.ckpt")  # TODO
+
+                    if tb_writer is not None:
+                        tb_epoch = int(self.epoch)
+                        tb_writer.add_scalar("epoch/train_loss", float(step_log["train_loss"]), tb_epoch)
+                        if "val_loss" in step_log:
+                            tb_writer.add_scalar("epoch/val_loss", float(step_log["val_loss"]), tb_epoch)
+                        if "train_action_mse_error" in step_log:
+                            tb_writer.add_scalar(
+                                "epoch/train_action_mse_error",
+                                float(step_log["train_action_mse_error"]),
+                                tb_epoch,
                             )
-                            repro_info = self.model.run_fpo_reproducibility_check(
-                                batch=batch,
-                                num_fpo_samples=4,
-                                seed=seed,
-                                batch_size=min(2, batch["action"].shape[0]),
-                                atol=0.0,
-                                rtol=0.0,
-                            )
-                            print(f"[FPO CHECK] smoke test passed: {smoke_info}")
-                            print(f"[FPO CHECK] reproducibility passed: {repro_info}")
-                            fpo_smoke_status = smoke_info.get("status", "unknown")
-                            fpo_repro_status = repro_info.get("status", "unknown")
-                            fpo_smoke_cfm_loss_mean = smoke_info.get("cfm_loss_mean", None)
-                            fpo_checks_done = True
 
-                        # compute loss
-                        raw_loss = self.model.compute_loss(batch)
-                        loss = raw_loss / cfg.training.gradient_accumulate_every
-                        loss.backward()
+                    # ========= eval end for this epoch ==========
+                    policy.train()
 
-                        # step optimizer
-                        if (self.global_step % cfg.training.gradient_accumulate_every == 0):
-                            self.optimizer.step()
-                            self.optimizer.zero_grad()
-                            lr_scheduler.step()
-
-                        # update ema
-                        if cfg.training.use_ema:
-                            ema.step(self.model)
-
-                        # logging
-                        raw_loss_cpu = raw_loss.item()
-                        tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
-                        train_losses.append(raw_loss_cpu)
-                        step_log = {
-                            "train_loss": raw_loss_cpu,
-                            "global_step": self.global_step,
-                            "epoch": self.epoch,
-                            "lr": lr_scheduler.get_last_lr()[0],
-                        }
-                        if fpo_smoke_status is not None:
-                            step_log["fpo_smoke_status"] = fpo_smoke_status
-                        if fpo_repro_status is not None:
-                            step_log["fpo_repro_status"] = fpo_repro_status
-                        if fpo_smoke_cfm_loss_mean is not None:
-                            step_log["fpo_smoke_cfm_loss_mean"] = fpo_smoke_cfm_loss_mean
-
-                        is_last_batch = batch_idx == (len(train_dataloader) - 1)
-                        if not is_last_batch:
-                            # log of last step is combined with validation and rollout
-                            json_logger.log(step_log)
-                            self.global_step += 1
-
-                        if (cfg.training.max_train_steps
-                                is not None) and batch_idx >= (cfg.training.max_train_steps - 1):
-                            break
-
-                # at the end of each epoch
-                # replace train_loss with epoch average
-                train_loss = np.mean(train_losses)
-                step_log["train_loss"] = train_loss
-
-                # ========= eval for this epoch ==========
-                policy = self.model
-                if cfg.training.use_ema:
-                    policy = self.ema_model
-                policy.eval()
-
-                # run rollout
-                # if (self.epoch % cfg.training.rollout_every) == 0:
-                #     runner_log = env_runner.run(policy)
-                #     # log all
-                #     step_log.update(runner_log)
-
-                # run validation
-                if (self.epoch % cfg.training.val_every) == 0:
-                    with torch.no_grad():
-                        val_losses = list()
-                        with tqdm.tqdm(
-                                val_dataloader,
-                                desc=f"Validation epoch {self.epoch}",
-                                leave=False,
-                                mininterval=cfg.training.tqdm_interval_sec,
-                        ) as tepoch:
-                            for batch_idx, batch in enumerate(tepoch):
-                                batch = dataset.postprocess(batch, device)
-                                loss = self.model.compute_loss(batch)
-                                val_losses.append(loss)
-                                if (cfg.training.max_val_steps
-                                        is not None) and batch_idx >= (cfg.training.max_val_steps - 1):
-                                    break
-                        if len(val_losses) > 0:
-                            val_loss = torch.mean(torch.tensor(val_losses)).item()
-                            # log epoch average validation loss
-                            step_log["val_loss"] = val_loss
-
-                # run diffusion sampling on a training batch
-                if (self.epoch % cfg.training.sample_every) == 0:
-                    with torch.no_grad():
-                        # sample trajectory from training set, and evaluate difference
-                        batch = train_sampling_batch
-                        obs_dict = batch["obs"]
-                        gt_action = batch["action"]
-
-                        result = policy.predict_action(obs_dict)
-                        pred_action = result["action_pred"]
-                        mse = torch.nn.functional.mse_loss(pred_action, gt_action)
-                        step_log["train_action_mse_error"] = mse.item()
-                        del batch
-                        del obs_dict
-                        del gt_action
-                        del result
-                        del pred_action
-                        del mse
-
-                # checkpoint
-                if ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
-                    # checkpointing
-                    save_name = pathlib.Path(self.cfg.task.dataset.zarr_path).stem
-                    self.save_checkpoint(f"checkpoints/{save_name}-{seed}/{self.epoch + 1}.ckpt")  # TODO
-
-                # ========= eval end for this epoch ==========
-                policy.train()
-
-                # end of epoch
-                # log of last step is combined with validation and rollout
-                json_logger.log(step_log)
-                self.global_step += 1
-                self.epoch += 1
+                    # end of epoch
+                    # log of last step is combined with validation and rollout
+                    json_logger.log(step_log)
+                    self.global_step += 1
+                    self.epoch += 1
+        finally:
+            if tb_writer is not None:
+                tb_writer.flush()
+                tb_writer.close()
 
 
 class BatchSampler:

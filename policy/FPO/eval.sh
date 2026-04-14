@@ -12,6 +12,39 @@ max_episode_steps=50
 positional=()
 extra_eval_args=()
 
+has_extra_eval_arg() {
+    local target="$1"
+    local arg
+    for arg in "${extra_eval_args[@]}"; do
+        if [[ "${arg}" == "${target}" ]] || [[ "${arg}" == "${target}"=* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+read_maniskill_eval_video_config() {
+    local config_yaml="${SCRIPT_DIR}/diffusion_policy/config/maniskill_eval.yaml"
+    python - "$config_yaml" <<'PY'
+import sys
+import yaml
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(1)
+
+cfg = yaml.safe_load(path.read_text()) or {}
+video = (((cfg.get("eval") or {}).get("video")) or {})
+enabled = bool(video.get("enabled", False))
+fps = int(video.get("fps", 10))
+save_dir = str(video.get("save_dir", "eval_videos"))
+print("1" if enabled else "0")
+print(fps)
+print(save_dir)
+PY
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --)
@@ -123,6 +156,21 @@ if [ "${backend}" = "maniskill" ]; then
 
     if [ -n "${task_profile}" ]; then
         cmd+=(--task-profile "${task_profile}")
+    fi
+
+    if ! has_extra_eval_arg "--save-video-dir"; then
+        mapfile -t eval_video_cfg < <(read_maniskill_eval_video_config)
+        if [ ${#eval_video_cfg[@]} -eq 3 ] && [ "${eval_video_cfg[0]}" = "1" ]; then
+            video_root="${ROOT_DIR}/${eval_video_cfg[2]}"
+            task_label="${task_profile:-${runtime_task_name}}"
+            ckpt_parent="$(basename "$(dirname "${ckpt_path}")")"
+            ckpt_stem="$(basename "${ckpt_path}" .ckpt)"
+            save_video_dir="${video_root}/fpo/${task_label}/${ckpt_parent}-${ckpt_stem}"
+            cmd+=(--save-video-dir "${save_video_dir}")
+            if ! has_extra_eval_arg "--video-fps"; then
+                cmd+=(--video-fps "${eval_video_cfg[1]}")
+            fi
+        fi
     fi
 
     cmd+=("${extra_eval_args[@]}")

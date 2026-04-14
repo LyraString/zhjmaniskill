@@ -35,7 +35,7 @@ def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
     )
 
 
-@register_env("HandoverBlock-v1", max_episode_steps=400)
+@register_env("HandoverBlock-v1", max_episode_steps=800)
 class HandoverBlockEnv(DualUR5WSGEnv):
     """Minimal ManiSkill port of RoboTwin handover_block scene and spatial success condition."""
 

@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import dill
+import imageio.v2 as imageio
 import numpy as np
 import torch
 
@@ -50,7 +51,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robot-uids", type=str, default=None)
     parser.add_argument("--sim-freq", type=int, default=None)
     parser.add_argument("--control-freq", type=int, default=None)
+    parser.add_argument("--save-video-dir", type=str, default=None)
+    parser.add_argument("--video-fps", type=int, default=10)
     return parser
+
+
+def _maybe_capture_frame(env_backend, frames: list[np.ndarray]) -> None:
+    frame = env_backend.env.render()
+    if frame is None:
+        return
+    if hasattr(frame, "detach") and hasattr(frame, "cpu"):
+        frame = frame.detach().cpu()
+    frame = np.asarray(frame)
+    # Raw ManiSkill rgb_array render returns a batched image of shape
+    # (num_envs, H, W, C) even when num_envs == 1.
+    if frame.ndim == 4 and frame.shape[0] >= 1:
+        frame = frame[0]
+    if frame.ndim != 3:
+        return
+    if frame.dtype != np.uint8:
+        frame = np.clip(frame, 0, 255).astype(np.uint8)
+    frames.append(frame)
 
 
 def run_evaluation(args) -> None:
@@ -83,12 +104,18 @@ def run_evaluation(args) -> None:
         control_mode=runtime_kwargs["control_mode"],
     )
     runtime_kwargs["control_mode"] = resolved_control_mode
+    if args.save_video_dir is not None and runtime_kwargs["render_mode"] in (None, ""):
+        runtime_kwargs["render_mode"] = "rgb_array"
     _, resolved_runtime, _profile_name = apply_task_profile(runtime_task_name, runtime_kwargs)
 
     env = ManiSkillTaskFactory().create_env(
         task_name=runtime_task_name,
         **resolved_runtime,
     )
+
+    video_dir = Path(args.save_video_dir) if args.save_video_dir is not None else None
+    if video_dir is not None:
+        video_dir.mkdir(parents=True, exist_ok=True)
 
     returns = []
     lengths = []
@@ -116,6 +143,10 @@ def run_evaluation(args) -> None:
             episode_return = 0.0
             episode_length = 0
             success = False
+            frames = []
+            if video_dir is not None:
+                _maybe_capture_frame(env, frames)
+            result = None
 
             while episode_length < args.max_episode_steps:
                 if len(model.obs_cache) == 0:
@@ -130,16 +161,28 @@ def run_evaluation(args) -> None:
                     episode_length += 1
                     encoded_obs = adapter.encode_obs(dict(result.observation.data))
                     model.update_obs(encoded_obs)
-                    success = _to_bool_scalar(result.info.get("success", False))
+                    if video_dir is not None:
+                        _maybe_capture_frame(env, frames)
+                    if _to_bool_scalar(result.info.get("success", False)):
+                        success = True
+                        break
                     if result.terminated or result.truncated or episode_length >= args.max_episode_steps:
                         break
 
-                if result.terminated or result.truncated or episode_length >= args.max_episode_steps:
+                if success or result.terminated or result.truncated or episode_length >= args.max_episode_steps:
                     break
 
             returns.append(episode_return)
             lengths.append(episode_length)
             successes.append(float(success))
+            if video_dir is not None and len(frames) > 0:
+                episode_dir = video_dir
+                episode_dir.mkdir(parents=True, exist_ok=True)
+                imageio.mimsave(
+                    episode_dir / f"episode{episode_idx}.mp4",
+                    frames,
+                    fps=int(args.video_fps),
+                )
             print(
                 f"episode={episode_idx} return={episode_return:.4f} "
                 f"length={episode_length} success={int(success)}"

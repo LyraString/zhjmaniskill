@@ -1,0 +1,8 @@
+defaults:
+  - _self_
+
+eval:
+  video:
+    enabled: true
+    fps: 10
+    save_dir: eval_videos
