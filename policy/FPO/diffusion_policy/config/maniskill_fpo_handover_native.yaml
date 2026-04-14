@@ -8,9 +8,9 @@ exp_name: handover_block_native
 
 training:
   online_iters: 200
-  timesteps_per_batch: 256
+  timesteps_per_batch: 200
   max_timesteps_per_episode: 100
-  n_updates_per_iteration: 4
-  num_minibatches: 4
+  n_updates_per_iteration: 2
+  num_minibatches: 2
   num_envs: 2
-  checkpoint_every: 20
+  checkpoint_every: 10

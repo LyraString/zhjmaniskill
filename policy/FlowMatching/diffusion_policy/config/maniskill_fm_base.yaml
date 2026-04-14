@@ -73,6 +73,8 @@ training:
   debug: False
   resume: False
   resume_ckpt_path: null
+  sim_backend: null
+  render_backend: null
   lr_scheduler: cosine
   lr_warmup_steps: 500
   num_epochs: 1

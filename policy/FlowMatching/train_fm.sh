@@ -31,6 +31,30 @@ get_task_group_override() {
     return 1
 }
 
+resolve_config_default_task_group() {
+    local fm_config_name="$1"
+    local config_yaml="${SCRIPT_DIR}/diffusion_policy/config/${fm_config_name}.yaml"
+    local task_group=
+
+    if [ ! -f "${config_yaml}" ]; then
+        return 1
+    fi
+
+    task_group=$(
+        awk '
+            $1 == "-" && $2 == "task:" { print $3; exit }
+        ' "${config_yaml}"
+    )
+
+    if [ -z "${task_group}" ]; then
+        return 1
+    fi
+
+    task_group="${task_group%\"}"
+    task_group="${task_group#\"}"
+    echo "${task_group}"
+}
+
 resolve_task_group_zarr_path() {
     local task_group="$1"
     local task_yaml="${SCRIPT_DIR}/diffusion_policy/config/task/${task_group}.yaml"
@@ -207,11 +231,21 @@ task_group_override=
 if task_group_override="$(get_task_group_override)"; then
     :
 fi
+config_task_group=
+if [ -z "${task_group_override}" ]; then
+    if config_task_group="$(resolve_config_default_task_group "${config_name}")"; then
+        :
+    fi
+fi
+effective_task_group="${task_group_override}"
+if [ -z "${effective_task_group}" ] && [ -n "${config_task_group}" ]; then
+    effective_task_group="${config_task_group}"
+fi
 
 exp_task_label=${task_name}
 if [ -z "${exp_task_label}" ]; then
-    if [ -n "${task_group_override}" ]; then
-        exp_task_label=${task_group_override}
+    if [ -n "${effective_task_group}" ]; then
+        exp_task_label=${effective_task_group}
     elif [ -n "${task_profile}" ]; then
         exp_task_label=${task_profile}
     else
@@ -248,13 +282,13 @@ fi
 inject_task_name=true
 inject_dataset_zarr_path=true
 resolved_dataset_zarr_path="${zarr_path}"
-if [ -n "${task_group_override}" ]; then
+if [ -n "${effective_task_group}" ]; then
     inject_task_name=false
 
     if has_override_prefix "task.dataset.zarr_path=" || has_override_prefix "+task.dataset.zarr_path="; then
         inject_dataset_zarr_path=false
     else
-        resolved_task_zarr_path="$(resolve_task_group_zarr_path "${task_group_override}")"
+        resolved_task_zarr_path="$(resolve_task_group_zarr_path "${effective_task_group}")"
         if [ -n "${resolved_task_zarr_path}" ]; then
             resolved_dataset_zarr_path="${resolved_task_zarr_path}"
         else
@@ -264,7 +298,19 @@ if [ -n "${task_group_override}" ]; then
 else
     if [ "${short_maniskill_syntax}" = true ]; then
         inject_task_name=false
-        inject_dataset_zarr_path=false
+        if has_override_prefix "task.dataset.zarr_path=" || has_override_prefix "+task.dataset.zarr_path="; then
+            inject_dataset_zarr_path=false
+        elif [ -n "${effective_task_group}" ]; then
+            resolved_task_zarr_path="$(resolve_task_group_zarr_path "${effective_task_group}")"
+            if [ -n "${resolved_task_zarr_path}" ]; then
+                resolved_dataset_zarr_path="${resolved_task_zarr_path}"
+                inject_dataset_zarr_path=true
+            else
+                inject_dataset_zarr_path=false
+            fi
+        else
+            inject_dataset_zarr_path=false
+        fi
     fi
     if has_override_prefix "task.name=" || has_override_prefix "+task.name="; then
         inject_task_name=false
@@ -274,7 +320,7 @@ else
     fi
 fi
 
-if [ "${short_maniskill_syntax}" = true ] && [ -n "${task_profile}" ] && [ -z "${task_group_override}" ] && [ "${inject_dataset_zarr_path}" = false ]; then
+if [ "${short_maniskill_syntax}" = true ] && [ -n "${task_profile}" ] && [ -z "${effective_task_group}" ] && [ "${inject_dataset_zarr_path}" = false ]; then
     hydra_task_name=${task_profile}
     inject_task_name=true
     if ! has_override_prefix "task.dataset.zarr_path=" && ! has_override_prefix "+task.dataset.zarr_path="; then
