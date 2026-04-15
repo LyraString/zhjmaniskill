@@ -228,6 +228,89 @@ class BaseBimanualEnv(BaseEnv):
         else:
             self.right_gripper_val = state
 
+    def get_arm_robot(self, arm_index: int):
+        return self.left_robot if arm_index == 0 else self.right_robot
+
+    def get_arm_joint_names(self, arm_index: int) -> list[str]:
+        return list(self.embodiment_spec.arm_joint_names(arm_index))
+
+    def get_arm_link_names(self, arm_index: int) -> list[str]:
+        robot = self.get_arm_robot(arm_index)
+        names: list[str] = []
+        for link in robot.get_links():
+            if hasattr(link, "get_name"):
+                names.append(link.get_name())
+            else:
+                names.append(str(link.name))
+        return names
+
+    def get_arm_joint_positions(self, arm_index: int) -> np.ndarray:
+        joints = self.left_arm_joints if arm_index == 0 else self.right_arm_joints
+        return np.asarray([float(joint.qpos.reshape(-1)[0].item()) for joint in joints], dtype=np.float64)
+
+    def get_arm_full_joint_positions(self, arm_index: int) -> np.ndarray:
+        robot = self.get_arm_robot(arm_index)
+        qpos = robot.get_qpos()
+        if hasattr(qpos, "detach") and hasattr(qpos, "cpu") and hasattr(qpos, "numpy"):
+            qpos = qpos.detach().cpu().numpy()
+        return np.asarray(qpos, dtype=np.float64).reshape(-1)
+
+    def get_arm_home_joint_positions(self, arm_index: int) -> np.ndarray:
+        return np.asarray(self.embodiment_spec.homestate(arm_index), dtype=np.float64)
+
+    def _to_numpy_array(self, value, final_shape: tuple[int, ...]) -> np.ndarray:
+        if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "numpy"):
+            value = value.detach().cpu().numpy()
+        return np.asarray(value, dtype=np.float64).reshape(final_shape)
+
+    def get_arm_root_pose_array(self, arm_index: int) -> np.ndarray:
+        root_pose = self.get_arm_robot(arm_index).get_root_pose()
+        return np.concatenate(
+            [
+                self._to_numpy_array(root_pose.p, (-1, 3))[0],
+                self._to_numpy_array(root_pose.q, (-1, 4))[0],
+            ],
+            axis=0,
+        ).astype(np.float64, copy=False)
+
+    def get_arm_move_group(self, arm_index: int) -> str:
+        config = self.embodiment_spec.left_config if arm_index == 0 else self.embodiment_spec.right_config
+        move_group = config.get("move_group", "ee_link")
+        if isinstance(move_group, (list, tuple)):
+            return str(move_group[min(arm_index, len(move_group) - 1)])
+        return str(move_group)
+
+    def get_arm_end_effector_link(self, arm_index: int):
+        move_group = self.get_arm_move_group(arm_index)
+        for link in self.get_arm_robot(arm_index).get_links():
+            link_name = link.get_name() if hasattr(link, "get_name") else str(link.name)
+            if link_name == move_group:
+                return link
+        raise KeyError(f"Could not find end-effector link `{move_group}` for arm {arm_index}.")
+
+    def get_arm_end_effector_pose_array(self, arm_index: int) -> np.ndarray:
+        ee_link = self.get_arm_end_effector_link(arm_index)
+        return np.concatenate(
+            [
+                self._to_numpy_array(ee_link.pose.p, (-1, 3))[0],
+                self._to_numpy_array(ee_link.pose.q, (-1, 4))[0],
+            ],
+            axis=0,
+        ).astype(np.float64, copy=False)
+
+    def get_arm_planner_assets(self, arm_index: int) -> dict[str, str]:
+        config = self.embodiment_spec.left_config if arm_index == 0 else self.embodiment_spec.right_config
+        robot_dir = self.embodiment_spec.left_robot_dir if arm_index == 0 else self.embodiment_spec.right_robot_dir
+        urdf_path = (robot_dir / config["urdf_path"]).resolve()
+        srdf_rel_path = config.get("srdf_path")
+        srdf_path = (robot_dir / srdf_rel_path).resolve() if srdf_rel_path else urdf_path.with_suffix(".srdf")
+        return {
+            "urdf_path": str(urdf_path),
+            "srdf_path": str(srdf_path),
+            "package_dir": str(robot_dir.resolve()),
+            "move_group": self.get_arm_move_group(arm_index),
+        }
+
     def _get_gripper_open_mask(self, arm_index: int) -> torch.Tensor:
         return self._get_gripper_state_tensor(arm_index).squeeze(-1) > self.GRIPPER_OPEN_THRESHOLD
 

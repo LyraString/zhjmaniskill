@@ -252,6 +252,10 @@ if __name__ == "__main__":
     parser.add_argument("--robot-uids", type=str, default=None)
     parser.add_argument("--sim-freq", type=int, default=None)
     parser.add_argument("--control-freq", type=int, default=None)
+    parser.add_argument("--collector", choices=("random", "legacy_replay"), default="random")
+    parser.add_argument("--teacher-zarr-path", type=str, default=None)
+    parser.add_argument("--teacher-seed-path", type=str, default=None)
+    parser.add_argument("--save-only-success", action="store_true")
     args = parser.parse_args()
 
     if args.backend == "maniskill":

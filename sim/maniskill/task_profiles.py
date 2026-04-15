@@ -73,6 +73,10 @@ MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
         "dataset": {
             "zarr_path": "data/HandoverBlock-v1-smoke_npz-1.zarr",
         },
+        "teacher_dataset": {
+            "zarr_path": "policy/FlowMatching/data/handover_block-demo_clean-50.zarr",
+            "seed_path": "data/handover_block/demo_clean/seed.txt",
+        },
     },
 }
 

@@ -52,9 +52,13 @@ while [[ $# -gt 0 ]]; do
             extra_args+=("$1" "$2")
             shift 2
             ;;
-        --episode-num|--seed|--max-episode-steps|--action-type|--obs-mode|--control-mode|--render-mode|--sim-backend|--render-backend|--reward-mode|--robot-uids|--sim-freq|--control-freq)
+        --episode-num|--seed|--max-episode-steps|--action-type|--obs-mode|--control-mode|--render-mode|--sim-backend|--render-backend|--reward-mode|--robot-uids|--sim-freq|--control-freq|--collector|--teacher-zarr-path|--teacher-seed-path)
             extra_args+=("$1" "$2")
             shift 2
+            ;;
+        --save-only-success)
+            extra_args+=("$1")
+            shift
             ;;
         --*)
             extra_args+=("$1")

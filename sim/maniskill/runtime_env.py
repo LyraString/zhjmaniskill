@@ -124,5 +124,8 @@ class ManiSkillEnvBackend:
             info=info,
         )
 
+    def render(self):
+        return self.env.render()
+
     def close(self) -> None:
         self.env.close()

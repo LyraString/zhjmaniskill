@@ -1,0 +1,364 @@
+from __future__ import annotations
+
+import numpy as np
+
+from sim.maniskill.expert.primitives import (
+    EpisodeLimitReached,
+    FixedRateMotionPrimitives,
+    matrix_to_pose,
+    pose_to_matrix,
+    scaled_local_matrix,
+    to_numpy,
+)
+from sim.maniskill.tasks.handover_block_env import BLOCK_MIDDLE_POSE, BOX_HALF_SIZE, TARGET_HALF_SIZE
+
+
+CONTACT_POSE_TO_GRASP_FRAME = np.array(
+    [[0.0, 0.0, 1.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+    dtype=np.float64,
+)
+LONG_BOX_CONTACT_MATRICES = np.asarray(
+    [
+        [[0.0, 0.0, 1.0, 0.0], [0.0, -1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.7], [0.0, 0.0, 0.0, 1.0]],
+        [[0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [1.0, 0.0, 0.0, 0.7], [0.0, 0.0, 0.0, 1.0]],
+        [[0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [1.0, 0.0, 0.0, 0.7], [0.0, 0.0, 0.0, 1.0]],
+        [[0.0, 0.0, -1.0, 0.0], [0.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.7], [0.0, 0.0, 0.0, 1.0]],
+        [[0.0, 0.0, 1.0, 0.0], [0.0, -1.0, 0.0, 0.0], [1.0, 0.0, 0.0, -0.7], [0.0, 0.0, 0.0, 1.0]],
+        [[0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [1.0, 0.0, 0.0, -0.7], [0.0, 0.0, 0.0, 1.0]],
+        [[0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [1.0, 0.0, 0.0, -0.7], [0.0, 0.0, 0.0, 1.0]],
+        [[0.0, 0.0, -1.0, 0.0], [0.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, -0.7], [0.0, 0.0, 0.0, 1.0]],
+    ],
+    dtype=np.float64,
+)
+BOX_FUNCTIONAL_MATRICES = np.asarray(
+    [
+        [[1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -1.0, -1.0], [0.0, 0.0, 0.0, 1.0]],
+        [[1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 1.0], [0.0, 0.0, 0.0, 1.0]],
+    ],
+    dtype=np.float64,
+)
+PREFERRED_GRASP_QUATS = {
+    0: np.asarray([-0.853532, 0.146484, -0.353542, -0.3536], dtype=np.float64),
+    1: np.asarray([-0.353518, 0.353564, -0.14642, -0.853568], dtype=np.float64),
+}
+LEFT_GRASP_CONTACT_IDS = (0, 1, 4, 5, 2, 3, 6, 7)
+RIGHT_GRASP_CONTACT_IDS = (4, 5, 0, 1, 6, 7, 2, 3)
+
+
+class HandoverBlockSolver:
+    PRE_GRASP_DISTANCE = 0.09
+    HANDOVER_PRE_GRASP_DISTANCE = 0.08
+    GRASP_DISTANCE = 0.0
+    ROTATE_NUM = 10
+    LEFT_ROTATE_LIM = (-0.6, 0.6)
+    RIGHT_ROTATE_LIM = (-0.6, 0.6)
+    LEFT_LIFT_DISTANCE = 0.10
+    LEFT_RELEASE_LIFT_DISTANCE = 0.12
+    ABOVE_TARGET_OFFSET = np.asarray([0.05, -0.12, 0.20], dtype=np.float64)
+    HANDOVER_APPROACH_OFFSET = np.asarray([0.0, -0.07, 0.10], dtype=np.float64)
+
+    def __init__(self, env_backend):
+        self.backend = env_backend
+        self.base_env = env_backend.env.unwrapped
+        self.ctrl = FixedRateMotionPrimitives(env_backend)
+        self.box_half_size = to_numpy(BOX_HALF_SIZE).reshape(3)
+        self.target_half_size = to_numpy(TARGET_HALF_SIZE).reshape(3)
+        self.last_debug_info: dict[str, object] = {}
+
+    @property
+    def last_status(self) -> str:
+        return self.ctrl.last_status
+
+    def _box_pose(self) -> np.ndarray:
+        return np.concatenate(
+            [
+                to_numpy(self.base_env.box.pose.p).reshape(-1, 3)[0],
+                to_numpy(self.base_env.box.pose.q).reshape(-1, 4)[0],
+            ],
+            axis=0,
+        ).astype(np.float64, copy=False)
+
+    def _target_pose(self) -> np.ndarray:
+        return np.concatenate(
+            [
+                to_numpy(self.base_env.target_box.pose.p).reshape(-1, 3)[0],
+                to_numpy(self.base_env.target_box.pose.q).reshape(-1, 4)[0],
+            ],
+            axis=0,
+        ).astype(np.float64, copy=False)
+
+    def _box_contact_world_pose(self, box_pose: np.ndarray, contact_id: int) -> np.ndarray:
+        local_matrix = scaled_local_matrix(LONG_BOX_CONTACT_MATRICES[contact_id], self.box_half_size)
+        world_matrix = pose_to_matrix(box_pose) @ local_matrix
+        return matrix_to_pose(world_matrix)
+
+    def _box_functional_world_pose(self, box_pose: np.ndarray, functional_id: int) -> np.ndarray:
+        local_matrix = scaled_local_matrix(BOX_FUNCTIONAL_MATRICES[functional_id], self.box_half_size)
+        world_matrix = pose_to_matrix(box_pose) @ local_matrix
+        return matrix_to_pose(world_matrix)
+
+    def _target_functional_world_pose(self, functional_id: int) -> np.ndarray:
+        local_matrix = scaled_local_matrix(BOX_FUNCTIONAL_MATRICES[functional_id], self.target_half_size)
+        world_matrix = pose_to_matrix(self._target_pose()) @ local_matrix
+        return matrix_to_pose(world_matrix)
+
+    def _solve_box_pose_from_functional_target(self, target_pose: np.ndarray, functional_id: int) -> np.ndarray:
+        local_matrix = scaled_local_matrix(BOX_FUNCTIONAL_MATRICES[functional_id], self.box_half_size)
+        box_matrix = pose_to_matrix(target_pose) @ np.linalg.inv(local_matrix)
+        return matrix_to_pose(box_matrix)
+
+    def _grasp_pose_from_box_pose(self, box_pose: np.ndarray, contact_id: int, pre_distance: float) -> np.ndarray:
+        contact_matrix = pose_to_matrix(self._box_contact_world_pose(box_pose, contact_id))
+        grasp_frame = contact_matrix @ CONTACT_POSE_TO_GRASP_FRAME
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, :3] = grasp_frame[:3, :3]
+        pose[:3, 3] = grasp_frame[:3, 3] + grasp_frame[:3, :3] @ np.array([-0.12 - pre_distance, 0.0, 0.0])
+        return matrix_to_pose(pose)
+
+    def _rotate_pose_along_target_axis(
+        self,
+        target_pose: np.ndarray,
+        center_pose: np.ndarray,
+        *,
+        axis: np.ndarray,
+        theta: float,
+        towards: np.ndarray | None = None,
+    ) -> np.ndarray:
+        if np.isclose(theta, 0.0):
+            return np.asarray(target_pose, dtype=np.float64).copy()
+        target_matrix = pose_to_matrix(target_pose)
+        center_matrix = pose_to_matrix(center_pose)
+        world_axis = target_matrix[:3, :3] @ np.asarray(axis, dtype=np.float64).reshape(3)
+        world_axis = world_axis / np.linalg.norm(world_axis)
+        rotvec = world_axis * float(theta)
+        theta_norm = np.linalg.norm(rotvec)
+        kx, ky, kz = rotvec / theta_norm
+        K = np.array([[0.0, -kz, ky], [kz, 0.0, -kx], [-ky, kx, 0.0]], dtype=np.float64)
+        rotate_mat = np.eye(3, dtype=np.float64) + np.sin(theta_norm) * K + (1.0 - np.cos(theta_norm)) * (K @ K)
+        translated = rotate_mat @ (target_matrix[:3, 3] - center_matrix[:3, 3]) + center_matrix[:3, 3]
+        if towards is not None and np.dot(translated - center_matrix[:3, 3], np.asarray(towards, dtype=np.float64)) < 0:
+            return self._rotate_pose_along_target_axis(
+                target_pose,
+                center_pose,
+                axis=axis,
+                theta=-theta,
+                towards=None,
+            )
+        rotated = np.eye(4, dtype=np.float64)
+        rotated[:3, :3] = rotate_mat @ target_matrix[:3, :3]
+        rotated[:3, 3] = translated
+        return matrix_to_pose(rotated)
+
+    def _get_rotate_limits(self, arm_index: int) -> tuple[float, float]:
+        config = self.base_env.embodiment_spec.left_config if arm_index == 0 else self.base_env.embodiment_spec.right_config
+        rotate_lim = config.get("rotate_lim")
+        if isinstance(rotate_lim, (list, tuple)) and len(rotate_lim) >= 2 and not np.isclose(float(rotate_lim[0]), float(rotate_lim[1])):
+            return float(rotate_lim[0]), float(rotate_lim[1])
+        return self.LEFT_ROTATE_LIM if arm_index == 0 else self.RIGHT_ROTATE_LIM
+
+    def _grasp_pre_pose_candidates_from_box_pose(
+        self,
+        box_pose: np.ndarray,
+        contact_id: int,
+        pre_distance: float,
+        arm_index: int,
+    ) -> list[np.ndarray]:
+        base_pose = self._grasp_pose_from_box_pose(box_pose, contact_id, pre_distance)
+        center_pose = self._box_contact_world_pose(box_pose, contact_id)
+        rotate_min, rotate_max = self._get_rotate_limits(arm_index)
+        angles = np.linspace(rotate_min, rotate_max, num=self.ROTATE_NUM, dtype=np.float64)
+        candidates = [np.asarray(base_pose, dtype=np.float64)]
+        for theta in angles:
+            if np.isclose(theta, 0.0):
+                continue
+            candidates.append(
+                self._rotate_pose_along_target_axis(
+                    base_pose,
+                    center_pose,
+                    axis=np.array([0.0, 1.0, 0.0], dtype=np.float64),
+                    theta=float(theta),
+                    towards=np.array([0.0, -1.0, 0.0], dtype=np.float64),
+                )
+            )
+        return candidates
+
+    def _get_handover_approach_pose(self, pre_grasp_pose: np.ndarray) -> np.ndarray:
+        pose = np.asarray(pre_grasp_pose, dtype=np.float64).copy()
+        pose[:3] += self.HANDOVER_APPROACH_OFFSET
+        return pose
+
+    def solve_episode(self, *, recorder, max_episode_steps: int) -> tuple[bool, int, str]:
+        self.ctrl.reset_episode(max_episode_steps)
+        self.last_debug_info = {}
+
+        try:
+            if self.ctrl.hold_pose(
+                recorder,
+                steps=self.ctrl.HOLD_SETTLE_STEPS,
+                left_gripper=1.0,
+                right_gripper=1.0,
+            ):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+
+            pick_candidate, success = self.ctrl.grasp_actor(
+                desired_pose=self._box_pose(),
+                arm_index=0,
+                contact_ids=LEFT_GRASP_CONTACT_IDS,
+                pre_grasp_dis=self.PRE_GRASP_DISTANCE,
+                grasp_dis=self.GRASP_DISTANCE,
+                pose_builder=self._grasp_pose_from_box_pose,
+                preferred_quat=PREFERRED_GRASP_QUATS[0],
+                pre_pose_candidates_builder=self._grasp_pre_pose_candidates_from_box_pose,
+                recorder=recorder,
+                fail_status="left_pick_plan_failed",
+            )
+            if pick_candidate is None:
+                self.last_debug_info = {
+                    "stage": "left_pick",
+                    "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                    "left_qpos": np.asarray(self.ctrl.current_qpos(0), dtype=np.float64).round(4).tolist(),
+                    "left_full_qpos": np.asarray(self.ctrl.current_full_qpos(0), dtype=np.float64).round(4).tolist(),
+                    "attempts": list(self.ctrl.last_grasp_attempts),
+                }
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+            if success:
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+
+            if self.ctrl.move_by_displacement(
+                0,
+                recorder,
+                z=self.LEFT_LIFT_DISTANCE,
+                fail_status="left_lift_failed",
+            ):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+            handover_box_pose = self._solve_box_pose_from_functional_target(
+                np.asarray(BLOCK_MIDDLE_POSE, dtype=np.float64),
+                functional_id=0,
+            )
+            left_handover_pose = self._grasp_pose_from_box_pose(
+                handover_box_pose,
+                pick_candidate.contact_id,
+                self.GRASP_DISTANCE,
+            )
+            if self.ctrl.place_actor(
+                arm_index=0,
+                pre_pose=left_handover_pose,
+                place_pose=left_handover_pose,
+                recorder=recorder,
+                fail_status="left_handover_move_failed",
+                open_after=False,
+            ):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+            handover_candidate = self.ctrl.choose_grasp_candidate(
+                desired_pose=handover_box_pose,
+                arm_index=1,
+                contact_ids=RIGHT_GRASP_CONTACT_IDS,
+                pre_distance=self.HANDOVER_PRE_GRASP_DISTANCE,
+                grasp_distance=self.GRASP_DISTANCE,
+                pose_builder=self._grasp_pose_from_box_pose,
+                preferred_quat=PREFERRED_GRASP_QUATS[1],
+                pre_pose_candidates_builder=self._grasp_pre_pose_candidates_from_box_pose,
+            )
+            if handover_candidate is None:
+                self.ctrl.last_status = "right_handover_plan_failed"
+                self.last_debug_info = {
+                    "stage": "right_handover",
+                    "handover_box_pose": np.asarray(handover_box_pose, dtype=np.float64).round(4).tolist(),
+                    "right_qpos": np.asarray(self.ctrl.current_qpos(1), dtype=np.float64).round(4).tolist(),
+                    "right_full_qpos": np.asarray(self.ctrl.current_full_qpos(1), dtype=np.float64).round(4).tolist(),
+                    "attempts": list(self.ctrl.last_grasp_attempts),
+                }
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+            approach_pose = self._get_handover_approach_pose(handover_candidate.pre_pose)
+            if self.ctrl.move_to_pose(1, approach_pose, recorder, fail_status="right_handover_approach_failed"):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+            handover_candidate, success = self.ctrl.grasp_actor(
+                desired_pose=handover_box_pose,
+                arm_index=1,
+                contact_ids=(handover_candidate.contact_id,),
+                pre_grasp_dis=self.HANDOVER_PRE_GRASP_DISTANCE,
+                grasp_dis=self.GRASP_DISTANCE,
+                pose_builder=self._grasp_pose_from_box_pose,
+                preferred_quat=PREFERRED_GRASP_QUATS[1],
+                pre_pose_candidates_builder=self._grasp_pre_pose_candidates_from_box_pose,
+                recorder=recorder,
+                fail_status="right_handover_plan_failed",
+            )
+            if handover_candidate is None:
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+            if success:
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+
+            if self.ctrl.open_gripper(0, recorder, fail_status="left_open_failed"):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+            if self.ctrl.move_by_displacement(
+                0,
+                recorder,
+                z=self.LEFT_RELEASE_LIFT_DISTANCE,
+                move_axis="arm",
+                fail_status="left_release_lift_failed",
+            ):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+            if self.ctrl.back_to_origin(0, recorder, fail_status="left_back_to_origin_failed"):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+            target_fp_pose = self._target_functional_world_pose(1)
+            current_right_pose = self.ctrl.current_ee_pose(1).copy()
+            above_target_pose = current_right_pose.copy()
+            above_target_pose[:3] = target_fp_pose[:3] + self.ABOVE_TARGET_OFFSET
+            if self.ctrl.move_to_pose(1, above_target_pose, recorder, fail_status="right_above_target_failed"):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+            placed_box_pose = self._solve_box_pose_from_functional_target(target_fp_pose, functional_id=0)
+            right_pre_place_pose = self._grasp_pose_from_box_pose(
+                placed_box_pose,
+                handover_candidate.contact_id,
+                0.08,
+            )
+            right_place_pose = self._grasp_pose_from_box_pose(
+                placed_box_pose,
+                handover_candidate.contact_id,
+                self.GRASP_DISTANCE,
+            )
+            if self.ctrl.place_actor(
+                arm_index=1,
+                pre_pose=right_pre_place_pose,
+                place_pose=right_place_pose,
+                recorder=recorder,
+                fail_status="right_place_failed",
+                open_after=True,
+                prefer_screw_final=True,
+            ):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+            if self.ctrl.current_success():
+                self.ctrl.last_status = "success"
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+
+            self.ctrl.last_status = "final_success_check_failed"
+            return False, self.ctrl.steps_taken, self.ctrl.last_status
+        except EpisodeLimitReached:
+            self.ctrl.last_status = "max_episode_steps_exceeded"
+            return False, self.ctrl.steps_taken, self.ctrl.last_status
