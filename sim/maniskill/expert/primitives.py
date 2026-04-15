@@ -26,7 +26,11 @@ class GraspCandidate:
     pre_plan: dict[str, Any]
     grasp_plan: dict[str, Any]
     score: float
+    top_down_score: float
+    side_score: float
     path_length: int
+    shoulder_pan_delta: float
+    joint_motion: float
 
 
 def to_numpy(value: Any) -> np.ndarray:
@@ -104,7 +108,7 @@ class FixedRateMotionPrimitives:
     GRIPPER_SETTLE_STEPS = 18
     RELEASE_SETTLE_STEPS = 12
     HOLD_SETTLE_STEPS = 6
-    PLANNER_TIME = 1.0
+    PLANNER_TIME = 0.35
 
     def __init__(self, env_backend):
         self.backend = env_backend
@@ -116,6 +120,15 @@ class FixedRateMotionPrimitives:
         self.step_limit = 0
         self.last_status = "not_started"
         self.last_grasp_attempts: list[dict[str, Any]] = []
+        self.last_plan_debug: dict[str, Any] = {}
+        self.commanded_arm_qpos = {
+            0: np.zeros(self.base_env.ARM_DOF, dtype=np.float64),
+            1: np.zeros(self.base_env.ARM_DOF, dtype=np.float64),
+        }
+        self.commanded_gripper = {
+            0: 0.0,
+            1: 0.0,
+        }
         self.planners = {
             0: self._build_planner(0),
             1: self._build_planner(1),
@@ -130,6 +143,11 @@ class FixedRateMotionPrimitives:
         self.step_limit = int(max_episode_steps)
         self.last_status = "running"
         self.last_grasp_attempts = []
+        self.last_plan_debug = {}
+        self.commanded_arm_qpos[0] = self.current_qpos(0).copy()
+        self.commanded_arm_qpos[1] = self.current_qpos(1).copy()
+        self.commanded_gripper[0] = self.current_gripper_value(0)
+        self.commanded_gripper[1] = self.current_gripper_value(1)
 
     def _build_planner(self, arm_index: int) -> mplib.Planner:
         assets = self.base_env.get_arm_planner_assets(arm_index)
@@ -194,13 +212,13 @@ class FixedRateMotionPrimitives:
         right_gripper: float | None = None,
     ) -> np.ndarray:
         if left_qpos is None:
-            left_qpos = self.current_qpos(0)
+            left_qpos = self.commanded_arm_qpos[0]
         if right_qpos is None:
-            right_qpos = self.current_qpos(1)
+            right_qpos = self.commanded_arm_qpos[1]
         if left_gripper is None:
-            left_gripper = self.current_gripper_value(0)
+            left_gripper = self.commanded_gripper[0]
         if right_gripper is None:
-            right_gripper = self.current_gripper_value(1)
+            right_gripper = self.commanded_gripper[1]
         return np.concatenate(
             [
                 np.asarray(left_qpos, dtype=np.float32).reshape(self.base_env.ARM_DOF),
@@ -214,6 +232,11 @@ class FixedRateMotionPrimitives:
     def _step_and_record(self, action: np.ndarray, recorder) -> tuple[Any, bool]:
         if self.steps_taken >= self.step_limit:
             raise EpisodeLimitReached
+        action = np.asarray(action, dtype=np.float32).reshape(self.base_env.ACTION_DIM)
+        self.commanded_arm_qpos[0] = action[0:6].astype(np.float64, copy=True)
+        self.commanded_gripper[0] = float(action[6])
+        self.commanded_arm_qpos[1] = action[7:13].astype(np.float64, copy=True)
+        self.commanded_gripper[1] = float(action[13])
         result = self.backend.step(ActionSpec.from_value(action))
         recorder.append_step(action, dict(result.observation.data))
         self.steps_taken += 1
@@ -316,12 +339,25 @@ class FixedRateMotionPrimitives:
         prefer_screw: bool = False,
         fail_status: str,
     ) -> bool:
-        plan_result = self.plan_screw_to_pose(arm_index, pose) if prefer_screw else None
+        target_pose = np.asarray(pose, dtype=np.float64)
+        screw_reason = None
+        pose_reason = None
+        plan_result = None
+        if prefer_screw:
+            plan_result, screw_reason = self.plan_screw_to_pose_debug(arm_index, target_pose)
         if plan_result is None:
-            plan_result = self.plan_to_pose(arm_index, pose)
+            plan_result, pose_reason = self.plan_to_pose_debug(arm_index, target_pose)
         if plan_result is None:
+            self.last_plan_debug = {
+                "arm_index": int(arm_index),
+                "target_pose": target_pose.round(4).tolist(),
+                "prefer_screw": bool(prefer_screw),
+                "screw_reason": screw_reason,
+                "plan_reason": pose_reason,
+            }
             self.last_status = fail_status
             return False
+        self.last_plan_debug = {}
         return self._execute_plan(arm_index, plan_result, recorder)
 
     def move_by_displacement(
@@ -345,7 +381,13 @@ class FixedRateMotionPrimitives:
             origin_pose[:3] += -z * dir_vec
         if quat is not None:
             origin_pose[3:] = np.asarray(quat, dtype=np.float64).reshape(4)
-        return self.move_to_pose(arm_index, origin_pose, recorder, fail_status=fail_status)
+        return self.move_to_pose(
+            arm_index,
+            origin_pose,
+            recorder,
+            prefer_screw=True,
+            fail_status=fail_status,
+        )
 
     def back_to_origin(self, arm_index: int, recorder, *, fail_status: str) -> bool:
         target_qpos = self.base_env.get_arm_home_joint_positions(arm_index)
@@ -371,7 +413,7 @@ class FixedRateMotionPrimitives:
             left_gripper=pos if arm_index == 0 else None,
             right_gripper=pos if arm_index == 1 else None,
         )
-        if not success and fail_status is not None and self.last_status == "running":
+        if not success and fail_status is not None and self.last_status not in ("running", "success"):
             self.last_status = fail_status
         return success
 
@@ -382,7 +424,7 @@ class FixedRateMotionPrimitives:
             left_gripper=pos if arm_index == 0 else None,
             right_gripper=pos if arm_index == 1 else None,
         )
-        if not success and fail_status is not None and self.last_status == "running":
+        if not success and fail_status is not None and self.last_status not in ("running", "success"):
             self.last_status = fail_status
         return success
 
@@ -396,10 +438,44 @@ class FixedRateMotionPrimitives:
         grasp_distance: float,
         pose_builder: Callable[[np.ndarray, int, float], np.ndarray],
         preferred_quat: np.ndarray,
+        preferred_top_down_quat: np.ndarray | None = None,
         pre_pose_candidates_builder: Callable[[np.ndarray, int, float, int], list[np.ndarray]] | None = None,
+        selection_mode: str = "auto",
     ) -> GraspCandidate | None:
+        def better_candidate(
+            lhs: GraspCandidate | None,
+            rhs: GraspCandidate | None,
+            *,
+            score_attr: str,
+        ) -> bool:
+            if lhs is None:
+                return False
+            if rhs is None:
+                return True
+            lhs_score = float(getattr(lhs, score_attr))
+            rhs_score = float(getattr(rhs, score_attr))
+            score_tol = 0.03
+            if lhs_score < rhs_score - score_tol:
+                return True
+            if lhs_score > rhs_score + score_tol:
+                return False
+            shoulder_tol = 0.05
+            if lhs.shoulder_pan_delta < rhs.shoulder_pan_delta - shoulder_tol:
+                return True
+            if lhs.shoulder_pan_delta > rhs.shoulder_pan_delta + shoulder_tol:
+                return False
+            motion_tol = 0.1
+            if lhs.joint_motion < rhs.joint_motion - motion_tol:
+                return True
+            if lhs.joint_motion > rhs.joint_motion + motion_tol:
+                return False
+            return lhs.path_length < rhs.path_length
+
         current_qpos = self.current_full_qpos(arm_index)
+        current_arm_qpos = self.current_qpos(arm_index)
         best: GraspCandidate | None = None
+        best_top_down: GraspCandidate | None = None
+        best_side: GraspCandidate | None = None
         attempts: list[dict[str, Any]] = []
         for contact_id in contact_ids:
             if pre_pose_candidates_builder is None:
@@ -453,10 +529,31 @@ class FixedRateMotionPrimitives:
                     grasp_pose=grasp_pose,
                     pre_plan=pre_plan,
                     grasp_plan=grasp_plan,
-                    score=quat_distance(grasp_pose[3:], preferred_quat),
+                    score=0.0,
+                    top_down_score=(
+                        quat_distance(grasp_pose[3:], preferred_top_down_quat)
+                        if preferred_top_down_quat is not None
+                        else np.inf
+                    ),
+                    side_score=quat_distance(grasp_pose[3:], preferred_quat),
                     path_length=len(pre_plan["position"]) + len(grasp_plan["position"]),
+                    shoulder_pan_delta=float(
+                        np.abs(self._arm_qpos_from_plan(pre_plan["position"][-1])[0] - current_arm_qpos[0])
+                    ),
+                    joint_motion=float(
+                        np.linalg.norm(self._arm_qpos_from_plan(pre_plan["position"][-1]) - current_arm_qpos)
+                        + np.linalg.norm(
+                            self._arm_qpos_from_plan(grasp_plan["position"][-1])
+                            - self._arm_qpos_from_plan(pre_plan["position"][-1])
+                        )
+                    ),
                 )
-                if best_for_contact is None or candidate.path_length < best_for_contact.path_length:
+                candidate.score = (
+                    0.7 * candidate.top_down_score + 0.3 * candidate.side_score
+                    if preferred_top_down_quat is not None
+                    else candidate.side_score
+                )
+                if best_for_contact is None or better_candidate(candidate, best_for_contact, score_attr="score"):
                     best_for_contact = candidate
                 attempts.append(
                     {
@@ -468,16 +565,21 @@ class FixedRateMotionPrimitives:
                 )
             if best_for_contact is None:
                 continue
-            if (
-                best is None
-                or best_for_contact.score < best.score
-                or (
-                    np.isclose(best_for_contact.score, best.score)
-                    and best_for_contact.path_length < best.path_length
-                )
-            ):
+            if better_candidate(best_for_contact, best_top_down, score_attr="top_down_score"):
+                best_top_down = best_for_contact
+            if better_candidate(best_for_contact, best_side, score_attr="side_score"):
+                best_side = best_for_contact
+            if better_candidate(best_for_contact, best, score_attr="score"):
                 best = best_for_contact
         self.last_grasp_attempts = attempts
+        if selection_mode == "prefer_top_down":
+            return best_top_down if best_top_down is not None else best
+        if selection_mode == "prefer_side":
+            return best_side if best_side is not None else best
+        if best_top_down is not None and best_top_down.top_down_score < 0.15:
+            return best_top_down
+        if best_side is not None and best_side.side_score < 0.15:
+            return best_side
         return best
 
     def grasp_actor(
@@ -490,10 +592,12 @@ class FixedRateMotionPrimitives:
         grasp_dis: float,
         pose_builder: Callable[[np.ndarray, int, float], np.ndarray],
         preferred_quat: np.ndarray,
+        preferred_top_down_quat: np.ndarray | None,
         recorder,
         fail_status: str,
         gripper_pos: float = 0.0,
         pre_pose_candidates_builder: Callable[[np.ndarray, int, float, int], list[np.ndarray]] | None = None,
+        selection_mode: str = "auto",
     ) -> tuple[GraspCandidate | None, bool]:
         candidate = self.choose_grasp_candidate(
             desired_pose=desired_pose,
@@ -503,7 +607,9 @@ class FixedRateMotionPrimitives:
             grasp_distance=grasp_dis,
             pose_builder=pose_builder,
             preferred_quat=preferred_quat,
+            preferred_top_down_quat=preferred_top_down_quat,
             pre_pose_candidates_builder=pre_pose_candidates_builder,
+            selection_mode=selection_mode,
         )
         if candidate is None:
             self.last_status = fail_status

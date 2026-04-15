@@ -14,6 +14,9 @@ BOX_HALF_SIZE = torch.tensor([0.03, 0.03, 0.1])
 TARGET_HALF_SIZE = torch.tensor([0.05, 0.05, 0.005])
 SUCCESS_XY_EPS = 0.03
 SUCCESS_Z_EPS = 0.01
+BOX_SETTLE_LINEAR_EPS = 0.05
+BOX_SETTLE_ANGULAR_EPS = 0.50
+RIGHT_GRIPPER_RELEASE_THRESHOLD = 0.95
 BLOCK_MIDDLE_POSE = [0.0, 0.1, 0.9, 0.0, 1.0, 0.0, 0.0]
 BOX_CENTER_Z = 0.842
 TARGET_CENTER_Z = 0.741
@@ -111,7 +114,12 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             torch.abs(box_bottom_center[:, 2] - target_top_center[:, 2]) < SUCCESS_Z_EPS
         )
         spatial_success = xy_aligned & z_aligned
-        right_gripper_open = self._get_gripper_open_mask(arm_index=1)
+        right_gripper_open = self._get_gripper_state_tensor(arm_index=1).squeeze(-1) > RIGHT_GRIPPER_RELEASE_THRESHOLD
+        box_static = (
+            torch.linalg.norm(self.box.linear_velocity, axis=1) <= BOX_SETTLE_LINEAR_EPS
+        ) & (
+            torch.linalg.norm(self.box.angular_velocity, axis=1) <= BOX_SETTLE_ANGULAR_EPS
+        )
         success = base_info["robots_ready"] & spatial_success
 
         base_info.update(
@@ -120,7 +128,8 @@ class HandoverBlockEnv(DualUR5WSGEnv):
                 "z_aligned": z_aligned,
                 "spatial_success": spatial_success,
                 "right_gripper_open": right_gripper_open,
-                "success": success & right_gripper_open,
+                "box_static": box_static,
+                "success": success & right_gripper_open & box_static,
             }
         )
         return base_info
@@ -154,4 +163,5 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         reward = reward + info["z_aligned"].to(torch.float32)
         reward = reward + 2.0 * info["spatial_success"].to(torch.float32)
         reward = reward + info["right_gripper_open"].to(torch.float32)
+        reward = reward + info["box_static"].to(torch.float32)
         return reward
