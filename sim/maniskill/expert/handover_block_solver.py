@@ -78,6 +78,10 @@ class HandoverBlockSolver:
     LEFT_FIRST_GRASP_BOX_AXIS_SHIFT = 0.02
     ABOVE_TARGET_OFFSET = np.asarray([0.05, -0.12, 0.20], dtype=np.float64)
     HANDOVER_APPROACH_OFFSET = np.asarray([0.0, -0.07, 0.10], dtype=np.float64)
+    RIGHT_CARRY_LIFT_DISTANCE = 0.14
+    RIGHT_RELEASE_LIFT_DISTANCE = 0.12
+    FINAL_RELEASE_SETTLE_STEPS = 12
+    FINAL_SETTLE_STEPS = 12
 
     def __init__(self, env_backend):
         self.backend = env_backend
@@ -287,7 +291,7 @@ class HandoverBlockSolver:
         start_to_target_rot = target_matrix[:3, :3] @ place_start_matrix[:3, :3].T
         target_point = start_to_target_rot @ (box_matrix[:3, 3] - place_start_pose[:3]) + target_pose[:3]
 
-        ee_pose = self.ctrl.current_ee_pose(arm_index)
+        ee_pose = self.ctrl.current_gripper_pose(arm_index)
         ee_matrix = pose_to_matrix(ee_pose)
         target_grasp_matrix = start_to_target_rot @ ee_matrix[:3, :3]
 
@@ -394,6 +398,7 @@ class HandoverBlockSolver:
                 self.ctrl.gripper_pose_to_planner_pose(0, pick_candidate.grasp_pose),
                 recorder,
                 prefer_screw=True,
+                allow_pose_fallback=False,
                 fail_status="left_pick_plan_failed",
             ):
                 return True, self.ctrl.steps_taken, self.ctrl.last_status
@@ -434,7 +439,7 @@ class HandoverBlockSolver:
             )
             if self.ctrl.move_to_pose(
                 0,
-                left_handover_pose,
+                self.ctrl.gripper_pose_to_planner_pose(0, left_handover_pose),
                 recorder,
                 prefer_screw=True,
                 fail_status="left_handover_move_failed",
@@ -531,10 +536,30 @@ class HandoverBlockSolver:
             if self.ctrl.last_status != "running":
                 return False, self.ctrl.steps_taken, self.ctrl.last_status
 
+            if self.ctrl.move_by_displacement(
+                1,
+                recorder,
+                z=self.RIGHT_CARRY_LIFT_DISTANCE,
+                move_axis="world",
+                fail_status="right_carry_lift_failed",
+            ):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                self.last_debug_info = {
+                    "stage": "right_carry_lift",
+                    "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
+                    "right_qpos": np.asarray(self.ctrl.current_qpos(1), dtype=np.float64).round(4).tolist(),
+                    "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                    "plan_debug": dict(self.ctrl.last_plan_debug),
+                }
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
             target_fp_pose = self._target_functional_world_pose(1)
             current_right_pose = self.ctrl.current_ee_pose(1).copy()
             above_target_pose = current_right_pose.copy()
-            above_target_pose[:3] = target_fp_pose[:3] + self.ABOVE_TARGET_OFFSET
+            above_target_pose[0] = float(target_fp_pose[0] + self.ABOVE_TARGET_OFFSET[0])
+            above_target_pose[1] = float(target_fp_pose[1] + self.ABOVE_TARGET_OFFSET[1])
+            above_target_pose[2] = float(max(current_right_pose[2], target_fp_pose[2] + self.ABOVE_TARGET_OFFSET[2]))
             if self.ctrl.move_to_pose(1, above_target_pose, recorder, fail_status="right_above_target_failed"):
                 return True, self.ctrl.steps_taken, self.ctrl.last_status
             if self.ctrl.last_status != "running":
@@ -564,12 +589,51 @@ class HandoverBlockSolver:
             )
             if self.ctrl.place_actor(
                 arm_index=1,
-                pre_pose=right_pre_place_pose,
-                place_pose=right_place_pose,
+                pre_pose=self.ctrl.gripper_pose_to_planner_pose(1, right_pre_place_pose),
+                place_pose=self.ctrl.gripper_pose_to_planner_pose(1, right_place_pose),
                 recorder=recorder,
                 fail_status="right_place_failed",
                 open_after=True,
                 prefer_screw_final=True,
+                allow_success_on_release=False,
+            ):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+            if self.ctrl.hold_pose(
+                recorder,
+                steps=self.FINAL_RELEASE_SETTLE_STEPS,
+                right_gripper=1.0,
+                allow_success_early=False,
+            ):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+            if self.ctrl.move_to_pose(
+                1,
+                above_target_pose,
+                recorder,
+                fail_status="right_release_lift_failed",
+            ):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                self.last_debug_info = {
+                    "stage": "right_release_lift",
+                    "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
+                    "right_qpos": np.asarray(self.ctrl.current_qpos(1), dtype=np.float64).round(4).tolist(),
+                    "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                    "above_target_pose": np.asarray(above_target_pose, dtype=np.float64).round(4).tolist(),
+                    "plan_debug": dict(self.ctrl.last_plan_debug),
+                }
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+            if self.ctrl.hold_pose(
+                recorder,
+                steps=self.FINAL_SETTLE_STEPS,
+                right_gripper=1.0,
+                allow_success_early=False,
             ):
                 return True, self.ctrl.steps_taken, self.ctrl.last_status
             if self.ctrl.last_status != "running":
@@ -579,6 +643,19 @@ class HandoverBlockSolver:
                 self.ctrl.last_status = "success"
                 return True, self.ctrl.steps_taken, self.ctrl.last_status
 
+            final_info = self.base_env.evaluate()
+            self.last_debug_info = {
+                "stage": "final_success_check",
+                "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
+                "left_ee_pose": np.asarray(self.ctrl.current_ee_pose(0), dtype=np.float64).round(4).tolist(),
+                "xy_aligned": bool(to_numpy(final_info["xy_aligned"]).reshape(-1)[0]),
+                "z_aligned": bool(to_numpy(final_info["z_aligned"]).reshape(-1)[0]),
+                "spatial_success": bool(to_numpy(final_info["spatial_success"]).reshape(-1)[0]),
+                "right_gripper_open": bool(to_numpy(final_info["right_gripper_open"]).reshape(-1)[0]),
+                "right_ee_clear": bool(to_numpy(final_info["right_ee_clear"]).reshape(-1)[0]),
+                "box_static": bool(to_numpy(final_info["box_static"]).reshape(-1)[0]),
+            }
             self.ctrl.last_status = "final_success_check_failed"
             return False, self.ctrl.steps_taken, self.ctrl.last_status
         except EpisodeLimitReached:

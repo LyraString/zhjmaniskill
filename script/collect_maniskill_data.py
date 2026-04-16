@@ -172,8 +172,11 @@ def run_collection(args) -> None:
             from sim.maniskill.expert.handover_block_solver import HandoverBlockSolver
 
             solver = HandoverBlockSolver(env)
-            for episode_idx in range(args.episode_num):
-                obs = env.reset(seed=args.seed + episode_idx)
+            saved_episode_idx = 0
+            attempted_episode_idx = 0
+            while saved_episode_idx < args.episode_num:
+                reset_seed = args.seed + attempted_episode_idx
+                obs = env.reset(seed=reset_seed)
                 recorder.start_episode(dict(obs.data))
                 maybe_render()
                 success, episode_length, status = solver.solve_episode(
@@ -183,26 +186,28 @@ def run_collection(args) -> None:
 
                 if success or not args.save_only_success:
                     if episode_length > 0:
-                        out_path = recorder.save_episode(episode_idx)
+                        out_path = recorder.save_episode(saved_episode_idx)
                         print(
                             f"saved {out_path} "
-                            f"(seed={args.seed + episode_idx}, length={episode_length}, "
+                            f"(seed={reset_seed}, length={episode_length}, "
                             f"success={int(success)}, status={status})"
                         )
+                        saved_episode_idx += 1
                     else:
                         print(
-                            f"skipped scripted_expert episode={episode_idx} "
-                            f"(seed={args.seed + episode_idx}, length=0, success={int(success)}, status={status})"
+                            f"skipped scripted_expert attempt={attempted_episode_idx} "
+                            f"(seed={reset_seed}, length=0, success={int(success)}, status={status})"
                         )
                     if (not success) and getattr(solver, "last_debug_info", None):
                         print("scripted_expert_debug=" + json.dumps(solver.last_debug_info, ensure_ascii=False))
                 else:
                     print(
-                        f"skipped scripted_expert episode={episode_idx} "
-                        f"(seed={args.seed + episode_idx}, length={episode_length}, success=0, status={status})"
+                        f"skipped scripted_expert attempt={attempted_episode_idx} "
+                        f"(seed={reset_seed}, length={episode_length}, success=0, status={status})"
                     )
                     if getattr(solver, "last_debug_info", None):
                         print("scripted_expert_debug=" + json.dumps(solver.last_debug_info, ensure_ascii=False))
+                attempted_episode_idx += 1
             return
 
         teacher_zarr_path, teacher_seed_path = _resolve_teacher_assets(args, resolved_profile_name)

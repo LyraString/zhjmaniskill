@@ -180,6 +180,21 @@ class FixedRateMotionPrimitives:
         gripper_pose_quat = tquat.mat2quat(gripper_pose_mat)
         return np.concatenate([gripper_pose_pos, gripper_pose_quat], axis=0).astype(np.float64, copy=False)
 
+    def planner_pose_to_gripper_pose(self, arm_index: int, planner_pose: np.ndarray) -> np.ndarray:
+        config = self._arm_config(arm_index)
+        gripper_bias = float(config.get("gripper_bias", 0.0))
+        delta_matrix = np.asarray(config.get("delta_matrix", np.eye(3)), dtype=np.float64).reshape(3, 3)
+
+        planner_pose = np.asarray(planner_pose, dtype=np.float64).reshape(7)
+        planner_pose_pos = planner_pose[:3].copy()
+        planner_pose_quat = planner_pose[3:].copy()
+        planner_pose_mat = tquat.quat2mat(planner_pose_quat)
+
+        gripper_pose_mat = planner_pose_mat @ delta_matrix
+        gripper_pose_pos = planner_pose_pos - gripper_pose_mat @ np.array([0.12 - gripper_bias, 0.0, 0.0], dtype=np.float64)
+        gripper_pose_quat = tquat.mat2quat(gripper_pose_mat)
+        return np.concatenate([gripper_pose_pos, gripper_pose_quat], axis=0).astype(np.float64, copy=False)
+
     def current_qpos(self, arm_index: int) -> np.ndarray:
         return self.base_env.get_arm_joint_positions(arm_index)
 
@@ -188,6 +203,9 @@ class FixedRateMotionPrimitives:
 
     def current_ee_pose(self, arm_index: int) -> np.ndarray:
         return self.base_env.get_arm_end_effector_pose_array(arm_index)
+
+    def current_gripper_pose(self, arm_index: int) -> np.ndarray:
+        return self.planner_pose_to_gripper_pose(arm_index, self.current_ee_pose(arm_index))
 
     def current_gripper_value(self, arm_index: int) -> float:
         value = self.base_env.get_left_gripper_val() if arm_index == 0 else self.base_env.get_right_gripper_val()
@@ -261,11 +279,19 @@ class FixedRateMotionPrimitives:
                 return False
         return False
 
-    def hold_pose(self, recorder, *, steps: int, left_gripper: float | None = None, right_gripper: float | None = None) -> bool:
+    def hold_pose(
+        self,
+        recorder,
+        *,
+        steps: int,
+        left_gripper: float | None = None,
+        right_gripper: float | None = None,
+        allow_success_early: bool = True,
+    ) -> bool:
         for _ in range(steps):
             action = self.compose_action(left_gripper=left_gripper, right_gripper=right_gripper)
             result, success = self._step_and_record(action, recorder)
-            if success:
+            if success and allow_success_early:
                 self.last_status = "success"
                 return True
             if result.terminated or result.truncated:
@@ -337,6 +363,7 @@ class FixedRateMotionPrimitives:
         recorder,
         *,
         prefer_screw: bool = False,
+        allow_pose_fallback: bool = True,
         fail_status: str,
     ) -> bool:
         target_pose = np.asarray(pose, dtype=np.float64)
@@ -345,13 +372,14 @@ class FixedRateMotionPrimitives:
         plan_result = None
         if prefer_screw:
             plan_result, screw_reason = self.plan_screw_to_pose_debug(arm_index, target_pose)
-        if plan_result is None:
+        if plan_result is None and (allow_pose_fallback or not prefer_screw):
             plan_result, pose_reason = self.plan_to_pose_debug(arm_index, target_pose)
         if plan_result is None:
             self.last_plan_debug = {
                 "arm_index": int(arm_index),
                 "target_pose": target_pose.round(4).tolist(),
                 "prefer_screw": bool(prefer_screw),
+                "allow_pose_fallback": bool(allow_pose_fallback),
                 "screw_reason": screw_reason,
                 "plan_reason": pose_reason,
             }
@@ -406,23 +434,41 @@ class FixedRateMotionPrimitives:
                 return False
         return False
 
-    def open_gripper(self, arm_index: int, recorder, *, pos: float = 1.0, fail_status: str | None = None) -> bool:
+    def open_gripper(
+        self,
+        arm_index: int,
+        recorder,
+        *,
+        pos: float = 1.0,
+        fail_status: str | None = None,
+        allow_success_early: bool = True,
+    ) -> bool:
         success = self.hold_pose(
             recorder,
             steps=self.RELEASE_SETTLE_STEPS,
             left_gripper=pos if arm_index == 0 else None,
             right_gripper=pos if arm_index == 1 else None,
+            allow_success_early=allow_success_early,
         )
         if not success and fail_status is not None and self.last_status not in ("running", "success"):
             self.last_status = fail_status
         return success
 
-    def close_gripper(self, arm_index: int, recorder, *, pos: float = 0.0, fail_status: str | None = None) -> bool:
+    def close_gripper(
+        self,
+        arm_index: int,
+        recorder,
+        *,
+        pos: float = 0.0,
+        fail_status: str | None = None,
+        allow_success_early: bool = True,
+    ) -> bool:
         success = self.hold_pose(
             recorder,
             steps=self.GRIPPER_SETTLE_STEPS,
             left_gripper=pos if arm_index == 0 else None,
             right_gripper=pos if arm_index == 1 else None,
+            allow_success_early=allow_success_early,
         )
         if not success and fail_status is not None and self.last_status not in ("running", "success"):
             self.last_status = fail_status
@@ -633,6 +679,7 @@ class FixedRateMotionPrimitives:
         fail_status: str,
         open_after: bool = True,
         prefer_screw_final: bool = False,
+        allow_success_on_release: bool = True,
     ) -> bool:
         if not np.allclose(pre_pose, place_pose):
             success = self.move_to_pose(arm_index, pre_pose, recorder, fail_status=fail_status)
@@ -646,7 +693,11 @@ class FixedRateMotionPrimitives:
         if self.last_status == fail_status:
             return False
         if open_after:
-            success = self.open_gripper(arm_index, recorder)
+            success = self.open_gripper(
+                arm_index,
+                recorder,
+                allow_success_early=allow_success_on_release,
+            )
             if success:
                 return True
         return False
