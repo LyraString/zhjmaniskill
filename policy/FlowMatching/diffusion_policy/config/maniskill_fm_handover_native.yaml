@@ -7,10 +7,10 @@ name: maniskill_fm_handover_native
 exp_name: handover_block_native_fm
 
 dataloader:
-  batch_size: 2
+  batch_size: 128
 
 val_dataloader:
-  batch_size: 2
+  batch_size: 128
 
 training:
   num_epochs: 3000

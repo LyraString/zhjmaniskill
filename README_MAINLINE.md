@@ -1,71 +1,86 @@
-# RoboTwin Mainline Guide
+# RoboTwin ManiSkill Mainline
 
-这份文档描述的是当前这个仓库里已经完成改造、并且实际可用的主线工作流。
+这份文档描述的是当前分支里真实可用的主线工作流，而不是上游 RoboTwin 官方默认工作流。
 
-- 上游 RoboTwin 官方说明保留在 [README.md](/home/idiot/zhj/RoboTwin/README.md)
-- 这份文档只解释当前这个分支里的实际行为
-- 当前主环境默认是 `zhjrl`
-- 当前主 simulator 默认是 `ManiSkill`
-- RoboTwin 原运行时仍然保留，但应视为 `legacy`
+- 上游项目介绍、论文信息和原始 RoboTwin 使用说明保留在 [README.md](README.md)
+- 当前分支的 ManiSkill 主线说明以这份文档为准
+- 当前主要验证对象是 `HandoverBlock-v1`
 
-## 1. 当前仓库到底是什么
+## 项目定位
 
-这个仓库现在同时包含两套东西：
+当前仓库同时包含两套东西：
 
-1. 上游 RoboTwin 2.0 原始代码和文档
+1. 上游 RoboTwin 2.0 代码与文档
 2. 一条新的 ManiSkill 主线
 
-当前 ManiSkill 主线的目标是：
+这条 ManiSkill 主线的目标是：
 
-- 保留 RoboTwin 的任务和 embodiment 语义
-- 把环境执行、采集、训练、评估统一到 ManiSkill 侧
-- 支持 GPU 并行和固定频率运行
+- 保留 RoboTwin 的任务语义和 embodiment 语义
+- 用 ManiSkill 环境统一采集、训练和评测
+- 把策略训练链路收敛到 `collect -> process -> train -> eval`
 
-当前已经落地的真实任务是：
+当前分支里，最值得关注的任务是：
 
-- `PickCube-v1`
 - `HandoverBlock-v1`
 
-其中 `HandoverBlock-v1` 是这次改造的重点任务。
+## 环境准备
 
-## 2. 目录总览
+这份文档默认你已经完成了上游 RoboTwin 的基础安装。
 
-### 2.1 核心目录
+安装与资产下载请先参考：
 
-- `core/`
-  - simulator-agnostic schema 和接口
-- `legacy/robotwin/`
-  - RoboTwin 原运行时 adapter
-- `sim/maniskill/`
-  - ManiSkill backend、vector backend、task profile、trajectory recorder
-- `sim/maniskill/tasks/`
-  - 自定义 ManiSkill env 注册入口
-  - `BaseBimanualEnv` 是双臂任务基类
-  - `HandoverBlock-v1` 是当前第一个完整迁移任务
-- `data/converters/`
-  - RoboTwin HDF5 -> zarr
-  - ManiSkill NPZ -> zarr
-- `policy/FlowMatching/`
-  - FM 训练、处理、评估入口
-- `policy/FPO/`
-  - FPO 训练、处理、评估入口
+- [README.md](README.md)
+- 上游 RoboTwin 官方文档
 
-### 2.2 当前最重要的几个文件
+当前分支的额外假设是：
 
-- [mainline.sh](/home/idiot/zhj/RoboTwin/mainline.sh)
+- 默认 Python 环境是 `zhjrl`
+- 当前主 simulator 是 ManiSkill
+- 调试 `scripted_expert` 时通常使用：
+  - `--sim-backend physx_cpu`
+  - `--render-backend sapien_cuda`
+
+如果你只想快速开始，不必先理解所有目录，直接按下面这条链走即可：
+
+1. 采 raw episode
+2. 处理成 zarr
+3. 训练 FM / FPO
+4. 评测
+
+## 仓库结构
+
+下面这些目录是当前主线最重要的部分：
+
+- [`mainline.sh`](mainline.sh)
   - 根目录统一入口
-- [sim/maniskill/task_profiles.py](/home/idiot/zhj/RoboTwin/sim/maniskill/task_profiles.py)
-  - ManiSkill task profile 注册表
-- [README.md](/home/idiot/zhj/RoboTwin/README.md)
-  - 上游 RoboTwin 官方说明
-- [README_MAINLINE.md](/home/idiot/zhj/RoboTwin/README_MAINLINE.md)
-  - 当前 ManiSkill 主线说明
+- [`script/`](script)
+  - 采集、评测和桥接脚本
+- [`sim/maniskill/`](sim/maniskill)
+  - ManiSkill runtime、task profile、trajectory recorder、expert solver
+- [`sim/maniskill/tasks/`](sim/maniskill/tasks)
+  - 当前自定义 ManiSkill 任务实现
+- [`policy/FlowMatching/`](policy/FlowMatching)
+  - Flow Matching 数据处理、训练、评测
+- [`policy/FPO/`](policy/FPO)
+  - FPO 数据处理、训练、评测
+- [`data/`](data)
+  - 原始采集数据、训练输出
+- [`checkpoints/`](checkpoints)
+  - 保存的模型权重
+- [`eval_videos/`](eval_videos)
+  - 评测视频
 
-## 3. 当前主线使用原则
+如果你只想理解主链路，先看这几个文件：
 
-### 3.1 推荐入口
+- [`script/collect_maniskill_data.py`](script/collect_maniskill_data.py)
+- [`sim/maniskill/expert/handover_block_solver.py`](sim/maniskill/expert/handover_block_solver.py)
+- [`sim/maniskill/expert/primitives.py`](sim/maniskill/expert/primitives.py)
+- [`sim/maniskill/tasks/handover_block_env.py`](sim/maniskill/tasks/handover_block_env.py)
+- [`sim/maniskill/task_profiles.py`](sim/maniskill/task_profiles.py)
 
-统一使用根目录入口：
+## 当前支持的主工作流
+
+主入口是：
 
 ```bash
 bash mainline.sh <command> ...
@@ -82,57 +97,142 @@ bash mainline.sh <command> ...
 - `eval-fm`
 - `eval-fpo`
 
-### 3.2 `task_profile` 和 `task yaml` 的区别
+但有一个当前分支特有的限制需要明确：
 
-当前仓库里有两层任务身份：
+- `scripted_expert` 采集目前还没有完整接回 `mainline.sh collect`
+- 原因是 [`script/collect_data.py`](script/collect_data.py) 目前只接受 `random|legacy_replay`
+- 所以 `scripted_expert` 请直接调用 [`script/collect_maniskill_data.py`](script/collect_maniskill_data.py)
 
-1. `task_profile`
-   - 运行时默认值和 smoke 数据路径
-   - 定义在 [task_profiles.py](/home/idiot/zhj/RoboTwin/sim/maniskill/task_profiles.py)
-2. `task yaml`
-   - 算法真正读取的 shape、dataset、obs/action 配置
-   - 定义在 `policy/*/diffusion_policy/config/task/*.yaml`
+## 任务配置的两层含义
 
-这两层没有完全合并，原因是为了尽量贴近原 RoboTwin 的显式配置风格。
+当前主线里有两层任务配置，作用不同。
 
-### 3.3 `legacy` 和 `native` 的区别
+### `task profile`
 
-当前 `handover_block` 有两条数据链：
+定义在 [`sim/maniskill/task_profiles.py`](sim/maniskill/task_profiles.py)。
 
-- `legacy`
-  - 来自原 RoboTwin 时代的 handover zarr
-  - 对应 task:
-    - `maniskill_handover_block_task`
-  - 默认数据：
-    - `handover_block-demo_clean-50.zarr`
+它负责：
 
-- `native`
-  - 来自当前 ManiSkill collect/process 流水线
-  - 对应 task:
-    - `maniskill_handover_block_native_task`
-  - 默认数据：
-    - `HandoverBlock-v1-smoke_npz-1.zarr`
+- 运行时默认参数
+- smoke 数据路径
+- `env_id`
+- `shape_meta`
 
-当前最重要的现实判断是：
+当前常用 profile：
 
-- `legacy` 数据可用于预训练 / warm start
-- `native smoke` 目前只够验证链路，不够做真正的 FM 预训练
+- `pickcube_smoke`
+- `handover_block_smoke`
+- `handover_block_native_smoke`
 
-## 4. 当前可用的 task profile
+### task yaml
 
-定义见 [task_profiles.py](/home/idiot/zhj/RoboTwin/sim/maniskill/task_profiles.py)。
+定义在：
 
-| profile | env_id | action / state | 默认数据 | 用途 |
-| --- | --- | --- | --- | --- |
-| `pickcube_smoke` | `PickCube-v1` | `8 / 9` | `PickCube-v1-smoke_npz-1.zarr` | pickcube smoke 验证 |
-| `handover_block_smoke` | `HandoverBlock-v1` | `14 / 14` | `handover_block-demo_clean-50.zarr` | legacy handover 路线 |
-| `handover_block_native_smoke` | `HandoverBlock-v1` | `14 / 14` | `HandoverBlock-v1-smoke_npz-1.zarr` | native smoke 链路验证 |
+- [`policy/FlowMatching/diffusion_policy/config/task/`](policy/FlowMatching/diffusion_policy/config/task)
+- [`policy/FPO/diffusion_policy/config/task/`](policy/FPO/diffusion_policy/config/task)
 
-## 5. 数据与输出路径
+它负责：
 
-### 5.1 原始采集数据
+- 训练阶段真正读取的 `zarr_path`
+- 数据形状
+- 数据集类
 
-ManiSkill collect 默认写到：
+这意味着：
+
+- `task profile` 更偏运行时默认值
+- task yaml 更偏训练配置
+
+对于你自己采出来的新数据，训练时通常应该显式覆盖：
+
+```bash
+task.dataset.zarr_path=/ABS/PATH/TO/YOUR.zarr
+```
+
+而不是依赖默认的 smoke zarr。
+
+## 从采集到训练再到评测
+
+推荐把当前分支理解成四个阶段：
+
+1. 收 raw episode
+2. 处理成 zarr
+3. 训练 FM / FPO
+4. 评测并保存视频
+
+下面按这个顺序说明。
+
+## 1. 数据采集
+
+### 1.1 当前支持的采集模式
+
+[`script/collect_maniskill_data.py`](script/collect_maniskill_data.py) 当前支持：
+
+- `random`
+- `legacy_replay`
+- `scripted_expert`
+
+其中：
+
+- `random`
+  - 只用于链路验证
+- `legacy_replay`
+  - 用 legacy zarr 里的动作序列重放到当前 ManiSkill 环境
+- `scripted_expert`
+  - 当前用于生成 native handover demonstration 的主模式
+
+### 1.2 `scripted_expert` 的推荐入口
+
+可视化调试：
+
+```bash
+cd /path/to/RoboTwin
+CUDA_VISIBLE_DEVICES=3 /home/idiot/anaconda3/envs/zhjrl/bin/python script/collect_maniskill_data.py \
+  HandoverBlock-v1 scripted_expert_npz 1 \
+  --task-profile handover_block_native_smoke \
+  --collector scripted_expert \
+  --seed 0 \
+  --max-episode-steps 800 \
+  --sim-backend physx_cpu \
+  --render-backend sapien_cuda \
+  --render-mode human
+```
+
+无头采集：
+
+```bash
+cd /path/to/RoboTwin
+CUDA_VISIBLE_DEVICES=1 /home/idiot/anaconda3/envs/zhjrl/bin/python script/collect_maniskill_data.py \
+  HandoverBlock-v1 scripted_expert_npz 10 \
+  --task-profile handover_block_native_smoke \
+  --collector scripted_expert \
+  --save-only-success \
+  --seed 0 \
+  --max-episode-steps 800 \
+  --sim-backend physx_cpu \
+  --render-backend sapien_cuda
+```
+
+### 1.3 `episode_num` 现在是什么意思
+
+对 `scripted_expert` 而言：
+
+- `episode_num` 表示最终要保存的成功轨迹数
+- 不是尝试的 seed 数
+
+例如：
+
+```bash
+... scripted_expert_npz 10 --collector scripted_expert --save-only-success ...
+```
+
+表示：
+
+- 会持续尝试新的 seed
+- 直到真的保存出 `10` 条成功 episode
+
+### 1.4 原始数据写到哪里
+
+采集成功后，原始 episode 会写到：
 
 ```text
 data/<env_id>/<task_config>/data/episode*.npz
@@ -141,331 +241,250 @@ data/<env_id>/<task_config>/data/episode*.npz
 例如：
 
 ```text
-data/HandoverBlock-v1/smoke_npz/data/episode0.npz
+data/HandoverBlock-v1/scripted_expert_npz/data/episode0.npz
 ```
 
-### 5.2 处理后的 zarr
+当前 `.npz` 默认包含：
 
-FM 和 FPO 仍然各自维护自己的 zarr 目录：
+- `point_cloud`
+- `agent_pos`
+- `actions`
 
-- FM:
-  - `policy/FlowMatching/data/*.zarr`
-- FPO:
-  - `policy/FPO/data/*.zarr`
+对应实现见：
 
-共享入口只是统一了 `process` 命令，不代表 zarr 输出已经合并。
+- [`sim/maniskill/trajectory_recorder.py`](sim/maniskill/trajectory_recorder.py)
 
-### 5.3 训练日志
+### 1.5 当前推荐的采集后端
 
-Hydra 输出目录仍在各算法目录下：
+对 `scripted_expert`，当前推荐：
 
-- `policy/FlowMatching/data/outputs/...`
-- `policy/FPO/data/outputs/...`
+- `--sim-backend physx_cpu`
+- `--render-backend sapien_cuda`
 
-### 5.4 checkpoint
+原因是：
 
-当前 FM / FPO checkpoint 保存路径是：
+- `physx_cpu` 路径下，当前 motion planning / solver 行为更稳定
+- `physx_cuda` 之前存在 planner 集成不一致的问题
+
+## 2. 数据处理
+
+处理入口统一在：
+
+```bash
+bash mainline.sh process fm ...
+bash mainline.sh process fpo ...
+```
+
+### 2.1 处理成 FM 用的 zarr
+
+```bash
+cd /path/to/RoboTwin
+bash mainline.sh process fm HandoverBlock-v1 scripted_expert_npz 10 --backend maniskill
+```
+
+### 2.2 处理成 FPO 用的 zarr
+
+```bash
+cd /path/to/RoboTwin
+bash mainline.sh process fpo HandoverBlock-v1 scripted_expert_npz 10 --backend maniskill
+```
+
+### 2.3 处理后的输出路径
+
+FM 输出：
 
 ```text
-<repo_root>/checkpoints/...
+policy/FlowMatching/data/HandoverBlock-v1-scripted_expert_npz-10.zarr
 ```
 
-不是：
+FPO 输出：
 
-- `policy/FlowMatching/checkpoints/`
-- `policy/FPO/checkpoints/`
-
-这是当前代码的真实行为，后续如果需要再单独收口。
-
-## 6. 快速开始
-
-### 6.1 ManiSkill collect
-
-推荐写法：
-
-```bash
-bash mainline.sh collect 1 \
-  --backend maniskill \
-  --task-profile handover_block_native_smoke \
-  --episode-num 1 \
-  --max-episode-steps 50 \
-  --sim-backend physx_cuda \
-  --render-backend sapien_cuda
+```text
+policy/FPO/data/HandoverBlock-v1-scripted_expert_npz-10.zarr
 ```
 
-兼容旧写法：
+### 2.4 smoke profile 和真实训练数据的关系
 
-```bash
-bash mainline.sh collect HandoverBlock-v1 smoke_npz 1 \
-  --backend maniskill \
-  --task-profile handover_block_native_smoke \
-  --episode-num 1 \
-  --max-episode-steps 50
+`handover_block_native_smoke` 目前默认仍然指向：
+
+```text
+data/HandoverBlock-v1-smoke_npz-1.zarr
 ```
 
-### 6.2 process
+所以：
 
-推荐写法：
+- smoke profile 适合链路验证
+- 真正训练时，建议显式覆盖成你自己的 zarr 路径
+
+## 3. Flow Matching 训练
+
+Flow Matching 的统一入口：
 
 ```bash
-bash mainline.sh process fm --backend maniskill --task-profile handover_block_native_smoke
-bash mainline.sh process fpo --backend maniskill --task-profile handover_block_native_smoke
+bash mainline.sh train-fm <seed> <gpu_id> --backend maniskill ...
 ```
 
-兼容别名：
+推荐直接使用 handover native preset：
+
+- [`maniskill_fm_handover_native.yaml`](policy/FlowMatching/diffusion_policy/config/maniskill_fm_handover_native.yaml)
+
+示例：
 
 ```bash
-bash mainline.sh process-fm --backend maniskill --task-profile handover_block_native_smoke
-bash mainline.sh process-fpo --backend maniskill --task-profile handover_block_native_smoke
-```
-
-### 6.3 FM 训练
-
-ManiSkill FM 的短写法是：
-
-```bash
-bash mainline.sh train-fm <seed> <gpu_id> \
-  --backend maniskill \
-  [--config-name CONFIG] \
-  -- <hydra overrides>
-```
-
-例如：
-
-```bash
+cd /path/to/RoboTwin
 bash mainline.sh train-fm 42 1 \
   --backend maniskill \
-  -- task=maniskill_handover_block_task \
-     logging.mode=offline \
-     exp_name=handover_block_legacy_fm
+  --config-name maniskill_fm_handover_native \
+  -- task.dataset.zarr_path=/path/to/RoboTwin/policy/FlowMatching/data/HandoverBlock-v1-scripted_expert_npz-10.zarr \
+     logging.mode=offline
 ```
 
-### 6.4 FPO 训练
+说明：
 
-ManiSkill FPO 的短写法是：
+- 这里显式覆盖了 `task.dataset.zarr_path`
+- 这样不会误用默认 smoke 数据
 
-```bash
-bash mainline.sh train-fpo <seed> <gpu_id> [resume_ckpt_path] \
-  --backend maniskill \
-  [--config-name CONFIG] \
-  -- <hydra overrides>
+训练输出默认在：
+
+```text
+data/outputs/<exp_name>_seed<seed>/
 ```
 
-例如：
+checkpoint 默认在：
+
+```text
+checkpoints/
+```
+
+## 4. FPO 训练
+
+FPO 的统一入口：
 
 ```bash
-bash mainline.sh train-fpo 42 1 \
+bash mainline.sh train-fpo <seed> <gpu_id> [resume_ckpt_path] --backend maniskill ...
+```
+
+推荐使用：
+
+- [`maniskill_fpo_handover_native.yaml`](policy/FPO/diffusion_policy/config/maniskill_fpo_handover_native.yaml)
+
+示例：
+
+```bash
+cd /path/to/RoboTwin
+bash mainline.sh train-fpo 42 1 /ABS/PATH/TO/FM.ckpt \
   --backend maniskill \
-  -- task=maniskill_handover_block_native_task \
+  --config-name maniskill_fpo_handover_native \
+  -- task.dataset.zarr_path=/path/to/RoboTwin/policy/FPO/data/HandoverBlock-v1-scripted_expert_npz-10.zarr \
      training.sim_backend=physx_cuda \
      training.render_backend=sapien_cuda \
      logging.mode=offline
 ```
 
-### 6.5 eval
+这里的典型用法是：
 
-FM:
+- 先用 FM 学到一个 behavior prior
+- 再用 FPO 在 ManiSkill 环境里做在线适配
+
+## 5. 评测
+
+评测统一入口：
+
+- `bash mainline.sh eval-fm ...`
+- `bash mainline.sh eval-fpo ...`
+
+### 5.1 评测 FM
 
 ```bash
-bash mainline.sh eval-fm handover_block_smoke 1 \
+cd /path/to/RoboTwin
+bash mainline.sh eval-fm handover_block_native_smoke 1 \
   --backend maniskill \
-  --task-profile handover_block_smoke \
+  --task-profile handover_block_native_smoke \
   --ckpt-path /ABS/PATH/TO/FM.ckpt \
-  --episodes 1 \
-  --max-episode-steps 50
+  --episodes 20 \
+  --max-episode-steps 800 \
+  -- --sim-backend physx_cuda --render-backend sapien_cuda
 ```
 
-FPO:
+### 5.2 评测 FPO
 
 ```bash
+cd /path/to/RoboTwin
 bash mainline.sh eval-fpo handover_block_native_smoke 1 \
   --backend maniskill \
   --task-profile handover_block_native_smoke \
   --ckpt-path /ABS/PATH/TO/FPO.ckpt \
-  --episodes 1 \
-  --max-episode-steps 50 \
+  --episodes 20 \
+  --max-episode-steps 800 \
   -- --sim-backend physx_cuda --render-backend sapien_cuda
 ```
 
-## 7. 当前 handover 推荐工作流
+### 5.3 评测视频保存位置
 
-### 7.1 不推荐的路线
+如果各算法目录下的 `maniskill_eval.yaml` 打开了视频保存，视频会默认写到：
 
-当前不推荐：
-
-- 用 `native smoke` 数据直接做正式 FM 预训练
-
-原因很简单：
-
-- 当前这份 `HandoverBlock-v1-smoke_npz-1.zarr` 只有 1 个 episode、5 步数据
-- 只够验证链路，不够训练
-
-### 7.2 当前推荐路线
-
-当前推荐的训练路线是：
-
-1. 用 `legacy handover` 数据做 FM 预训练
-2. 在当前 ManiSkill handover 环境里做 FPO finetune
-
-也就是：
-
-- `legacy 数据 -> 行为先验`
-- `ManiSkill online RL -> 环境适配`
-
-### 7.3 推荐命令
-
-#### 第一步：FM 预训练，吃 legacy handover 数据
-
-```bash
-cd /home/idiot/zhj/RoboTwin
-bash mainline.sh train-fm 42 1 \
-  --backend maniskill \
-  --config-name maniskill_fm \
-  -- task=maniskill_handover_block_task \
-     dataloader.batch_size=64 \
-     val_dataloader.batch_size=64 \
-     training.num_epochs=3000 \
-     training.gradient_accumulate_every=2 \
-     training.rollout_every=50 \
-     training.checkpoint_every=100 \
-     training.sample_every=5 \
-     logging.mode=offline \
-     exp_name=handover_block_legacy_fm
+```text
+eval_videos/<algo>/<task_label>/<ckpt_parent>-<ckpt_stem>/
 ```
 
-#### 第二步：FPO finetune，运行在当前 ManiSkill 环境
+例如：
 
-```bash
-cd /home/idiot/zhj/RoboTwin
-bash mainline.sh train-fpo 42 1 /ABS/PATH/TO/FM.ckpt \
-  --backend maniskill \
-  --config-name maniskill_fpo_finetune \
-  -- task=maniskill_handover_block_task \
-     training.sim_backend=physx_cuda \
-     training.render_backend=sapien_cuda \
-     logging.mode=offline \
-     exp_name=handover_block_legacy_fpo_finetune
+```text
+eval_videos/flowmatching/handover_block_native_smoke/<ckpt_parent>-<ckpt_stem>/episode0.mp4
 ```
 
-#### 第三步：评估
+## 当前推荐的完整工作流
+
+如果你要从零开始复现实验，建议按这个顺序走：
+
+1. 用 `scripted_expert` 采集 native raw episode
+2. 处理成 FM / FPO 各自的 zarr
+3. 用 FM 先做离线训练
+4. 用 FPO 接着做在线训练
+5. 用 `eval-fm` / `eval-fpo` 评测并录视频
+
+对应命令链大致是：
 
 ```bash
-cd /home/idiot/zhj/RoboTwin
-bash mainline.sh eval-fpo handover_block_smoke 1 \
-  --backend maniskill \
-  --task-profile handover_block_smoke \
-  --ckpt-path /ABS/PATH/TO/FPO.ckpt \
-  --episodes 1 \
-  --max-episode-steps 50 \
-  -- --sim-backend physx_cuda --render-backend sapien_cuda
+python script/collect_maniskill_data.py ...
+bash mainline.sh process fm ...
+bash mainline.sh process fpo ...
+bash mainline.sh train-fm ...
+bash mainline.sh train-fpo ...
+bash mainline.sh eval-fm ...
+bash mainline.sh eval-fpo ...
 ```
 
-## 8. 当前已经验证过的主线
+## 如果你要自己改功能，应该改哪里
 
-当前已经实际验证通过的内容包括：
+按职责分可以这样找文件：
 
-- `HandoverBlock-v1` 能正常 `gym.make / reset / step`
-- `collect -> process -> train-fpo -> eval-fpo` 的 native smoke 闭环已通
-- ManiSkill `sim_backend / render_backend` 已打通
-- FM / FPO / eval / process / collect 的命令入口已经收口
+- 改采集 CLI、seed 遍历方式、保存逻辑
+  - [`script/collect_maniskill_data.py`](script/collect_maniskill_data.py)
+- 改 handover 任务阶段顺序、waypoint、handover 行为
+  - [`sim/maniskill/expert/handover_block_solver.py`](sim/maniskill/expert/handover_block_solver.py)
+- 改 motion primitive、规划 fallback、开合夹爪、撤离逻辑
+  - [`sim/maniskill/expert/primitives.py`](sim/maniskill/expert/primitives.py)
+- 改成功判定、target 容差、是否必须撤离 box
+  - [`sim/maniskill/tasks/handover_block_env.py`](sim/maniskill/tasks/handover_block_env.py)
+- 改 raw `.npz` 落盘内容
+  - [`sim/maniskill/trajectory_recorder.py`](sim/maniskill/trajectory_recorder.py)
+- 改默认 profile 和 smoke 数据路径
+  - [`sim/maniskill/task_profiles.py`](sim/maniskill/task_profiles.py)
 
-但要区分两件事：
+## 当前已知限制
 
-1. 工程链路已通
-2. 策略已经能学会任务
+这几个限制建议在开始前就知道：
 
-前者已经成立，后者目前还没有。
+- `scripted_expert` 目前请直接调用 [`script/collect_maniskill_data.py`](script/collect_maniskill_data.py)
+  - 还没有完整接回 `mainline.sh collect`
+- `handover_block_native_smoke` 默认只指向 smoke zarr
+  - 训练真实模型时请显式覆盖 `task.dataset.zarr_path`
+- `scripted_expert` 当前更推荐 `physx_cpu`
+- 目前分支的重点是 ManiSkill 主线，不是完全复刻上游 RoboTwin 的全部运行方式
 
-## 9. 当前训练相关配置
+## 参考
 
-### 9.1 通用 ManiSkill 配置
-
-- FM:
-  - [maniskill_fm.yaml](/home/idiot/zhj/RoboTwin/policy/FlowMatching/diffusion_policy/config/maniskill_fm.yaml)
-  - [maniskill_fm_base.yaml](/home/idiot/zhj/RoboTwin/policy/FlowMatching/diffusion_policy/config/maniskill_fm_base.yaml)
-- FPO:
-  - [maniskill_fpo.yaml](/home/idiot/zhj/RoboTwin/policy/FPO/diffusion_policy/config/maniskill_fpo.yaml)
-  - [maniskill_fpo_base.yaml](/home/idiot/zhj/RoboTwin/policy/FPO/diffusion_policy/config/maniskill_fpo_base.yaml)
-  - [maniskill_fpo_finetune.yaml](/home/idiot/zhj/RoboTwin/policy/FPO/diffusion_policy/config/maniskill_fpo_finetune.yaml)
-
-### 9.2 当前 handover 专用配置
-
-- FM native 训练 preset:
-  - [maniskill_fm_handover_native.yaml](/home/idiot/zhj/RoboTwin/policy/FlowMatching/diffusion_policy/config/maniskill_fm_handover_native.yaml)
-- FPO native 在线训练 preset:
-  - [maniskill_fpo_handover_native.yaml](/home/idiot/zhj/RoboTwin/policy/FPO/diffusion_policy/config/maniskill_fpo_handover_native.yaml)
-
-这些 config 存在的意义是：
-
-- 减少长串 override
-- 保持 handover 和默认 pickcube 配置解耦
-
-但要注意：
-
-- `maniskill_fm_handover_native.yaml` 当前只是“能跑”的配置
-- 不代表当前 native smoke 数据已经足够支撑真正的 FM 预训练
-
-## 10. Handover 任务当前和原 RoboTwin 的关系
-
-当前 `HandoverBlock-v1` 已经尽量向原任务靠拢：
-
-- 双臂 `UR5-WSG` embodiment
-- `14` 维动作 / `14` 维 `agent_pos`
-- legacy handover 动作语义对齐
-- `box` / `target_box` 尺寸和 reset 范围对齐
-- `box` 姿态随机化已改回“小范围 yaw 扰动”
-- 默认传感器已切到更接近原 `demo_clean` 的 `head_camera`
-
-仍然没有完全逐项复刻的地方包括：
-
-- ManiSkill 固定频率执行模型和原 RoboTwin 时序并不相同
-- 当前没有迁原 RoboTwin scripted handover expert
-- native demonstration 数据还没有建起来
-
-## 11. 常见问题
-
-### 11.1 为什么 `human` 渲染在 GPU 1 上会失败
-
-如果 GPU 1 不是接显示器的卡，`render_mode=human` 会失败。当前更稳的方式是：
-
-- `sim_backend="physx_cuda:1"`
-- `render_backend="sapien_cuda:3"`
-
-也就是：
-
-- 卡 1 跑仿真
-- 卡 3 出窗口
-
-### 11.2 为什么 FM 训练会“立刻结束”
-
-要区分两种情况：
-
-1. 配置没切过去
-   - 例如没传 `--config-name`
-   - 还在用 `maniskill_fm` 默认的 `num_epochs=1`
-2. 数据太少
-   - 当前 native smoke 数据只有 5 步
-   - 大 batch 会导致 dataloader 直接为空
-
-### 11.3 为什么 native smoke 不适合正式 FM 预训练
-
-因为当前它只有 smoke 级数据量，而且 collect 逻辑也不是 expert demonstration。
-
-所以当前更现实的路线是：
-
-- 先用 legacy handover 数据做预训练
-- 再用 ManiSkill FPO finetune 去适配当前环境
-
-## 12. 当前建议
-
-如果你的目标是继续推进训练，而不是再改工程结构，那么当前推荐优先级是：
-
-1. 先跑 `legacy FM pretrain + ManiSkill FPO finetune`
-2. 暂时不要继续用 `native smoke` 作为正式预训练数据
-3. 后面如果要把 native 路线做成正式主线，再单独解决 demonstration 数据来源
-
-如果你的目标是继续改仓库，而不是继续训练，那么下一批更合适的工作会是：
-
-1. checkpoint 路径收口
-2. 文档和命令示例进一步统一
-3. native expert 数据链建设
+- 上游项目说明： [README.md](README.md)
+- ManiSkill 主线入口： [mainline.sh](mainline.sh)
+- 采集入口： [script/collect_maniskill_data.py](script/collect_maniskill_data.py)

@@ -611,6 +611,24 @@ class HandoverBlockSolver:
             if self.ctrl.last_status != "running":
                 return False, self.ctrl.steps_taken, self.ctrl.last_status
 
+            if self.ctrl.move_by_displacement(
+                1,
+                recorder,
+                z=self.RIGHT_RELEASE_LIFT_DISTANCE,
+                move_axis="world",
+                fail_status="right_release_lift_failed",
+            ):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                self.last_debug_info = {
+                    "stage": "right_release_lift",
+                    "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
+                    "right_qpos": np.asarray(self.ctrl.current_qpos(1), dtype=np.float64).round(4).tolist(),
+                    "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                    "plan_debug": dict(self.ctrl.last_plan_debug),
+                }
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
             if self.ctrl.move_to_pose(
                 1,
                 above_target_pose,
@@ -644,9 +662,14 @@ class HandoverBlockSolver:
                 return True, self.ctrl.steps_taken, self.ctrl.last_status
 
             final_info = self.base_env.evaluate()
+            target_fp_pose = self._target_functional_world_pose(1)
             self.last_debug_info = {
                 "stage": "final_success_check",
                 "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                "target_fp_pose": np.asarray(target_fp_pose, dtype=np.float64).round(4).tolist(),
+                "box_to_target_xy": (
+                    np.asarray(self._box_pose(), dtype=np.float64)[:2] - np.asarray(target_fp_pose, dtype=np.float64)[:2]
+                ).round(4).tolist(),
                 "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
                 "left_ee_pose": np.asarray(self.ctrl.current_ee_pose(0), dtype=np.float64).round(4).tolist(),
                 "xy_aligned": bool(to_numpy(final_info["xy_aligned"]).reshape(-1)[0]),

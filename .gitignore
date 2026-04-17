@@ -34,3 +34,6 @@ adjust_bottle_args.yaml
 script/run_adjust_bottle_visual.py
 
 third_party/
+
+# Agents
+AGENTS.md
