@@ -316,6 +316,56 @@ data/HandoverBlock-v1-smoke_npz-1.zarr
 - smoke profile 适合链路验证
 - 真正训练时，建议显式覆盖成你自己的 zarr 路径
 
+### 2.5 生成清洗版 zarr
+
+如果你要先压缩长时间静止片段，再做 FM 预训练，当前推荐直接调用 `process_data.py`。
+
+原因是：
+
+- [`mainline.sh`](mainline.sh) 现在还不能把静止过滤参数继续往下透传
+- 所以 clean zarr 这一步先走 Python 入口更直接
+
+FM clean zarr：
+
+```bash
+cd /path/to/RoboTwin
+/home/idiot/anaconda3/envs/zhjrl/bin/python policy/FlowMatching/process_data.py \
+  --backend maniskill \
+  --filter-static \
+  --static-action-eps 0.05 \
+  --static-state-eps 0.05 \
+  --static-gripper-eps 1e-3 \
+  --static-keep-boundary 2 \
+  HandoverBlock-v1 scripted_expert_npz 50
+```
+
+FPO clean zarr：
+
+```bash
+cd /path/to/RoboTwin
+/home/idiot/anaconda3/envs/zhjrl/bin/python policy/FPO/process_data.py \
+  --backend maniskill \
+  --filter-static \
+  --static-action-eps 0.05 \
+  --static-state-eps 0.05 \
+  --static-gripper-eps 1e-3 \
+  --static-keep-boundary 2 \
+  HandoverBlock-v1 scripted_expert_npz 50
+```
+
+默认会生成：
+
+```text
+policy/FlowMatching/data/HandoverBlock-v1-scripted_expert_npz-50-clean.zarr
+policy/FPO/data/HandoverBlock-v1-scripted_expert_npz-50-clean.zarr
+```
+
+如果你想自定义名字，可以再加：
+
+```bash
+--output-suffix your_tag
+```
+
 ## 3. Flow Matching 训练
 
 Flow Matching 的统一入口：
@@ -482,6 +532,9 @@ bash mainline.sh eval-fpo ...
   - 训练真实模型时请显式覆盖 `task.dataset.zarr_path`
 - `scripted_expert` 当前更推荐 `physx_cpu`
 - 目前分支的重点是 ManiSkill 主线，不是完全复刻上游 RoboTwin 的全部运行方式
+
+## Tips
+- 用physx_cpu采集的数据去训练策略，在验证的时候backend也应该选择physx_cpu
 
 ## 参考
 
