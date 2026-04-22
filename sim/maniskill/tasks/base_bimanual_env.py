@@ -419,6 +419,8 @@ class BaseBimanualEnv(BaseEnv):
             self._set_gripper(parsed_action[:, 6], arm_index=0)
             self._apply_arm_action(self.right_robot, self.right_arm_joints, parsed_action[:, 7:13])
             self._set_gripper(parsed_action[:, 13], arm_index=1)
+            if self.gpu_sim_enabled:
+                self.scene._gpu_apply_all()
 
         self._before_control_step()
         for _ in range(self._sim_steps_per_control):

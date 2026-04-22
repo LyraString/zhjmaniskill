@@ -11,6 +11,9 @@ from core.schemas.observation import Observation
 
 
 DEFAULT_POINT_CLOUD_SIZE = 512
+DEFAULT_POINT_CLOUD_PRIMARY_CAMERA = "head_camera"
+DEFAULT_POINT_CLOUD_CROP_MIN = np.asarray([-0.6, -0.35, 0.7401], dtype=np.float32)
+DEFAULT_POINT_CLOUD_CROP_MAX = np.asarray([0.6, 0.35, 2.0], dtype=np.float32)
 
 
 def _convert_value(value: Any) -> Any:
@@ -52,6 +55,92 @@ def _resize_point_cloud(point_cloud_xyz: np.ndarray, target_points: int) -> np.n
     return np.concatenate([point_cloud_xyz, pad], axis=0).astype(np.float32, copy=False)
 
 
+def _crop_point_cloud(point_cloud_xyz: np.ndarray) -> np.ndarray:
+    if point_cloud_xyz.shape[0] == 0:
+        return point_cloud_xyz.astype(np.float32, copy=False)
+
+    inside_bounds = np.logical_and(
+        point_cloud_xyz >= DEFAULT_POINT_CLOUD_CROP_MIN,
+        point_cloud_xyz <= DEFAULT_POINT_CLOUD_CROP_MAX,
+    ).all(axis=1)
+    return point_cloud_xyz[inside_bounds].astype(np.float32, copy=False)
+
+
+def _farthest_point_sample(point_cloud_xyz: np.ndarray, target_points: int) -> np.ndarray:
+    num_points = point_cloud_xyz.shape[0]
+    if num_points <= target_points:
+        return point_cloud_xyz.astype(np.float32, copy=False)
+
+    sampled = np.empty((target_points, 3), dtype=np.float32)
+    sampled[0] = point_cloud_xyz[0]
+    min_dist_sq = np.sum((point_cloud_xyz - sampled[0]) ** 2, axis=1)
+    farthest_idx = int(np.argmax(min_dist_sq))
+
+    for sample_idx in range(1, target_points):
+        sampled[sample_idx] = point_cloud_xyz[farthest_idx]
+        dist_sq = np.sum((point_cloud_xyz - sampled[sample_idx]) ** 2, axis=1)
+        min_dist_sq = np.minimum(min_dist_sq, dist_sq)
+        farthest_idx = int(np.argmax(min_dist_sq))
+
+    return sampled
+
+
+def _postprocess_point_cloud(point_cloud_xyz: np.ndarray, target_points: int) -> np.ndarray:
+    point_cloud_xyz = np.asarray(point_cloud_xyz, dtype=np.float32).reshape(-1, 3)
+    cropped = _crop_point_cloud(point_cloud_xyz)
+    if cropped.shape[0] == 0:
+        return np.zeros((target_points, 3), dtype=np.float32)
+    sampled = _farthest_point_sample(cropped, target_points)
+    return _resize_point_cloud(sampled, target_points)
+
+
+def _extract_world_xyz_from_camera(
+    images: Mapping[str, Any],
+    cam_param: Mapping[str, Any],
+) -> np.ndarray | None:
+    if "position" not in images:
+        return None
+    if "cam2world_gl" not in cam_param:
+        return None
+
+    position = np.asarray(images["position"], dtype=np.float32)
+    cam2world = np.asarray(cam_param["cam2world_gl"], dtype=np.float32)
+    segmentation = images.get("segmentation")
+
+    if position.ndim >= 4 and position.shape[0] == 1:
+        position = position[0]
+    if cam2world.ndim == 3 and cam2world.shape[0] == 1:
+        cam2world = cam2world[0]
+    if segmentation is not None:
+        segmentation = np.asarray(segmentation)
+        if segmentation.ndim >= 4 and segmentation.shape[0] == 1:
+            segmentation = segmentation[0]
+
+    if position.shape[-1] < 3:
+        return None
+
+    position_xyz = position[..., :3] / 1000.0
+    if position.shape[-1] >= 4:
+        valid = position[..., 3] < 1.0
+    elif segmentation is not None:
+        valid = segmentation != 0
+    else:
+        valid = np.ones(position_xyz.shape[:-1], dtype=bool)
+
+    points_xyzw = np.concatenate(
+        [
+            position_xyz.reshape(-1, 3),
+            valid.reshape(-1, 1).astype(np.float32),
+        ],
+        axis=-1,
+    )
+    world_xyzw = points_xyzw @ cam2world.T
+    xyz = world_xyzw[world_xyzw[:, 3] > 0, :3]
+    if xyz.shape[0] == 0:
+        return None
+    return xyz.astype(np.float32, copy=False)
+
+
 def _extract_point_cloud_from_sensor_data(
     payload: Mapping[str, Any],
     target_points: int = DEFAULT_POINT_CLOUD_SIZE,
@@ -61,52 +150,36 @@ def _extract_point_cloud_from_sensor_data(
     if not isinstance(sensor_data, Mapping) or not isinstance(sensor_param, Mapping):
         return None
 
+    head_images = sensor_data.get(DEFAULT_POINT_CLOUD_PRIMARY_CAMERA)
+    head_param = sensor_param.get(DEFAULT_POINT_CLOUD_PRIMARY_CAMERA)
+    if isinstance(head_images, Mapping) and isinstance(head_param, Mapping):
+        head_xyz = _extract_world_xyz_from_camera(head_images, head_param)
+        if head_xyz is not None:
+            return _postprocess_point_cloud(head_xyz, target_points)
+
     point_sets: list[np.ndarray] = []
     for cam_uid, images in sensor_data.items():
         if not isinstance(images, Mapping):
             continue
-        if "position" not in images or "segmentation" not in images:
-            continue
         cam_param = sensor_param.get(cam_uid)
-        if not isinstance(cam_param, Mapping) or "cam2world_gl" not in cam_param:
+        if not isinstance(cam_param, Mapping):
             continue
-
-        position = np.asarray(images["position"], dtype=np.float32)
-        segmentation = np.asarray(images["segmentation"])
-        cam2world = np.asarray(cam_param["cam2world_gl"], dtype=np.float32)
-
-        if position.ndim >= 4 and position.shape[0] == 1:
-            position = position[0]
-        if segmentation.ndim >= 4 and segmentation.shape[0] == 1:
-            segmentation = segmentation[0]
-        if cam2world.ndim == 3 and cam2world.shape[0] == 1:
-            cam2world = cam2world[0]
-
-        if position.shape[-1] < 3:
-            continue
-
-        position_xyz = position[..., :3] / 1000.0
-        valid = np.asarray(segmentation != 0).reshape(-1)
-        xyzw = np.concatenate(
-            [
-                position_xyz.reshape(-1, 3),
-                valid[:, None].astype(np.float32),
-            ],
-            axis=-1,
-        )
-        world_xyzw = xyzw @ cam2world.T
-        xyz = world_xyzw[world_xyzw[:, 3] > 0, :3]
-        if xyz.shape[0] > 0:
-            point_sets.append(xyz.astype(np.float32, copy=False))
+        xyz = _extract_world_xyz_from_camera(images, cam_param)
+        if xyz is not None:
+            point_sets.append(xyz)
 
     if not point_sets:
         return None
 
     merged = np.concatenate(point_sets, axis=0)
-    return _resize_point_cloud(merged, target_points)
+    return _postprocess_point_cloud(merged, target_points)
 
 
 def _extract_point_cloud(payload: Mapping[str, Any], target_points: int = DEFAULT_POINT_CLOUD_SIZE) -> np.ndarray | None:
+    point_cloud = _extract_point_cloud_from_sensor_data(payload, target_points=target_points)
+    if point_cloud is not None:
+        return point_cloud
+
     pointcloud = payload.get("pointcloud")
     if isinstance(pointcloud, Mapping) and "xyzw" in pointcloud:
         xyzw = _squeeze_single_env(pointcloud["xyzw"])
@@ -116,17 +189,13 @@ def _extract_point_cloud(payload: Mapping[str, Any], target_points: int = DEFAUL
             xyz = xyzw[valid, :3]
         else:
             xyz = xyzw[:, :3]
-        return _resize_point_cloud(xyz, target_points)
+        return _postprocess_point_cloud(xyz, target_points)
     if pointcloud is not None:
-        return _to_xyz(_squeeze_single_env(pointcloud))
+        return _postprocess_point_cloud(_to_xyz(_squeeze_single_env(pointcloud)), target_points)
 
     point_cloud = payload.get("point_cloud")
     if point_cloud is not None:
-        return _to_xyz(_squeeze_single_env(point_cloud))
-
-    point_cloud = _extract_point_cloud_from_sensor_data(payload, target_points=target_points)
-    if point_cloud is not None:
-        return point_cloud
+        return _postprocess_point_cloud(_to_xyz(_squeeze_single_env(point_cloud)), target_points)
 
     return None
 

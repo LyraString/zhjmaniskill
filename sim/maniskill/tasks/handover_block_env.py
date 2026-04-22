@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Any
-
 import sapien
 import torch
 from mani_skill.utils.registration import register_env
@@ -70,12 +69,29 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         super()._initialize_episode(env_idx, options)
         with torch.device(self.device):
             b = len(env_idx)
+            episode_rng = self._batched_episode_rng[env_idx]
 
-            box_xyz = torch.zeros((b, 3), device=self.device)
-            box_xyz[:, 0] = -0.25 + torch.rand((b,), device=self.device) * 0.20
-            box_xyz[:, 1] = torch.rand((b,), device=self.device) * 0.25
+            box_x = torch.as_tensor(
+                episode_rng.uniform(-0.25, -0.05),
+                device=self.device,
+                dtype=torch.float32,
+            ).reshape(b)
+            box_y = torch.as_tensor(
+                episode_rng.uniform(0.0, 0.25),
+                device=self.device,
+                dtype=torch.float32,
+            ).reshape(b)
+            yaw = torch.as_tensor(
+                episode_rng.uniform(-BOX_YAW_LIMIT, BOX_YAW_LIMIT),
+                device=self.device,
+                dtype=torch.float32,
+            ).reshape(b)
+
+            box_xyz = torch.zeros((b, 3), device=self.device, dtype=torch.float32)
+            box_xyz[:, 0] = box_x
+            box_xyz[:, 1] = box_y
             box_xyz[:, 2] = BOX_CENTER_Z
-            yaw = (torch.rand((b,), device=self.device) * 2.0 - 1.0) * BOX_YAW_LIMIT
+
             yaw_half = yaw / 2.0
             yaw_q = torch.stack(
                 [
@@ -91,9 +107,20 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             box_q = box_q / torch.linalg.norm(box_q, dim=-1, keepdim=True)
             self.box.set_pose(Pose.create_from_pq(p=box_xyz, q=box_q))
 
-            target_xyz = torch.zeros((b, 3), device=self.device)
-            target_xyz[:, 0] = 0.10 + torch.rand((b,), device=self.device) * 0.15
-            target_xyz[:, 1] = 0.15 + torch.rand((b,), device=self.device) * 0.05
+            target_x = torch.as_tensor(
+                episode_rng.uniform(0.10, 0.25),
+                device=self.device,
+                dtype=torch.float32,
+            ).reshape(b)
+            target_y = torch.as_tensor(
+                episode_rng.uniform(0.15, 0.20),
+                device=self.device,
+                dtype=torch.float32,
+            ).reshape(b)
+
+            target_xyz = torch.zeros((b, 3), device=self.device, dtype=torch.float32)
+            target_xyz[:, 0] = target_x
+            target_xyz[:, 1] = target_y
             target_xyz[:, 2] = TARGET_CENTER_Z
             self.target_box.set_pose(Pose.create_from_pq(p=target_xyz))
 

@@ -1,0 +1,20 @@
+defaults:
+  - maniskill_fm_base
+  - task: maniskill_handover_block_native_teacher_task
+  - _self_
+
+name: maniskill_fm_handover_native_teacher
+exp_name: handover_block_native_teacher_fm
+
+dataloader:
+  batch_size: 128
+
+val_dataloader:
+  batch_size: 128
+
+training:
+  num_epochs: 3000
+  gradient_accumulate_every: 2
+  rollout_every: 50
+  checkpoint_every: 100
+  sample_every: 5

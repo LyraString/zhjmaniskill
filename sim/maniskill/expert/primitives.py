@@ -25,6 +25,7 @@ class GraspCandidate:
     grasp_pose: np.ndarray
     pre_plan: dict[str, Any]
     grasp_plan: dict[str, Any]
+    grasp_plan_source: str
     score: float
     top_down_score: float
     side_score: float
@@ -108,6 +109,8 @@ class FixedRateMotionPrimitives:
     GRIPPER_SETTLE_STEPS = 18
     RELEASE_SETTLE_STEPS = 12
     HOLD_SETTLE_STEPS = 6
+    INITIAL_GRIPPER_SETTLE_STEPS = 30
+    GRIPPER_JOINT_SETTLE_EPS = 0.02
     PLANNER_TIME = 0.35
 
     def __init__(self, env_backend):
@@ -121,6 +124,7 @@ class FixedRateMotionPrimitives:
         self.last_status = "not_started"
         self.last_grasp_attempts: list[dict[str, Any]] = []
         self.last_plan_debug: dict[str, Any] = {}
+        self.success_detection_enabled = True
         self.commanded_arm_qpos = {
             0: np.zeros(self.base_env.ARM_DOF, dtype=np.float64),
             1: np.zeros(self.base_env.ARM_DOF, dtype=np.float64),
@@ -138,12 +142,23 @@ class FixedRateMotionPrimitives:
         if getattr(self.backend, "render_mode", None) == "human":
             self.backend.render()
 
+    def sync_sim_state(self) -> None:
+        scene = getattr(self.base_env, "scene", None)
+        if scene is None:
+            return
+        if not getattr(self.base_env, "gpu_sim_enabled", False):
+            return
+        if hasattr(scene, "_gpu_sim_initialized") and not getattr(scene, "_gpu_sim_initialized"):
+            return
+        scene._gpu_fetch_all()
+
     def reset_episode(self, max_episode_steps: int) -> None:
         self.steps_taken = 0
         self.step_limit = int(max_episode_steps)
         self.last_status = "running"
         self.last_grasp_attempts = []
         self.last_plan_debug = {}
+        self.sync_sim_state()
         self.commanded_arm_qpos[0] = self.current_qpos(0).copy()
         self.commanded_arm_qpos[1] = self.current_qpos(1).copy()
         self.commanded_gripper[0] = self.current_gripper_value(0)
@@ -196,24 +211,45 @@ class FixedRateMotionPrimitives:
         return np.concatenate([gripper_pose_pos, gripper_pose_quat], axis=0).astype(np.float64, copy=False)
 
     def current_qpos(self, arm_index: int) -> np.ndarray:
+        self.sync_sim_state()
         return self.base_env.get_arm_joint_positions(arm_index)
 
     def current_full_qpos(self, arm_index: int) -> np.ndarray:
+        self.sync_sim_state()
         return self.base_env.get_arm_full_joint_positions(arm_index)
 
     def current_ee_pose(self, arm_index: int) -> np.ndarray:
+        self.sync_sim_state()
         return self.base_env.get_arm_end_effector_pose_array(arm_index)
 
     def current_gripper_pose(self, arm_index: int) -> np.ndarray:
         return self.planner_pose_to_gripper_pose(arm_index, self.current_ee_pose(arm_index))
 
     def current_gripper_value(self, arm_index: int) -> float:
+        self.sync_sim_state()
         value = self.base_env.get_left_gripper_val() if arm_index == 0 else self.base_env.get_right_gripper_val()
         if isinstance(value, (float, int)):
             return float(value)
         return float(to_numpy(value).reshape(-1)[0])
 
+    def current_gripper_joint_qpos(self, arm_index: int) -> np.ndarray:
+        joints = self.base_env.left_gripper if arm_index == 0 else self.base_env.right_gripper
+        full_qpos = self.current_full_qpos(arm_index)
+        start = self.base_env.ARM_DOF
+        end = start + len(joints)
+        return np.asarray(full_qpos[start:end], dtype=np.float64).copy()
+
+    def target_gripper_joint_qpos(self, arm_index: int, gripper_value: float) -> np.ndarray:
+        gripper_scale = self.base_env.embodiment_spec.gripper_scale(arm_index)
+        real_gripper_val = float(gripper_scale[0]) + float(gripper_value) * float(gripper_scale[1] - gripper_scale[0])
+        joints = self.base_env.left_gripper if arm_index == 0 else self.base_env.right_gripper
+        return np.asarray(
+            [real_gripper_val * float(sign) + float(offset) for _, sign, offset in joints],
+            dtype=np.float64,
+        )
+
     def current_success(self) -> bool:
+        self.sync_sim_state()
         info = self.base_env.evaluate()
         return scalar_bool(info["success"])
 
@@ -259,7 +295,7 @@ class FixedRateMotionPrimitives:
         recorder.append_step(action, dict(result.observation.data))
         self.steps_taken += 1
         self.maybe_render()
-        success = scalar_bool(result.info.get("success", False))
+        success = self.success_detection_enabled and scalar_bool(result.info.get("success", False))
         return result, success
 
     def _execute_plan(self, arm_index: int, plan_result: dict[str, Any], recorder) -> bool:
@@ -270,6 +306,33 @@ class FixedRateMotionPrimitives:
                 action = self.compose_action(left_qpos=arm_qpos)
             else:
                 action = self.compose_action(right_qpos=arm_qpos)
+            result, success = self._step_and_record(action, recorder)
+            if success:
+                self.last_status = "success"
+                return True
+            if result.terminated or result.truncated:
+                self.last_status = "terminated_during_plan"
+                return False
+        return False
+
+    def execute_plan(self, arm_index: int, plan_result: dict[str, Any], recorder) -> bool:
+        return self._execute_plan(arm_index, plan_result, recorder)
+
+    def execute_plan_with_gripper(
+        self,
+        arm_index: int,
+        plan_result: dict[str, Any],
+        recorder,
+        *,
+        gripper: float | None = None,
+    ) -> bool:
+        positions = np.asarray(plan_result["position"], dtype=np.float64)
+        for qpos in positions:
+            arm_qpos = self._arm_qpos_from_plan(qpos)
+            if arm_index == 0:
+                action = self.compose_action(left_qpos=arm_qpos, left_gripper=gripper)
+            else:
+                action = self.compose_action(right_qpos=arm_qpos, right_gripper=gripper)
             result, success = self._step_and_record(action, recorder)
             if success:
                 self.last_status = "success"
@@ -299,6 +362,49 @@ class FixedRateMotionPrimitives:
                 return False
         return False
 
+    def settle_grippers_to_targets(
+        self,
+        recorder,
+        *,
+        left_target: float | None = None,
+        right_target: float | None = None,
+        max_steps: int | None = None,
+        joint_eps: float | None = None,
+        fail_status: str | None = None,
+        allow_success_early: bool = False,
+    ) -> bool:
+        max_steps = self.INITIAL_GRIPPER_SETTLE_STEPS if max_steps is None else int(max_steps)
+        joint_eps = self.GRIPPER_JOINT_SETTLE_EPS if joint_eps is None else float(joint_eps)
+        left_joint_target = None if left_target is None else self.target_gripper_joint_qpos(0, left_target)
+        right_joint_target = None if right_target is None else self.target_gripper_joint_qpos(1, right_target)
+
+        for _ in range(max_steps):
+            action = self.compose_action(left_gripper=left_target, right_gripper=right_target)
+            result, success = self._step_and_record(action, recorder)
+            if success and allow_success_early:
+                self.last_status = "success"
+                return True
+            if result.terminated or result.truncated:
+                self.last_status = "terminated_during_gripper_settle"
+                return False
+
+            left_ready = True
+            if left_joint_target is not None:
+                left_ready = np.all(
+                    np.abs(self.current_gripper_joint_qpos(0) - left_joint_target) <= joint_eps
+                )
+            right_ready = True
+            if right_joint_target is not None:
+                right_ready = np.all(
+                    np.abs(self.current_gripper_joint_qpos(1) - right_joint_target) <= joint_eps
+                )
+            if left_ready and right_ready:
+                return False
+
+        if fail_status is not None:
+            self.last_status = fail_status
+        return False
+
     def plan_to_pose(self, arm_index: int, target_pose: np.ndarray, *, start_qpos: np.ndarray | None = None) -> dict[str, Any] | None:
         result, _reason = self.plan_to_pose_debug(arm_index, target_pose, start_qpos=start_qpos)
         return result
@@ -311,6 +417,7 @@ class FixedRateMotionPrimitives:
         start_qpos: np.ndarray | None = None,
     ) -> tuple[dict[str, Any] | None, str]:
         planner = self.planners[arm_index]
+        self.sync_sim_state()
         current_qpos = self.current_full_qpos(arm_index) if start_qpos is None else np.asarray(start_qpos, dtype=np.float64)
         current_qpos = planner.pad_qpos(current_qpos.copy())
         try:
@@ -328,6 +435,40 @@ class FixedRateMotionPrimitives:
             return None, f"status:{status}"
         return result, "success"
 
+    def ik_to_pose_debug(
+        self,
+        arm_index: int,
+        target_pose: np.ndarray,
+        *,
+        start_qpos: np.ndarray | None = None,
+        n_init_qpos: int = 20,
+        threshold: float = 1e-3,
+    ) -> tuple[np.ndarray | None, str]:
+        planner = self.planners[arm_index]
+        self.sync_sim_state()
+        current_qpos = self.current_full_qpos(arm_index) if start_qpos is None else np.asarray(start_qpos, dtype=np.float64)
+        current_qpos = planner.pad_qpos(current_qpos.copy())
+        goal_pose = planner.transform_goal_to_wrt_base(np.asarray(target_pose, dtype=np.float64))
+        try:
+            status, results = planner.IK(
+                goal_pose,
+                current_qpos,
+                n_init_qpos=int(n_init_qpos),
+                threshold=float(threshold),
+            )
+        except Exception as exc:
+            return None, f"exception:{type(exc).__name__}:{exc}"
+        if status != "Success" or len(results) == 0:
+            return None, f"status:{status}"
+        move_group_indices = np.asarray(planner.move_group_joint_indices, dtype=np.int64)
+        best_qpos = min(
+            results,
+            key=lambda qpos: float(
+                np.linalg.norm(np.asarray(qpos, dtype=np.float64)[move_group_indices] - current_qpos[move_group_indices])
+            ),
+        )
+        return np.asarray(best_qpos, dtype=np.float64), "success"
+
     def plan_screw_to_pose(self, arm_index: int, target_pose: np.ndarray, *, start_qpos: np.ndarray | None = None) -> dict[str, Any] | None:
         result, _reason = self.plan_screw_to_pose_debug(arm_index, target_pose, start_qpos=start_qpos)
         return result
@@ -340,6 +481,7 @@ class FixedRateMotionPrimitives:
         start_qpos: np.ndarray | None = None,
     ) -> tuple[dict[str, Any] | None, str]:
         planner = self.planners[arm_index]
+        self.sync_sim_state()
         current_qpos = self.current_full_qpos(arm_index) if start_qpos is None else np.asarray(start_qpos, dtype=np.float64)
         current_qpos = planner.pad_qpos(current_qpos.copy())
         try:
@@ -417,6 +559,98 @@ class FixedRateMotionPrimitives:
             fail_status=fail_status,
         )
 
+    def move_by_displacement_via_ik(
+        self,
+        arm_index: int,
+        recorder,
+        *,
+        x: float = 0.0,
+        y: float = 0.0,
+        z: float = 0.0,
+        quat: np.ndarray | None = None,
+        move_axis: str = "world",
+        steps: int = 10,
+        settle_steps: int = 8,
+        fail_status: str,
+    ) -> bool:
+        target_pose = self.current_ee_pose(arm_index).copy()
+        if move_axis == "world":
+            target_pose[:3] += np.asarray([x, y, z], dtype=np.float64)
+        else:
+            dir_vec = pose_to_matrix(target_pose)[:3, 0]
+            dir_vec /= np.linalg.norm(dir_vec)
+            target_pose[:3] += -z * dir_vec
+        if quat is not None:
+            target_pose[3:] = np.asarray(quat, dtype=np.float64).reshape(4)
+
+        ik_qpos, ik_reason = self.ik_to_pose_debug(arm_index, target_pose)
+        if ik_qpos is None:
+            self.last_plan_debug = {
+                "arm_index": int(arm_index),
+                "target_pose": np.asarray(target_pose, dtype=np.float64).round(4).tolist(),
+                "move_axis": str(move_axis),
+                "ik_reason": ik_reason,
+                "steps": int(steps),
+                "settle_steps": int(settle_steps),
+            }
+            self.last_status = fail_status
+            return False
+
+        self.last_plan_debug = {
+            "arm_index": int(arm_index),
+            "target_pose": np.asarray(target_pose, dtype=np.float64).round(4).tolist(),
+            "target_arm_qpos": self._arm_qpos_from_plan(ik_qpos).round(4).tolist(),
+            "move_axis": str(move_axis),
+            "ik_reason": ik_reason,
+            "steps": int(steps),
+            "settle_steps": int(settle_steps),
+        }
+        return self.move_to_qpos(
+            arm_index,
+            self._arm_qpos_from_plan(ik_qpos),
+            recorder,
+            steps=steps,
+            settle_steps=settle_steps,
+        )
+
+    def move_to_qpos(
+        self,
+        arm_index: int,
+        target_qpos: np.ndarray,
+        recorder,
+        *,
+        steps: int = 25,
+        settle_steps: int = 0,
+    ) -> bool:
+        start_qpos = self.current_qpos(arm_index)
+        target_qpos = np.asarray(target_qpos, dtype=np.float64).reshape(start_qpos.shape)
+        trajectory = np.linspace(start_qpos, target_qpos, num=int(steps)).astype(np.float64, copy=False)
+        for qpos in trajectory:
+            if arm_index == 0:
+                action = self.compose_action(left_qpos=qpos)
+            else:
+                action = self.compose_action(right_qpos=qpos)
+            result, success = self._step_and_record(action, recorder)
+            if success:
+                self.last_status = "success"
+                return True
+            if result.terminated or result.truncated:
+                self.last_status = "terminated_during_qpos_move"
+                return False
+        for _ in range(int(settle_steps)):
+            if arm_index == 0:
+                action = self.compose_action(left_qpos=target_qpos)
+            else:
+                action = self.compose_action(right_qpos=target_qpos)
+            result, success = self._step_and_record(action, recorder)
+            if success:
+                self.last_status = "success"
+                return True
+            if result.terminated or result.truncated:
+                self.last_status = "terminated_during_qpos_move"
+                return False
+        return False
+
     def back_to_origin(self, arm_index: int, recorder, *, fail_status: str) -> bool:
         target_qpos = self.base_env.get_arm_home_joint_positions(arm_index)
         steps = np.linspace(self.current_qpos(arm_index), target_qpos, num=25).astype(np.float64, copy=False)
@@ -488,6 +722,11 @@ class FixedRateMotionPrimitives:
         pre_pose_candidates_builder: Callable[[np.ndarray, int, float, int], list[np.ndarray]] | None = None,
         selection_mode: str = "auto",
     ) -> GraspCandidate | None:
+        self.sync_sim_state()
+
+        def pose_list(value: np.ndarray) -> list[float]:
+            return np.asarray(value, dtype=np.float64).round(4).tolist()
+
         def better_candidate(
             lhs: GraspCandidate | None,
             rhs: GraspCandidate | None,
@@ -519,6 +758,9 @@ class FixedRateMotionPrimitives:
 
         current_qpos = self.current_full_qpos(arm_index)
         current_arm_qpos = self.current_qpos(arm_index)
+        current_ee_pose = self.current_ee_pose(arm_index)
+        current_gripper_pose = self.current_gripper_pose(arm_index)
+        planner_base_pose = self.base_env.get_arm_root_pose_array(arm_index)
         best: GraspCandidate | None = None
         best_top_down: GraspCandidate | None = None
         best_side: GraspCandidate | None = None
@@ -542,6 +784,14 @@ class FixedRateMotionPrimitives:
                         {
                             "contact_id": int(contact_id),
                             "variant_index": int(variant_index),
+                            "pre_pose": pose_list(pre_pose),
+                            "planner_pre_pose": pose_list(planner_pre_pose),
+                            "grasp_pose": pose_list(grasp_pose),
+                            "planner_grasp_pose": pose_list(planner_grasp_pose),
+                            "desired_pose": pose_list(desired_pose),
+                            "current_ee_pose": pose_list(current_ee_pose),
+                            "current_gripper_pose": pose_list(current_gripper_pose),
+                            "planner_base_pose": pose_list(planner_base_pose),
                             "pre_reason": pre_reason,
                             "grasp_reason": None,
                         }
@@ -553,19 +803,31 @@ class FixedRateMotionPrimitives:
                     planner_grasp_pose,
                     start_qpos=next_qpos,
                 )
+                grasp_plan_source = "screw"
                 if grasp_plan is None:
                     grasp_plan, grasp_reason = self.plan_to_pose_debug(
                         arm_index,
                         planner_grasp_pose,
                         start_qpos=next_qpos,
                     )
+                    if grasp_plan is not None:
+                        grasp_plan_source = "pose_fallback"
                 if grasp_plan is None:
                     attempts.append(
                         {
                             "contact_id": int(contact_id),
                             "variant_index": int(variant_index),
+                            "pre_pose": pose_list(pre_pose),
+                            "planner_pre_pose": pose_list(planner_pre_pose),
+                            "grasp_pose": pose_list(grasp_pose),
+                            "planner_grasp_pose": pose_list(planner_grasp_pose),
+                            "desired_pose": pose_list(desired_pose),
+                            "current_ee_pose": pose_list(current_ee_pose),
+                            "current_gripper_pose": pose_list(current_gripper_pose),
+                            "planner_base_pose": pose_list(planner_base_pose),
                             "pre_reason": pre_reason,
                             "grasp_reason": grasp_reason,
+                            "grasp_plan_source": None,
                         }
                     )
                     continue
@@ -575,6 +837,7 @@ class FixedRateMotionPrimitives:
                     grasp_pose=grasp_pose,
                     pre_plan=pre_plan,
                     grasp_plan=grasp_plan,
+                    grasp_plan_source=grasp_plan_source,
                     score=0.0,
                     top_down_score=(
                         quat_distance(grasp_pose[3:], preferred_top_down_quat)
@@ -605,8 +868,17 @@ class FixedRateMotionPrimitives:
                     {
                         "contact_id": int(contact_id),
                         "variant_index": int(variant_index),
+                        "pre_pose": pose_list(pre_pose),
+                        "planner_pre_pose": pose_list(planner_pre_pose),
+                        "grasp_pose": pose_list(grasp_pose),
+                        "planner_grasp_pose": pose_list(planner_grasp_pose),
+                        "desired_pose": pose_list(desired_pose),
+                        "current_ee_pose": pose_list(current_ee_pose),
+                        "current_gripper_pose": pose_list(current_gripper_pose),
+                        "planner_base_pose": pose_list(planner_base_pose),
                         "pre_reason": pre_reason,
                         "grasp_reason": grasp_reason,
+                        "grasp_plan_source": grasp_plan_source,
                     }
                 )
             if best_for_contact is None:

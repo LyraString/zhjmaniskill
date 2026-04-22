@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher-zarr-path", type=str, default=None)
     parser.add_argument("--teacher-seed-path", type=str, default=None)
     parser.add_argument("--save-only-success", action="store_true")
+    parser.add_argument("--debug-scripted-expert", action="store_true")
     return parser
 
 
@@ -198,6 +199,8 @@ def run_collection(args) -> None:
                             f"skipped scripted_expert attempt={attempted_episode_idx} "
                             f"(seed={reset_seed}, length=0, success={int(success)}, status={status})"
                         )
+                    if args.debug_scripted_expert and getattr(solver, "first_pick_debug", None):
+                        print("scripted_expert_pick_debug=" + json.dumps(solver.first_pick_debug, ensure_ascii=False))
                     if (not success) and getattr(solver, "last_debug_info", None):
                         print("scripted_expert_debug=" + json.dumps(solver.last_debug_info, ensure_ascii=False))
                 else:
@@ -205,6 +208,8 @@ def run_collection(args) -> None:
                         f"skipped scripted_expert attempt={attempted_episode_idx} "
                         f"(seed={reset_seed}, length={episode_length}, success=0, status={status})"
                     )
+                    if args.debug_scripted_expert and getattr(solver, "first_pick_debug", None):
+                        print("scripted_expert_pick_debug=" + json.dumps(solver.first_pick_debug, ensure_ascii=False))
                     if getattr(solver, "last_debug_info", None):
                         print("scripted_expert_debug=" + json.dumps(solver.last_debug_info, ensure_ascii=False))
                 attempted_episode_idx += 1
