@@ -14,6 +14,9 @@ DEFAULT_POINT_CLOUD_SIZE = 512
 DEFAULT_POINT_CLOUD_PRIMARY_CAMERA = "head_camera"
 DEFAULT_POINT_CLOUD_CROP_MIN = np.asarray([-0.6, -0.35, 0.7401], dtype=np.float32)
 DEFAULT_POINT_CLOUD_CROP_MAX = np.asarray([0.6, 0.35, 2.0], dtype=np.float32)
+ENV_POINT_CLOUD_EXCLUDED_SEG_IDS: dict[str, tuple[int, ...]] = {
+    "HandoverBlock-v1": (3,),
+}
 
 
 def _convert_value(value: Any) -> Any:
@@ -94,9 +97,31 @@ def _postprocess_point_cloud(point_cloud_xyz: np.ndarray, target_points: int) ->
     return _resize_point_cloud(sampled, target_points)
 
 
+def _filter_segmentation_ids(
+    xyz: np.ndarray,
+    segmentation: np.ndarray | None,
+    *,
+    env_id: str | None,
+) -> np.ndarray:
+    if segmentation is None or env_id is None:
+        return xyz
+
+    excluded_seg_ids = ENV_POINT_CLOUD_EXCLUDED_SEG_IDS.get(env_id)
+    if not excluded_seg_ids:
+        return xyz
+
+    seg_flat = np.asarray(segmentation).reshape(-1)
+    keep = ~np.isin(seg_flat, np.asarray(excluded_seg_ids, dtype=seg_flat.dtype))
+    if not np.any(keep):
+        return xyz
+    return xyz[keep]
+
+
 def _extract_world_xyz_from_camera(
     images: Mapping[str, Any],
     cam_param: Mapping[str, Any],
+    *,
+    env_id: str | None,
 ) -> np.ndarray | None:
     if "position" not in images:
         return None
@@ -138,12 +163,21 @@ def _extract_world_xyz_from_camera(
     xyz = world_xyzw[world_xyzw[:, 3] > 0, :3]
     if xyz.shape[0] == 0:
         return None
+    xyz = _filter_segmentation_ids(
+        xyz,
+        segmentation.reshape(-1) if segmentation is not None else None,
+        env_id=env_id,
+    )
+    if xyz.shape[0] == 0:
+        return None
     return xyz.astype(np.float32, copy=False)
 
 
 def _extract_point_cloud_from_sensor_data(
     payload: Mapping[str, Any],
     target_points: int = DEFAULT_POINT_CLOUD_SIZE,
+    *,
+    env_id: str | None = None,
 ) -> np.ndarray | None:
     sensor_data = payload.get("sensor_data")
     sensor_param = payload.get("sensor_param")
@@ -153,7 +187,7 @@ def _extract_point_cloud_from_sensor_data(
     head_images = sensor_data.get(DEFAULT_POINT_CLOUD_PRIMARY_CAMERA)
     head_param = sensor_param.get(DEFAULT_POINT_CLOUD_PRIMARY_CAMERA)
     if isinstance(head_images, Mapping) and isinstance(head_param, Mapping):
-        head_xyz = _extract_world_xyz_from_camera(head_images, head_param)
+        head_xyz = _extract_world_xyz_from_camera(head_images, head_param, env_id=env_id)
         if head_xyz is not None:
             return _postprocess_point_cloud(head_xyz, target_points)
 
@@ -164,7 +198,7 @@ def _extract_point_cloud_from_sensor_data(
         cam_param = sensor_param.get(cam_uid)
         if not isinstance(cam_param, Mapping):
             continue
-        xyz = _extract_world_xyz_from_camera(images, cam_param)
+        xyz = _extract_world_xyz_from_camera(images, cam_param, env_id=env_id)
         if xyz is not None:
             point_sets.append(xyz)
 
@@ -175,8 +209,17 @@ def _extract_point_cloud_from_sensor_data(
     return _postprocess_point_cloud(merged, target_points)
 
 
-def _extract_point_cloud(payload: Mapping[str, Any], target_points: int = DEFAULT_POINT_CLOUD_SIZE) -> np.ndarray | None:
-    point_cloud = _extract_point_cloud_from_sensor_data(payload, target_points=target_points)
+def _extract_point_cloud(
+    payload: Mapping[str, Any],
+    target_points: int = DEFAULT_POINT_CLOUD_SIZE,
+    *,
+    env_id: str | None = None,
+) -> np.ndarray | None:
+    point_cloud = _extract_point_cloud_from_sensor_data(
+        payload,
+        target_points=target_points,
+        env_id=env_id,
+    )
     if point_cloud is not None:
         return point_cloud
 
@@ -220,7 +263,8 @@ def convert_maniskill_obs(raw_obs: Any, metadata: dict[str, Any] | None = None) 
     converted = _convert_value(raw_obs)
     if isinstance(converted, Mapping):
         payload = dict(converted)
-        point_cloud = _extract_point_cloud(payload)
+        env_id = None if metadata is None else metadata.get("env_id")
+        point_cloud = _extract_point_cloud(payload, env_id=env_id)
         if point_cloud is not None:
             payload["point_cloud"] = point_cloud
 
