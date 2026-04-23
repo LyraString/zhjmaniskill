@@ -39,11 +39,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robot-uids", type=str, default=None)
     parser.add_argument("--sim-freq", type=int, default=None)
     parser.add_argument("--control-freq", type=int, default=None)
-    parser.add_argument("--collector", choices=("random", "legacy_replay", "scripted_expert"), default="random")
+    parser.add_argument(
+        "--collector",
+        choices=("random", "legacy_replay", "scripted_expert", "policy_intervention"),
+        default="random",
+    )
     parser.add_argument("--teacher-zarr-path", type=str, default=None)
     parser.add_argument("--teacher-seed-path", type=str, default=None)
+    parser.add_argument("--policy-kind", choices=("flowmatching", "fpo"), default="flowmatching")
+    parser.add_argument("--ckpt-path", type=str, default=None)
     parser.add_argument("--save-only-success", action="store_true")
     parser.add_argument("--debug-scripted-expert", action="store_true")
+    parser.add_argument("--debug-policy-intervention", action="store_true")
     return parser
 
 
@@ -212,6 +219,61 @@ def run_collection(args) -> None:
                         print("scripted_expert_pick_debug=" + json.dumps(solver.first_pick_debug, ensure_ascii=False))
                     if getattr(solver, "last_debug_info", None):
                         print("scripted_expert_debug=" + json.dumps(solver.last_debug_info, ensure_ascii=False))
+                attempted_episode_idx += 1
+            return
+
+        if args.collector == "policy_intervention":
+            from sim.maniskill.policy_intervention_collector import PolicyInterventionCollector
+
+            ckpt_path = _resolve_repo_path(args.ckpt_path)
+            if ckpt_path is None:
+                raise ValueError("--collector policy_intervention requires --ckpt-path.")
+
+            collector = PolicyInterventionCollector(
+                env,
+                policy_kind=args.policy_kind,
+                ckpt_path=str(ckpt_path),
+                action_type=resolved_runtime["action_type"],
+                debug=args.debug_policy_intervention,
+            )
+            saved_episode_idx = 0
+            attempted_episode_idx = 0
+            while saved_episode_idx < args.episode_num:
+                reset_seed = args.seed + attempted_episode_idx
+                success, episode_length, status = collector.collect_episode(
+                    recorder=recorder,
+                    seed=reset_seed,
+                    max_episode_steps=args.max_episode_steps,
+                )
+                if success or not args.save_only_success:
+                    if episode_length > 0:
+                        out_path = recorder.save_episode(saved_episode_idx)
+                        print(
+                            f"saved {out_path} "
+                            f"(seed={reset_seed}, length={episode_length}, "
+                            f"success={int(success)}, status={status})"
+                        )
+                        saved_episode_idx += 1
+                    else:
+                        print(
+                            f"skipped policy_intervention attempt={attempted_episode_idx} "
+                            f"(seed={reset_seed}, length=0, success={int(success)}, status={status})"
+                        )
+                    if args.debug_policy_intervention and getattr(collector, "last_debug_info", None):
+                        print(
+                            "policy_intervention_debug="
+                            + json.dumps(collector.last_debug_info, ensure_ascii=False)
+                        )
+                else:
+                    print(
+                        f"skipped policy_intervention attempt={attempted_episode_idx} "
+                        f"(seed={reset_seed}, length={episode_length}, success=0, status={status})"
+                    )
+                    if args.debug_policy_intervention and getattr(collector, "last_debug_info", None):
+                        print(
+                            "policy_intervention_debug="
+                            + json.dumps(collector.last_debug_info, ensure_ascii=False)
+                        )
                 attempted_episode_idx += 1
             return
 
