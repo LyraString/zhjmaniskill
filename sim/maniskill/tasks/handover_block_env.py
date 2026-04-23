@@ -42,6 +42,10 @@ def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
 class HandoverBlockEnv(DualUR5WSGEnv):
     """Minimal ManiSkill port of RoboTwin handover_block scene and spatial success condition."""
 
+    def __init__(self, *args, legacy_rng_compat: bool = False, **kwargs):
+        self.legacy_rng_compat = bool(legacy_rng_compat)
+        super().__init__(*args, **kwargs)
+
     def _load_scene(self, options: dict):
         super()._load_scene(options)
 
@@ -71,26 +75,41 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             b = len(env_idx)
             episode_rng = self._batched_episode_rng[env_idx]
 
-            box_x = torch.as_tensor(
-                episode_rng.uniform(-0.25, -0.05),
-                device=self.device,
-                dtype=torch.float32,
-            ).reshape(b)
-            box_y = torch.as_tensor(
-                episode_rng.uniform(0.0, 0.25),
-                device=self.device,
-                dtype=torch.float32,
-            ).reshape(b)
-            yaw = torch.as_tensor(
-                episode_rng.uniform(-BOX_YAW_LIMIT, BOX_YAW_LIMIT),
-                device=self.device,
-                dtype=torch.float32,
-            ).reshape(b)
+            if self.legacy_rng_compat:
+                # RoboTwin's original handover_block consumes RNG before actor
+                # placement for:
+                # 1) table_z_bias uniform draw
+                # 2) head-camera random direction (np.random.randn(3))
+                # 3) head-camera distance jitter uniform draw
+                # 4) fixed z values and zero roll/pitch ranges in rand_pose
+                # Keep those dummy draws so identical seeds reproduce the old
+                # box/target poses.
+                episode_rng.uniform(-0.0, 0.0)
+                episode_rng.randn(3)
+                episode_rng.uniform(0.0, 0.0)
+                box_x_np = episode_rng.uniform(-0.25, -0.05)
+                box_y_np = episode_rng.uniform(0.0, 0.25)
+                box_z_np = episode_rng.uniform(BOX_CENTER_Z, BOX_CENTER_Z)
+                episode_rng.uniform(-0.0, 0.0)
+                episode_rng.uniform(-0.0, 0.0)
+                yaw_np = episode_rng.uniform(-BOX_YAW_LIMIT, BOX_YAW_LIMIT)
+            else:
+                box_x_np = episode_rng.uniform(-0.25, -0.05)
+                box_y_np = episode_rng.uniform(0.0, 0.25)
+                box_z_np = None
+                yaw_np = episode_rng.uniform(-BOX_YAW_LIMIT, BOX_YAW_LIMIT)
+
+            box_x = torch.as_tensor(box_x_np, device=self.device, dtype=torch.float32).reshape(b)
+            box_y = torch.as_tensor(box_y_np, device=self.device, dtype=torch.float32).reshape(b)
+            yaw = torch.as_tensor(yaw_np, device=self.device, dtype=torch.float32).reshape(b)
 
             box_xyz = torch.zeros((b, 3), device=self.device, dtype=torch.float32)
             box_xyz[:, 0] = box_x
             box_xyz[:, 1] = box_y
-            box_xyz[:, 2] = BOX_CENTER_Z
+            if box_z_np is None:
+                box_xyz[:, 2] = BOX_CENTER_Z
+            else:
+                box_xyz[:, 2] = torch.as_tensor(box_z_np, device=self.device, dtype=torch.float32).reshape(b)
 
             yaw_half = yaw / 2.0
             yaw_q = torch.stack(
@@ -107,21 +126,20 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             box_q = box_q / torch.linalg.norm(box_q, dim=-1, keepdim=True)
             self.box.set_pose(Pose.create_from_pq(p=box_xyz, q=box_q))
 
-            target_x = torch.as_tensor(
-                episode_rng.uniform(0.10, 0.25),
-                device=self.device,
-                dtype=torch.float32,
-            ).reshape(b)
-            target_y = torch.as_tensor(
-                episode_rng.uniform(0.15, 0.20),
-                device=self.device,
-                dtype=torch.float32,
-            ).reshape(b)
+            target_x_np = episode_rng.uniform(0.10, 0.25)
+            target_y_np = episode_rng.uniform(0.15, 0.20)
+            target_z_np = episode_rng.uniform(TARGET_CENTER_Z, TARGET_CENTER_Z) if self.legacy_rng_compat else None
+
+            target_x = torch.as_tensor(target_x_np, device=self.device, dtype=torch.float32).reshape(b)
+            target_y = torch.as_tensor(target_y_np, device=self.device, dtype=torch.float32).reshape(b)
 
             target_xyz = torch.zeros((b, 3), device=self.device, dtype=torch.float32)
             target_xyz[:, 0] = target_x
             target_xyz[:, 1] = target_y
-            target_xyz[:, 2] = TARGET_CENTER_Z
+            if target_z_np is None:
+                target_xyz[:, 2] = TARGET_CENTER_Z
+            else:
+                target_xyz[:, 2] = torch.as_tensor(target_z_np, device=self.device, dtype=torch.float32).reshape(b)
             self.target_box.set_pose(Pose.create_from_pq(p=target_xyz))
 
     def evaluate(self):

@@ -41,7 +41,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-freq", type=int, default=None)
     parser.add_argument(
         "--collector",
-        choices=("random", "legacy_replay", "scripted_expert", "policy_intervention"),
+        choices=(
+            "random",
+            "legacy_replay",
+            "scripted_expert",
+            "policy_intervention",
+            "policy_manual_intervention",
+        ),
         default="random",
     )
     parser.add_argument("--teacher-zarr-path", type=str, default=None)
@@ -51,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-only-success", action="store_true")
     parser.add_argument("--debug-scripted-expert", action="store_true")
     parser.add_argument("--debug-policy-intervention", action="store_true")
+    parser.add_argument("--debug-policy-manual-intervention", action="store_true")
     return parser
 
 
@@ -143,7 +150,8 @@ def run_collection(args) -> None:
         control_mode=runtime_kwargs["control_mode"],
     )
     runtime_kwargs["control_mode"] = resolved_control_mode
-    _, resolved_runtime, _profile_name = apply_task_profile(runtime_task_name, runtime_kwargs)
+    profile_runtime_key = resolved_profile_name or runtime_task_name
+    _, resolved_runtime, _profile_name = apply_task_profile(profile_runtime_key, runtime_kwargs)
     save_dir = REPO_ROOT / "data" / runtime_task_name / args.task_config
     recorder = ManiSkillTrajectoryRecorder(save_dir)
     env = ManiSkillTaskFactory().create_env(
@@ -272,6 +280,63 @@ def run_collection(args) -> None:
                     if args.debug_policy_intervention and getattr(collector, "last_debug_info", None):
                         print(
                             "policy_intervention_debug="
+                            + json.dumps(collector.last_debug_info, ensure_ascii=False)
+                        )
+                attempted_episode_idx += 1
+            return
+
+        if args.collector == "policy_manual_intervention":
+            from sim.maniskill.policy_manual_intervention_collector import (
+                PolicyManualInterventionCollector,
+            )
+
+            ckpt_path = _resolve_repo_path(args.ckpt_path)
+            if ckpt_path is None:
+                raise ValueError("--collector policy_manual_intervention requires --ckpt-path.")
+
+            collector = PolicyManualInterventionCollector(
+                env,
+                policy_kind=args.policy_kind,
+                ckpt_path=str(ckpt_path),
+                action_type=resolved_runtime["action_type"],
+                debug=args.debug_policy_manual_intervention,
+            )
+            saved_episode_idx = 0
+            attempted_episode_idx = 0
+            while saved_episode_idx < args.episode_num:
+                reset_seed = args.seed + attempted_episode_idx
+                success, episode_length, status = collector.collect_episode(
+                    recorder=recorder,
+                    seed=reset_seed,
+                    max_episode_steps=args.max_episode_steps,
+                )
+                if success or not args.save_only_success:
+                    if episode_length > 0:
+                        out_path = recorder.save_episode(saved_episode_idx)
+                        print(
+                            f"saved {out_path} "
+                            f"(seed={reset_seed}, length={episode_length}, "
+                            f"success={int(success)}, status={status})"
+                        )
+                        saved_episode_idx += 1
+                    else:
+                        print(
+                            f"skipped policy_manual_intervention attempt={attempted_episode_idx} "
+                            f"(seed={reset_seed}, length=0, success={int(success)}, status={status})"
+                        )
+                    if args.debug_policy_manual_intervention and getattr(collector, "last_debug_info", None):
+                        print(
+                            "policy_manual_intervention_debug="
+                            + json.dumps(collector.last_debug_info, ensure_ascii=False)
+                        )
+                else:
+                    print(
+                        f"skipped policy_manual_intervention attempt={attempted_episode_idx} "
+                        f"(seed={reset_seed}, length={episode_length}, success=0, status={status})"
+                    )
+                    if args.debug_policy_manual_intervention and getattr(collector, "last_debug_info", None):
+                        print(
+                            "policy_manual_intervention_debug="
                             + json.dumps(collector.last_debug_info, ensure_ascii=False)
                         )
                 attempted_episode_idx += 1

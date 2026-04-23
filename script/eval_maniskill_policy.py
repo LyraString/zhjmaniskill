@@ -82,7 +82,7 @@ def run_evaluation(args) -> None:
     runtime_env_id = args.task_name
     if args.task_profile is not None and args.task_name == args.task_profile:
         runtime_env_id = None
-    runtime_task_name, _resolved_profile_name = resolve_runtime_task_target(
+    runtime_task_name, resolved_profile_name = resolve_runtime_task_target(
         task_name=args.task_name,
         task_profile=args.task_profile,
         env_id=runtime_env_id,
@@ -106,7 +106,8 @@ def run_evaluation(args) -> None:
     runtime_kwargs["control_mode"] = resolved_control_mode
     if args.save_video_dir is not None and runtime_kwargs["render_mode"] in (None, ""):
         runtime_kwargs["render_mode"] = "rgb_array"
-    _, resolved_runtime, _profile_name = apply_task_profile(runtime_task_name, runtime_kwargs)
+    profile_runtime_key = resolved_profile_name or runtime_task_name
+    _, resolved_runtime, _profile_name = apply_task_profile(profile_runtime_key, runtime_kwargs)
 
     env = ManiSkillTaskFactory().create_env(
         task_name=runtime_task_name,
