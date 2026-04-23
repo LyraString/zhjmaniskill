@@ -206,12 +206,24 @@ def main() -> None:
         raw_env = env.env.unwrapped
         ctrl = FixedRateMotionPrimitives(env)
         initial_box_pose = _to_numpy(raw_env.box.pose.raw_pose, (-1, 7))[0]
-        records.append(_align_record(old_demo, _capture_current_state(raw_env, ctrl), old_index=0))
+        initial_record = _align_record(old_demo, _capture_current_state(raw_env, ctrl), old_index=0)
+        initial_record["teacher_target_left_qpos"] = None
+        initial_record["teacher_target_left_gripper"] = None
+        initial_record["qtrack_err"] = None
+        records.append(initial_record)
 
         max_steps = min(int(args.max_steps), len(teacher_actions), len(old_demo["left_endpose"]) - 1)
         for step_idx in range(max_steps):
             env.step(ActionSpec.from_value(teacher_actions[step_idx], action_type=resolved_runtime["action_type"]))
-            records.append(_align_record(old_demo, _capture_current_state(raw_env, ctrl), old_index=step_idx + 1))
+            record = _align_record(old_demo, _capture_current_state(raw_env, ctrl), old_index=step_idx + 1)
+            teacher_target = np.asarray(teacher_actions[step_idx], dtype=np.float64)
+            teacher_target_left_qpos = teacher_target[:6]
+            teacher_target_left_gripper = float(teacher_target[6])
+            current_qpos = np.asarray(record["current_left_qpos"], dtype=np.float64)
+            record["teacher_target_left_qpos"] = teacher_target_left_qpos.tolist()
+            record["teacher_target_left_gripper"] = teacher_target_left_gripper
+            record["qtrack_err"] = float(np.linalg.norm(current_qpos - teacher_target_left_qpos))
+            records.append(record)
     finally:
         env.close()
 
@@ -225,6 +237,12 @@ def main() -> None:
     first_box_motion_idx = _first_index(records, lambda r: float(r["box_disp"]) > args.box_motion_threshold)
     first_ee_diverge_idx = _first_index(records, lambda r: float(r["ee_pos_err"]) > args.ee_pos_threshold)
     first_qpos_diverge_idx = _first_index(records, lambda r: float(r["qpos_err"]) > args.qpos_threshold)
+    first_qtrack_diverge_idx = _first_index(
+        records[1:],
+        lambda r: r["qtrack_err"] is not None and float(r["qtrack_err"]) > args.qpos_threshold,
+    )
+    if first_qtrack_diverge_idx is not None:
+        first_qtrack_diverge_idx += 1
 
     if args.start_step is not None or args.end_step is not None:
         window_start = max(0, int(args.start_step or 0))
@@ -246,6 +264,7 @@ def main() -> None:
         "first_box_motion_idx": first_box_motion_idx,
         "first_ee_diverge_idx": first_ee_diverge_idx,
         "first_qpos_diverge_idx": first_qpos_diverge_idx,
+        "first_qtrack_diverge_idx": first_qtrack_diverge_idx,
         "window_start": window_start,
         "window_end": window_end,
     }
@@ -260,17 +279,19 @@ def main() -> None:
         f"replay_close={first_replay_close_idx} "
         f"box_motion={first_box_motion_idx} "
         f"ee_diverge(>{args.ee_pos_threshold})={first_ee_diverge_idx} "
-        f"qpos_diverge(>{args.qpos_threshold})={first_qpos_diverge_idx}"
+        f"qpos_diverge(>{args.qpos_threshold})={first_qpos_diverge_idx} "
+        f"qtrack_diverge(>{args.qpos_threshold})={first_qtrack_diverge_idx}"
     )
     print(
         "window "
         f"[{window_start}, {window_end}] "
-        "(idx old_g cur_g ee_pos_err ee_rot_deg qpos_err box_disp old_xyz -> cur_xyz)"
+        "(idx old_g cur_g ee_pos_err ee_rot_deg qpos_err qtrack_err box_disp old_xyz -> cur_xyz)"
     )
     for idx in range(window_start, window_end + 1):
         record = records[idx]
         old_xyz = np.asarray(record["old_left_ee_pose"], dtype=np.float64)[:3]
         cur_xyz = np.asarray(record["current_left_endpose"], dtype=np.float64)[:3]
+        qtrack_err = record["qtrack_err"]
         print(
             f"{idx:03d} "
             f"{float(record['old_left_gripper']):.2f} "
@@ -278,6 +299,7 @@ def main() -> None:
             f"{float(record['ee_pos_err']):.4f} "
             f"{float(record['ee_rot_err_deg']):6.2f} "
             f"{float(record['qpos_err']):.4f} "
+            f"{'NA' if qtrack_err is None else f'{float(qtrack_err):.4f}'} "
             f"{float(record['box_disp']):.4f} "
             f"{np.round(old_xyz, 4).tolist()} -> {np.round(cur_xyz, 4).tolist()}"
         )
