@@ -68,6 +68,7 @@ TOP_DOWN_PREFERRED_GRASP_QUATS = {
 }
 LEFT_GRASP_CONTACT_IDS = (0, 1)
 RIGHT_GRASP_CONTACT_IDS = (4, 5, 6, 7)
+RIGHT_GRASP_PREFERRED_X_AXIS_CONTACT_IDS = (5, 6)
 
 
 class _NullRecorder:
@@ -83,14 +84,14 @@ class HandoverBlockSolver:
     HANDOVER_PRE_GRASP_DISTANCE = 0.08
     GRASP_DISTANCE = 0.0
     LEFT_FIRST_GRASP_DISTANCE = -0.02
-    RIGHT_HANDOVER_GRASP_DISTANCE = -0.02
+    RIGHT_HANDOVER_GRASP_DISTANCE = 0.0
     ROTATE_NUM = 10
     LEFT_ROTATE_LIM = (-0.6, 0.6)
     RIGHT_ROTATE_LIM = (-0.6, 0.6)
     LEFT_FIRST_GRASP_YAW_VARIANTS = (-0.15, -0.075, 0.0, 0.075, 0.15)
     LEFT_LIFT_DISTANCE = 0.16
     LEFT_HANDOVER_CLEARANCE_Z = 0.18
-    LEFT_RELEASE_LIFT_DISTANCE = 0.12
+    LEFT_RELEASE_LIFT_DISTANCE = 0.0
     LEFT_FIRST_GRASP_CLOSE_STEPS = 18
     LEFT_FIRST_GRASP_CLAMP_LIFT_DISTANCE = 0.05
     LEFT_FIRST_GRASP_CLAMP_LIFT_QPOS_STEPS = 10
@@ -98,19 +99,20 @@ class HandoverBlockSolver:
     LEFT_FIRST_GRASP_APPROACH_OFFSET = np.asarray([0.0, -0.10, 0.0], dtype=np.float64)
     ALLOW_LEFT_FIRST_GRASP_APPROACH_FALLBACK = True
     LEFT_FIRST_GRASP_BOX_AXIS_SHIFT = 0.04
-    RIGHT_END_GRASP_BOX_AXIS_SHIFT = 0.03
+    RIGHT_END_GRASP_BOX_AXIS_SHIFT = -0.03
     ABOVE_TARGET_OFFSET = np.asarray([0.05, -0.12, 0.20], dtype=np.float64)
     HANDOVER_APPROACH_OFFSET = np.asarray([0.0, -0.07, 0.10], dtype=np.float64)
     RIGHT_PLACE_TARGET_OFFSET = np.asarray([0.0, 0.0, 0.0], dtype=np.float64)
     RIGHT_PRE_PLACE_WORLD_OFFSET = np.asarray([0.0, 0.0, 0.0], dtype=np.float64)
     RIGHT_PLACE_WORLD_OFFSET = np.asarray([0.0, 0.0, 0.0], dtype=np.float64)
-    USE_SELECTED_PLACE_CANDIDATE_AT_RUNTIME = True
+    USE_SELECTED_PLACE_CANDIDATE_AT_RUNTIME = False
+    RETURN_LEFT_HOME_AFTER_HANDOVER = False
     RIGHT_CARRY_RETRACT_SEGMENTS = ((0.02, -0.02, 0.0), (0.02, -0.02, 0.0))
     RIGHT_CARRY_LIFT_SEGMENTS = (0.03, 0.03, 0.03, 0.03, 0.02)
     RIGHT_CARRY_RELAX_BLEND = 1.0
     RIGHT_CARRY_RELAX_STEPS = 4
     RIGHT_CARRY_RELAX_SETTLE_STEPS = 2
-    ENABLE_FUTURE_PLACE_SELECTION = True
+    ENABLE_FUTURE_PLACE_SELECTION = False
     ENABLE_RIGHT_HANDOVER_BRANCH_TRIAL = False
     RIGHT_HANDOVER_PLACE_VARIANT_TRIAL_LIMIT = 1
     RIGHT_HANDOVER_TOTAL_TRIAL_BRANCH_LIMIT = 2
@@ -119,6 +121,7 @@ class HandoverBlockSolver:
     RIGHT_RELEASE_LIFT_DISTANCE = 0.12
     RIGHT_RELEASE_RETRACT_DISTANCE = 0.03
     RIGHT_PLACE_SETTLE_STEPS = 3
+    RIGHT_HANDOVER_DUAL_HOLD_STEPS = 0
     FINAL_RELEASE_SETTLE_STEPS = 4
     FINAL_SETTLE_STEPS = 12
 
@@ -394,6 +397,21 @@ class HandoverBlockSolver:
         result_matrix[:3, :3] = target_grasp_matrix
         result_matrix[:3, 3] = target_point - grasp_bias - float(pre_dis) * target_dis_vec
         return matrix_to_pose(result_matrix)
+
+    def _place_pose_by_current_grasp_translation(
+        self,
+        *,
+        arm_index: int,
+        target_pose: np.ndarray,
+        pre_dis: float,
+    ) -> np.ndarray:
+        box_pose = self._box_pose()
+        target_top_center = np.asarray(target_pose, dtype=np.float64)[:3].copy()
+        desired_box_center = target_top_center + np.array([0.0, 0.0, float(self.box_half_size[2])], dtype=np.float64)
+        result_pose = np.asarray(self.ctrl.current_gripper_pose(arm_index), dtype=np.float64).copy()
+        result_pose[:3] += desired_box_center - box_pose[:3]
+        result_pose[2] += float(pre_dis)
+        return result_pose
 
     def _offset_pose_world(self, pose: np.ndarray, *, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> np.ndarray:
         shifted = np.asarray(pose, dtype=np.float64).copy()
@@ -720,8 +738,14 @@ class HandoverBlockSolver:
             return None, None, selection_debug, "no_handover_candidate", selection_options
 
         if not self.ENABLE_FUTURE_PLACE_SELECTION:
+            preferred_options = [
+                item
+                for item in selection_options
+                if int(item["contact_id"]) in RIGHT_GRASP_PREFERRED_X_AXIS_CONTACT_IDS
+            ]
+            selectable_options = preferred_options if preferred_options else selection_options
             selected_option = min(
-                selection_options,
+                selectable_options,
                 key=lambda item: (
                     float(item["candidate"].score),
                     int(item["candidate"].path_length),
@@ -733,14 +757,20 @@ class HandoverBlockSolver:
                 selected_option["candidate"],
                 None,
                 selection_debug,
-                "handover_score_only",
+                "preferred_x_axis_handover" if preferred_options else "handover_score_only",
                 selection_options,
             )
 
         place_viable_options = [item for item in selection_options if item["future_place_ok"]]
         if place_viable_options:
+            preferred_place_viable_options = [
+                item
+                for item in place_viable_options
+                if int(item["contact_id"]) in RIGHT_GRASP_PREFERRED_X_AXIS_CONTACT_IDS
+            ]
+            selectable_place_options = preferred_place_viable_options if preferred_place_viable_options else place_viable_options
             selected_option = min(
-                place_viable_options,
+                selectable_place_options,
                 key=lambda item: (
                     float(item["future_place_path_len"]),
                     float(item["candidate"].score),
@@ -754,12 +784,18 @@ class HandoverBlockSolver:
                 selected_option["candidate"],
                 selected_option["future_place_candidate"],
                 selection_debug,
-                "future_place_viable",
+                "preferred_x_axis_future_place_viable" if preferred_place_viable_options else "future_place_viable",
                 selection_options,
             )
 
+        preferred_candidates = [
+            item
+            for item in candidates
+            if int(item[0].contact_id) in RIGHT_GRASP_PREFERRED_X_AXIS_CONTACT_IDS
+        ]
+        selectable_candidates = preferred_candidates if preferred_candidates else candidates
         selected_candidate, _, _, _ = min(
-            candidates,
+            selectable_candidates,
             key=lambda item: (
                 float(item[0].score),
                 int(item[0].path_length),
@@ -767,7 +803,8 @@ class HandoverBlockSolver:
                 float(item[0].joint_motion),
             ),
         )
-        return selected_candidate, None, selection_debug, "handover_fallback", selection_options
+        selection_reason = "preferred_x_axis_handover_fallback" if preferred_candidates else "handover_fallback"
+        return selected_candidate, None, selection_debug, selection_reason, selection_options
 
     def _capture_rollout_snapshot(self) -> dict[str, object]:
         return {
@@ -931,42 +968,74 @@ class HandoverBlockSolver:
         if success:
             return True, self.ctrl.steps_taken, self.ctrl.last_status
 
+        if self.RIGHT_HANDOVER_DUAL_HOLD_STEPS > 0:
+            if self.ctrl.hold_pose(
+                recorder,
+                steps=self.RIGHT_HANDOVER_DUAL_HOLD_STEPS,
+                left_gripper=0.0,
+                right_gripper=0.0,
+                allow_success_early=False,
+            ):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                self.last_debug_info = {
+                    "stage": "right_handover_dual_hold",
+                    "handover_box_pose": np.asarray(handover_box_pose, dtype=np.float64).round(4).tolist(),
+                    "selection_reason": right_handover_selection_reason,
+                    "selection_debug": right_handover_selection_debug,
+                    "selected_contact_id": int(handover_candidate.contact_id),
+                    "right_handover_alignment": right_handover_alignment,
+                    "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
+                    "right_gripper_pose": np.asarray(self.ctrl.current_gripper_pose(1), dtype=np.float64).round(4).tolist(),
+                    "right_qpos": np.asarray(self.ctrl.current_qpos(1), dtype=np.float64).round(4).tolist(),
+                    "right_full_qpos": np.asarray(self.ctrl.current_full_qpos(1), dtype=np.float64).round(4).tolist(),
+                    "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                }
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+            right_handover_alignment = self._box_gripper_alignment_debug(
+                arm_index=1,
+                planned_box_pose=handover_box_pose,
+                planned_gripper_pose=handover_candidate.grasp_pose,
+            )
+
         if self.ctrl.open_gripper(0, recorder, fail_status="left_open_failed"):
             return True, self.ctrl.steps_taken, self.ctrl.last_status
         if self.ctrl.last_status != "running":
             return False, self.ctrl.steps_taken, self.ctrl.last_status
 
-        if self.ctrl.move_by_displacement(
-            0,
-            recorder,
-            z=self.LEFT_RELEASE_LIFT_DISTANCE,
-            move_axis="world",
-            fail_status="left_release_lift_failed",
-        ):
-            return True, self.ctrl.steps_taken, self.ctrl.last_status
-        if self.ctrl.last_status != "running":
-            self.last_debug_info = {
-                "stage": "left_release_lift",
-                "left_ee_pose": np.asarray(self.ctrl.current_ee_pose(0), dtype=np.float64).round(4).tolist(),
-                "left_qpos": np.asarray(self.ctrl.current_qpos(0), dtype=np.float64).round(4).tolist(),
-                "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
-                "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
-                "right_handover_alignment": right_handover_alignment,
-                "plan_debug": dict(self.ctrl.last_plan_debug),
-            }
-            return False, self.ctrl.steps_taken, self.ctrl.last_status
+        if self.LEFT_RELEASE_LIFT_DISTANCE > 1e-8:
+            if self.ctrl.move_by_displacement(
+                0,
+                recorder,
+                z=self.LEFT_RELEASE_LIFT_DISTANCE,
+                move_axis="world",
+                fail_status="left_release_lift_failed",
+            ):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                self.last_debug_info = {
+                    "stage": "left_release_lift",
+                    "left_ee_pose": np.asarray(self.ctrl.current_ee_pose(0), dtype=np.float64).round(4).tolist(),
+                    "left_qpos": np.asarray(self.ctrl.current_qpos(0), dtype=np.float64).round(4).tolist(),
+                    "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
+                    "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                    "right_handover_alignment": right_handover_alignment,
+                    "plan_debug": dict(self.ctrl.last_plan_debug),
+                }
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
 
-        if self.ctrl.back_to_origin(0, recorder, fail_status="left_back_to_origin_failed"):
-            return True, self.ctrl.steps_taken, self.ctrl.last_status
-        if self.ctrl.last_status != "running":
-            return False, self.ctrl.steps_taken, self.ctrl.last_status
+        if self.RETURN_LEFT_HOME_AFTER_HANDOVER:
+            if self.ctrl.back_to_origin(0, recorder, fail_status="left_back_to_origin_failed"):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
 
         current_right_qpos = self.ctrl.current_qpos(1)
         right_home_qpos = self.base_env.get_arm_home_joint_positions(1)
-        if selected_place_candidate is not None:
+        if selected_place_candidate is not None and self.USE_SELECTED_PLACE_CANDIDATE_AT_RUNTIME:
             right_carry_relax_qpos = np.asarray(selected_place_candidate["relaxed_start_qpos"], dtype=np.float64).copy()
         else:
-            right_carry_relax_qpos = current_right_qpos + self.RIGHT_CARRY_RELAX_BLEND * (right_home_qpos - current_right_qpos)
+            right_carry_relax_qpos = current_right_qpos.copy()
         if self.ctrl.move_to_qpos(
             1,
             right_carry_relax_qpos,
@@ -992,7 +1061,7 @@ class HandoverBlockSolver:
         target_fp_pose = self._target_functional_world_pose(1)
         place_target_pose = target_fp_pose.copy()
         place_target_pose[:3] += self.RIGHT_PLACE_TARGET_OFFSET
-        place_pose_source = "runtime_from_current_grasp"
+        place_pose_source = "runtime_translation_from_current_grasp"
         selected_place_variant_index = None
         selected_place_grasp_plan_source = None
         selected_pre_plan_len = None
@@ -1010,19 +1079,15 @@ class HandoverBlockSolver:
             right_place_pose = np.asarray(selected_place_candidate["grasp_pose"], dtype=np.float64).copy()
             place_pose_source = "future_place_candidate_plan"
         else:
-            right_pre_place_pose = self._place_pose_from_current_grasp(
+            right_pre_place_pose = self._place_pose_by_current_grasp_translation(
                 arm_index=1,
                 target_pose=place_target_pose,
-                functional_id=0,
                 pre_dis=0.08,
-                pre_dis_axis="fp",
             )
-            right_place_pose = self._place_pose_from_current_grasp(
+            right_place_pose = self._place_pose_by_current_grasp_translation(
                 arm_index=1,
                 target_pose=place_target_pose,
-                functional_id=0,
                 pre_dis=self.GRASP_DISTANCE,
-                pre_dis_axis="fp",
             )
             right_pre_place_pose = self._offset_pose_world(
                 right_pre_place_pose,

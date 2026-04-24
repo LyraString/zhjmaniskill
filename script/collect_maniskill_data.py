@@ -3,6 +3,7 @@ import json
 import sys
 from pathlib import Path
 
+import imageio.v2 as imageio
 import numpy as np
 import zarr
 
@@ -39,6 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robot-uids", type=str, default=None)
     parser.add_argument("--sim-freq", type=int, default=None)
     parser.add_argument("--control-freq", type=int, default=None)
+    parser.add_argument("--save-video-dir", type=str, default=None)
+    parser.add_argument("--video-fps", type=int, default=10)
     parser.add_argument(
         "--collector",
         choices=(
@@ -76,6 +79,63 @@ def _to_bool_scalar(value) -> bool:
     if isinstance(value, np.ndarray):
         return bool(np.asarray(value).reshape(-1)[0])
     return bool(value)
+
+
+def _maybe_capture_frame(env_backend, frames: list[np.ndarray]) -> None:
+    frame = env_backend.render()
+    if frame is None:
+        return
+    if hasattr(frame, "detach") and hasattr(frame, "cpu"):
+        frame = frame.detach().cpu()
+    frame = np.asarray(frame)
+    # ManiSkill rgb_array render returns (num_envs, H, W, C) for vectorized envs,
+    # even when num_envs == 1.
+    if frame.ndim == 4 and frame.shape[0] >= 1:
+        frame = frame[0]
+    if frame.ndim != 3:
+        return
+    if frame.dtype != np.uint8:
+        frame = np.clip(frame, 0, 255).astype(np.uint8)
+    frames.append(frame)
+
+
+class VideoTrajectoryRecorder:
+    def __init__(
+        self,
+        recorder: ManiSkillTrajectoryRecorder,
+        *,
+        env_backend,
+        video_dir: Path | None,
+        video_fps: int,
+    ) -> None:
+        self._recorder = recorder
+        self._env_backend = env_backend
+        self._video_dir = video_dir
+        self._video_fps = int(video_fps)
+        self._frames: list[np.ndarray] = []
+        if self._video_dir is not None:
+            self._video_dir.mkdir(parents=True, exist_ok=True)
+
+    def start_episode(self, initial_obs: dict) -> None:
+        self._recorder.start_episode(initial_obs)
+        self._frames = []
+        if self._video_dir is not None:
+            _maybe_capture_frame(self._env_backend, self._frames)
+
+    def append_step(self, action, next_obs: dict) -> None:
+        self._recorder.append_step(action, next_obs)
+        if self._video_dir is not None:
+            _maybe_capture_frame(self._env_backend, self._frames)
+
+    def save_episode(self, episode_idx: int) -> Path:
+        out_path = self._recorder.save_episode(episode_idx)
+        if self._video_dir is not None and len(self._frames) > 0:
+            imageio.mimsave(
+                self._video_dir / f"episode{int(episode_idx)}.mp4",
+                self._frames,
+                fps=self._video_fps,
+            )
+        return out_path
 
 
 def _load_teacher_actions(zarr_path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -150,13 +210,21 @@ def run_collection(args) -> None:
         control_mode=runtime_kwargs["control_mode"],
     )
     runtime_kwargs["control_mode"] = resolved_control_mode
+    if args.save_video_dir is not None and runtime_kwargs["render_mode"] in (None, ""):
+        runtime_kwargs["render_mode"] = "rgb_array"
     profile_runtime_key = resolved_profile_name or runtime_task_name
     _, resolved_runtime, _profile_name = apply_task_profile(profile_runtime_key, runtime_kwargs)
     save_dir = REPO_ROOT / "data" / runtime_task_name / args.task_config
-    recorder = ManiSkillTrajectoryRecorder(save_dir)
     env = ManiSkillTaskFactory().create_env(
         task_name=runtime_task_name,
         **resolved_runtime,
+    )
+    video_dir = _resolve_repo_path(args.save_video_dir)
+    recorder = VideoTrajectoryRecorder(
+        ManiSkillTrajectoryRecorder(save_dir),
+        env_backend=env,
+        video_dir=video_dir,
+        video_fps=args.video_fps,
     )
 
     def maybe_render() -> None:
