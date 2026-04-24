@@ -19,6 +19,8 @@ from sim.maniskill import (
     resolve_task_profile,
 )
 from sim.maniskill.expert.primitives import FixedRateMotionPrimitives
+from sim.maniskill.tasks import dual_ur5_wsg_env as dual_ur5_module
+from script.diagnose_handover_gripper_contact import _make_diagnostic_robot_dir
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,6 +49,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--render-backend", type=str, default=None)
     parser.add_argument("--render-mode", type=str, default=None)
     parser.add_argument("--output-json", type=str, default=None)
+    parser.add_argument(
+        "--disable-nonfinger-gripper-collision",
+        action="store_true",
+        help="Diagnostic only: remove wsg_50_base_link/gripper_left/gripper_right collision from a temporary URDF.",
+    )
+    parser.add_argument(
+        "--shrink-finger-collision",
+        action="store_true",
+        help="Diagnostic only: scale finger_left/finger_right collision meshes in a temporary URDF.",
+    )
+    parser.add_argument(
+        "--finger-collision-scale",
+        type=float,
+        default=0.8,
+        help="Scale factor used with --shrink-finger-collision.",
+    )
+    parser.add_argument(
+        "--use-finger-box-collision-proxy",
+        action="store_true",
+        help="Diagnostic only: replace finger_left/finger_right collision meshes with simple box proxies.",
+    )
+    parser.add_argument(
+        "--finger-box-collision-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor used with --use-finger-box-collision-proxy.",
+    )
+    parser.add_argument("--arm-joint-stiffness", type=float, default=None)
+    parser.add_argument("--arm-joint-damping", type=float, default=None)
     return parser
 
 
@@ -167,8 +198,23 @@ def _first_index(records: list[dict[str, object]], predicate) -> int | None:
     return None
 
 
+def _override_arm_drive_params(raw_env, stiffness: float | None, damping: float | None) -> None:
+    if stiffness is None and damping is None:
+        return
+    if stiffness is None or damping is None:
+        raise ValueError("--arm-joint-stiffness and --arm-joint-damping must be set together")
+    for joint in list(raw_env.left_arm_joints) + list(raw_env.right_arm_joints):
+        joint.set_drive_properties(float(stiffness), float(damping))
+
+
 def main() -> None:
     args = build_parser().parse_args()
+    if args.shrink_finger_collision and args.use_finger_box_collision_proxy:
+        raise ValueError("--shrink-finger-collision and --use-finger-box-collision-proxy are mutually exclusive")
+    if args.shrink_finger_collision and args.finger_collision_scale <= 0.0:
+        raise ValueError("--finger-collision-scale must be positive")
+    if args.use_finger_box_collision_proxy and args.finger_box_collision_scale <= 0.0:
+        raise ValueError("--finger-box-collision-scale must be positive")
 
     teacher_zarr_path, teacher_seed_path = _load_teacher_assets(
         profile_name=args.task_profile,
@@ -199,11 +245,29 @@ def main() -> None:
     )
     resolved_runtime["control_mode"] = resolved_control_mode
 
-    env = ManiSkillTaskFactory().create_env(task_name=args.task_profile, **resolved_runtime)
+    temp_robot_dir = None
+    original_ur5_wsg_dir = dual_ur5_module.UR5_WSG_DIR
+    if (
+        args.disable_nonfinger_gripper_collision
+        or args.shrink_finger_collision
+        or args.use_finger_box_collision_proxy
+    ):
+        temp_robot_dir = _make_diagnostic_robot_dir(
+            original_ur5_wsg_dir,
+            disable_nonfinger_collision=bool(args.disable_nonfinger_gripper_collision),
+            finger_collision_scale=float(args.finger_collision_scale) if args.shrink_finger_collision else None,
+            use_finger_box_collision_proxy=bool(args.use_finger_box_collision_proxy),
+            finger_box_collision_scale=float(args.finger_box_collision_scale),
+        )
+        dual_ur5_module.UR5_WSG_DIR = Path(temp_robot_dir.name)
+
     records: list[dict[str, object]] = []
+    env = None
     try:
+        env = ManiSkillTaskFactory().create_env(task_name=args.task_profile, **resolved_runtime)
         env.reset(seed=reset_seed)
         raw_env = env.env.unwrapped
+        _override_arm_drive_params(raw_env, args.arm_joint_stiffness, args.arm_joint_damping)
         ctrl = FixedRateMotionPrimitives(env)
         initial_box_pose = _to_numpy(raw_env.box.pose.raw_pose, (-1, 7))[0]
         initial_record = _align_record(old_demo, _capture_current_state(raw_env, ctrl), old_index=0)
@@ -225,7 +289,11 @@ def main() -> None:
             record["qtrack_err"] = float(np.linalg.norm(current_qpos - teacher_target_left_qpos))
             records.append(record)
     finally:
-        env.close()
+        if env is not None:
+            env.close()
+        dual_ur5_module.UR5_WSG_DIR = original_ur5_wsg_dir
+        if temp_robot_dir is not None:
+            temp_robot_dir.cleanup()
 
     for record in records:
         box_pose = np.asarray(record["current_box_pose"], dtype=np.float64)
@@ -259,6 +327,15 @@ def main() -> None:
         "teacher_zarr_path": str(teacher_zarr_path),
         "legacy_hdf5_path": str(hdf5_path),
         "record_count": len(records),
+        "disable_nonfinger_gripper_collision": bool(args.disable_nonfinger_gripper_collision),
+        "shrink_finger_collision": bool(args.shrink_finger_collision),
+        "finger_collision_scale": float(args.finger_collision_scale) if args.shrink_finger_collision else None,
+        "use_finger_box_collision_proxy": bool(args.use_finger_box_collision_proxy),
+        "finger_box_collision_scale": float(args.finger_box_collision_scale)
+        if args.use_finger_box_collision_proxy
+        else None,
+        "arm_joint_stiffness": float(args.arm_joint_stiffness) if args.arm_joint_stiffness is not None else None,
+        "arm_joint_damping": float(args.arm_joint_damping) if args.arm_joint_damping is not None else None,
         "first_old_close_idx": first_old_close_idx,
         "first_replay_close_idx": first_replay_close_idx,
         "first_box_motion_idx": first_box_motion_idx,

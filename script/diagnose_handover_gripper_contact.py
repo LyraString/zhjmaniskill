@@ -46,6 +46,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Diagnostic only: remove wsg_50_base_link/gripper_left/gripper_right collision from a temporary URDF.",
     )
+    parser.add_argument(
+        "--shrink-finger-collision",
+        action="store_true",
+        help="Diagnostic only: scale finger_left/finger_right collision meshes in a temporary URDF.",
+    )
+    parser.add_argument(
+        "--finger-collision-scale",
+        type=float,
+        default=0.8,
+        help="Scale factor used with --shrink-finger-collision.",
+    )
+    parser.add_argument(
+        "--use-finger-box-collision-proxy",
+        action="store_true",
+        help="Diagnostic only: replace finger_left/finger_right collision meshes with simple box proxies.",
+    )
+    parser.add_argument(
+        "--finger-box-collision-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor used with --use-finger-box-collision-proxy.",
+    )
     return parser
 
 
@@ -89,23 +111,119 @@ def _load_legacy_demo(hdf5_path: Path) -> dict[str, np.ndarray]:
     }
 
 
-def _make_nonfinger_collision_disabled_robot_dir(source_robot_dir: Path) -> tempfile.TemporaryDirectory:
+def _format_float(value: float) -> str:
+    return f"{value:.8g}"
+
+
+def _scale_collision_mesh(collision: ET.Element, scale: float) -> bool:
+    geometry = collision.find("geometry")
+    if geometry is None:
+        return False
+    mesh = geometry.find("mesh")
+    if mesh is None:
+        return False
+
+    raw_scale = mesh.get("scale")
+    if raw_scale:
+        values = [float(value) for value in raw_scale.split()]
+        if len(values) == 1:
+            values = values * 3
+        if len(values) != 3:
+            raise RuntimeError(f"Unexpected URDF mesh scale `{raw_scale}`")
+        values = [value * scale for value in values]
+    else:
+        values = [scale, scale, scale]
+    mesh.set("scale", " ".join(_format_float(value) for value in values))
+    return True
+
+
+def _replace_link_collisions_with_box(
+    link: ET.Element,
+    *,
+    origin_xyz: tuple[float, float, float],
+    size_xyz: tuple[float, float, float],
+) -> None:
+    for collision in list(link.findall("collision")):
+        link.remove(collision)
+
+    collision = ET.SubElement(link, "collision")
+    ET.SubElement(
+        collision,
+        "origin",
+        {
+            "xyz": " ".join(_format_float(value) for value in origin_xyz),
+            "rpy": "0 0 0",
+        },
+    )
+    geometry = ET.SubElement(collision, "geometry")
+    ET.SubElement(
+        geometry,
+        "box",
+        {"size": " ".join(_format_float(value) for value in size_xyz)},
+    )
+
+
+def _make_diagnostic_robot_dir(
+    source_robot_dir: Path,
+    *,
+    disable_nonfinger_collision: bool,
+    finger_collision_scale: float | None,
+    use_finger_box_collision_proxy: bool,
+    finger_box_collision_scale: float,
+) -> tempfile.TemporaryDirectory:
     temp_dir = tempfile.TemporaryDirectory(prefix="robotwin_ur5_wsg_diag_")
     temp_robot_dir = Path(temp_dir.name)
 
     config = yaml.safe_load((source_robot_dir / "config.yml").read_text(encoding="utf-8"))
     source_urdf = (source_robot_dir / config["urdf_path"]).resolve()
-    patched_urdf_name = f"{source_urdf.stem}_no_nonfinger_collision.urdf"
+    suffixes = []
+    if disable_nonfinger_collision:
+        suffixes.append("no_nonfinger_collision")
+    if finger_collision_scale is not None:
+        suffixes.append(f"finger_collision_scale_{_format_float(finger_collision_scale).replace('.', 'p')}")
+    if use_finger_box_collision_proxy:
+        suffixes.append(f"finger_box_collision_proxy_{_format_float(finger_box_collision_scale).replace('.', 'p')}")
+    patched_urdf_name = f"{source_urdf.stem}_{'_'.join(suffixes)}.urdf"
     patched_urdf = temp_robot_dir / patched_urdf_name
 
     tree = ET.parse(source_urdf)
     root = tree.getroot()
-    for link_name in ("wsg_50_base_link", "gripper_left", "gripper_right"):
-        link = root.find(f"./link[@name='{link_name}']")
-        if link is None:
-            raise RuntimeError(f"Failed to find link `{link_name}` in {source_urdf}")
-        for collision in list(link.findall("collision")):
-            link.remove(collision)
+    if disable_nonfinger_collision:
+        for link_name in ("wsg_50_base_link", "gripper_left", "gripper_right"):
+            link = root.find(f"./link[@name='{link_name}']")
+            if link is None:
+                raise RuntimeError(f"Failed to find link `{link_name}` in {source_urdf}")
+            for collision in list(link.findall("collision")):
+                link.remove(collision)
+
+    if use_finger_box_collision_proxy:
+        scale = float(finger_box_collision_scale)
+        if scale <= 0.0:
+            raise ValueError("--finger-box-collision-scale must be positive")
+        base_origin = (-0.0085, 0.0, 0.094)
+        base_size = (0.023, 0.03, 0.073)
+        for link_name in ("finger_left", "finger_right"):
+            link = root.find(f"./link[@name='{link_name}']")
+            if link is None:
+                raise RuntimeError(f"Failed to find link `{link_name}` in {source_urdf}")
+            _replace_link_collisions_with_box(
+                link,
+                origin_xyz=base_origin,
+                size_xyz=tuple(value * scale for value in base_size),
+            )
+    elif finger_collision_scale is not None:
+        if finger_collision_scale <= 0.0:
+            raise ValueError("--finger-collision-scale must be positive")
+        scaled_count = 0
+        for link_name in ("finger_left", "finger_right"):
+            link = root.find(f"./link[@name='{link_name}']")
+            if link is None:
+                raise RuntimeError(f"Failed to find link `{link_name}` in {source_urdf}")
+            for collision in link.findall("collision"):
+                if _scale_collision_mesh(collision, finger_collision_scale):
+                    scaled_count += 1
+        if scaled_count == 0:
+            raise RuntimeError("No finger collision mesh was found to scale")
     tree.write(patched_urdf, encoding="utf-8", xml_declaration=True)
 
     config["urdf_path"] = f"./{patched_urdf_name}"
@@ -331,6 +449,12 @@ def _first_index(records: list[dict[str, object]], predicate):
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.shrink_finger_collision and args.use_finger_box_collision_proxy:
+        raise ValueError("--shrink-finger-collision and --use-finger-box-collision-proxy are mutually exclusive")
+    if args.shrink_finger_collision and args.finger_collision_scale <= 0.0:
+        raise ValueError("--finger-collision-scale must be positive")
+    if args.use_finger_box_collision_proxy and args.finger_box_collision_scale <= 0.0:
+        raise ValueError("--finger-box-collision-scale must be positive")
 
     seed_path = _load_seed_path(args.task_profile, args.teacher_seed_path)
     teacher_seeds = _load_teacher_seeds(seed_path)
@@ -344,8 +468,18 @@ def main() -> None:
 
     temp_robot_dir = None
     original_ur5_wsg_dir = dual_ur5_module.UR5_WSG_DIR
-    if args.disable_nonfinger_gripper_collision:
-        temp_robot_dir = _make_nonfinger_collision_disabled_robot_dir(original_ur5_wsg_dir)
+    if (
+        args.disable_nonfinger_gripper_collision
+        or args.shrink_finger_collision
+        or args.use_finger_box_collision_proxy
+    ):
+        temp_robot_dir = _make_diagnostic_robot_dir(
+            original_ur5_wsg_dir,
+            disable_nonfinger_collision=bool(args.disable_nonfinger_gripper_collision),
+            finger_collision_scale=float(args.finger_collision_scale) if args.shrink_finger_collision else None,
+            use_finger_box_collision_proxy=bool(args.use_finger_box_collision_proxy),
+            finger_box_collision_scale=float(args.finger_box_collision_scale),
+        )
         dual_ur5_module.UR5_WSG_DIR = Path(temp_robot_dir.name)
 
     runtime_kwargs = {
@@ -354,10 +488,11 @@ def main() -> None:
         "render_mode": args.render_mode,
     }
     _, resolved_runtime, _ = apply_task_profile(args.task_profile, runtime_kwargs)
-    env = ManiSkillTaskFactory().create_env(task_name=args.task_profile, **resolved_runtime)
 
     records: list[dict[str, object]] = []
+    env = None
     try:
+        env = ManiSkillTaskFactory().create_env(task_name=args.task_profile, **resolved_runtime)
         env.reset(seed=reset_seed)
         raw_env = env.env.unwrapped
         _validate_joint_order(raw_env)
@@ -408,7 +543,8 @@ def main() -> None:
                 }
             )
     finally:
-        env.close()
+        if env is not None:
+            env.close()
         dual_ur5_module.UR5_WSG_DIR = original_ur5_wsg_dir
         if temp_robot_dir is not None:
             temp_robot_dir.cleanup()
@@ -453,6 +589,12 @@ def main() -> None:
         "legacy_hdf5_path": str(hdf5_path),
         "record_count": len(records),
         "disable_nonfinger_gripper_collision": bool(args.disable_nonfinger_gripper_collision),
+        "shrink_finger_collision": bool(args.shrink_finger_collision),
+        "use_finger_box_collision_proxy": bool(args.use_finger_box_collision_proxy),
+        "finger_collision_scale": float(args.finger_collision_scale) if args.shrink_finger_collision else None,
+        "finger_box_collision_scale": float(args.finger_box_collision_scale)
+        if args.use_finger_box_collision_proxy
+        else None,
         "contact_api_available": bool(records[0]["contact_api_available"]) if records else False,
         "first_teacher_close_idx": first_teacher_close_idx,
         "first_current_close_idx": first_current_close_idx,
