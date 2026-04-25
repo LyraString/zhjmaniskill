@@ -22,9 +22,6 @@ BOX_CENTER_Z = 0.842
 TARGET_CENTER_Z = 0.741
 BOX_BASE_QUAT = [0.981, 0.0, 0.0, 0.195]
 BOX_YAW_LIMIT = 0.2
-BOX_STATIC_FRICTION = 2.0
-BOX_DYNAMIC_FRICTION = 2.0
-BOX_RESTITUTION = 0.0
 
 
 def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
@@ -53,12 +50,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         super()._load_scene(options)
 
         box_builder = self.scene.create_actor_builder()
-        box_material = sapien.physx.PhysxMaterial(
-            BOX_STATIC_FRICTION,
-            BOX_DYNAMIC_FRICTION,
-            BOX_RESTITUTION,
-        )
-        box_builder.add_box_collision(half_size=BOX_HALF_SIZE.tolist(), material=box_material)
+        box_builder.add_box_collision(half_size=BOX_HALF_SIZE.tolist())
         if self.scene.can_render():
             box_builder.add_box_visual(
                 half_size=BOX_HALF_SIZE.tolist(),

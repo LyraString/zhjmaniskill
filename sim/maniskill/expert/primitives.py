@@ -830,7 +830,6 @@ class FixedRateMotionPrimitives:
         preferred_top_down_quat: np.ndarray | None = None,
         pre_pose_candidates_builder: Callable[[np.ndarray, int, float, int], list[np.ndarray]] | None = None,
         selection_mode: str = "auto",
-        prefer_screw_grasp: bool = True,
     ) -> GraspCandidate | None:
         self.sync_sim_state()
 
@@ -908,15 +907,12 @@ class FixedRateMotionPrimitives:
                     )
                     continue
                 next_qpos = np.asarray(pre_plan["position"][-1], dtype=np.float64)
-                grasp_plan = None
-                grasp_reason = None
+                grasp_plan, grasp_reason = self.plan_screw_to_pose_debug(
+                    arm_index,
+                    planner_grasp_pose,
+                    start_qpos=next_qpos,
+                )
                 grasp_plan_source = "screw"
-                if prefer_screw_grasp:
-                    grasp_plan, grasp_reason = self.plan_screw_to_pose_debug(
-                        arm_index,
-                        planner_grasp_pose,
-                        start_qpos=next_qpos,
-                    )
                 if grasp_plan is None:
                     grasp_plan, grasp_reason = self.plan_to_pose_debug(
                         arm_index,
@@ -924,15 +920,7 @@ class FixedRateMotionPrimitives:
                         start_qpos=next_qpos,
                     )
                     if grasp_plan is not None:
-                        grasp_plan_source = "pose_fallback" if prefer_screw_grasp else "pose"
-                if grasp_plan is None and not prefer_screw_grasp:
-                    grasp_plan, grasp_reason = self.plan_screw_to_pose_debug(
-                        arm_index,
-                        planner_grasp_pose,
-                        start_qpos=next_qpos,
-                    )
-                    if grasp_plan is not None:
-                        grasp_plan_source = "screw_fallback"
+                        grasp_plan_source = "pose_fallback"
                 if grasp_plan is None:
                     attempts.append(
                         {
@@ -1046,12 +1034,8 @@ class FixedRateMotionPrimitives:
         paired_close_gripper_pos: float | None = None,
         paired_close_gripper_release_after_smooth: bool = False,
         freeze_current_qpos_before_close: bool = False,
-        final_ik_refine_steps: int = 0,
-        final_ik_refine_settle_steps: int = 0,
-        final_ik_refine_required: bool = False,
         pre_pose_candidates_builder: Callable[[np.ndarray, int, float, int], list[np.ndarray]] | None = None,
         selection_mode: str = "auto",
-        prefer_screw_grasp: bool = True,
     ) -> tuple[GraspCandidate | None, bool]:
         candidate = self.choose_grasp_candidate(
             desired_pose=desired_pose,
@@ -1064,7 +1048,6 @@ class FixedRateMotionPrimitives:
             preferred_top_down_quat=preferred_top_down_quat,
             pre_pose_candidates_builder=pre_pose_candidates_builder,
             selection_mode=selection_mode,
-            prefer_screw_grasp=prefer_screw_grasp,
         )
         if candidate is None:
             self.last_status = fail_status
@@ -1075,33 +1058,6 @@ class FixedRateMotionPrimitives:
         success = self._execute_plan(arm_index, candidate.grasp_plan, recorder)
         if success:
             return candidate, True
-        if int(final_ik_refine_steps) > 0:
-            refine_pose = self.gripper_pose_to_planner_pose(arm_index, candidate.grasp_pose)
-            refine_qpos, refine_reason = self.ik_to_pose_debug(arm_index, refine_pose)
-            if refine_qpos is None:
-                self.last_plan_debug = {
-                    "arm_index": int(arm_index),
-                    "target_pose": np.asarray(refine_pose, dtype=np.float64).round(4).tolist(),
-                    "ik_reason": refine_reason,
-                    "steps": int(final_ik_refine_steps),
-                    "settle_steps": int(final_ik_refine_settle_steps),
-                    "stage": "final_ik_refine",
-                }
-                if final_ik_refine_required:
-                    self.last_status = fail_status
-                    return candidate, False
-            else:
-                success = self.move_to_qpos(
-                    arm_index,
-                    self._arm_qpos_from_plan(refine_qpos),
-                    recorder,
-                    steps=int(final_ik_refine_steps),
-                    settle_steps=int(final_ik_refine_settle_steps),
-                )
-                if success:
-                    return candidate, True
-                if self.last_status != "running":
-                    return candidate, False
         if freeze_current_qpos_before_close and pre_close_settle_steps > 0:
             success = self.hold_pose(
                 recorder,
