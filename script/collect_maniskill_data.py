@@ -284,7 +284,9 @@ def run_collection(args) -> None:
                         )
                     if args.debug_scripted_expert and getattr(solver, "first_pick_debug", None):
                         print("scripted_expert_pick_debug=" + json.dumps(solver.first_pick_debug, ensure_ascii=False))
-                    if (not success) and getattr(solver, "last_debug_info", None):
+                    if args.debug_scripted_expert and getattr(solver, "last_debug_info", None):
+                        print("scripted_expert_debug=" + json.dumps(solver.last_debug_info, ensure_ascii=False))
+                    if (not success) and (not args.debug_scripted_expert) and getattr(solver, "last_debug_info", None):
                         print("scripted_expert_debug=" + json.dumps(solver.last_debug_info, ensure_ascii=False))
                 else:
                     print(

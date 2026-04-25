@@ -696,14 +696,123 @@ class FixedRateMotionPrimitives:
         pos: float = 0.0,
         fail_status: str | None = None,
         allow_success_early: bool = True,
+        smooth_steps: int | None = None,
+        settle_steps: int | None = None,
+        step_callback: Callable[[dict[str, Any]], None] | None = None,
+        paired_gripper_arm_index: int | None = None,
+        paired_gripper_pos: float | None = None,
+        paired_gripper_release_after_smooth: bool = False,
     ) -> bool:
-        success = self.hold_pose(
-            recorder,
-            steps=self.GRIPPER_SETTLE_STEPS,
-            left_gripper=pos if arm_index == 0 else None,
-            right_gripper=pos if arm_index == 1 else None,
-            allow_success_early=allow_success_early,
-        )
+        if smooth_steps is None:
+            success = self.hold_pose(
+                recorder,
+                steps=self.GRIPPER_SETTLE_STEPS,
+                left_gripper=pos if arm_index == 0 else None,
+                right_gripper=pos if arm_index == 1 else None,
+                allow_success_early=allow_success_early,
+            )
+        else:
+            success = False
+            start_pos = float(self.commanded_gripper[arm_index])
+            step_count = max(1, int(smooth_steps))
+            target_positions = np.linspace(start_pos, float(pos), num=step_count, dtype=np.float64)
+            paired_positions = None
+            paired_start_pos = None
+            if paired_gripper_arm_index is not None and paired_gripper_pos is not None:
+                paired_start_pos = float(self.commanded_gripper[int(paired_gripper_arm_index)])
+                if paired_gripper_release_after_smooth:
+                    paired_positions = np.full(step_count, paired_start_pos, dtype=np.float64)
+                else:
+                    paired_positions = np.linspace(
+                        paired_start_pos,
+                        float(paired_gripper_pos),
+                        num=step_count,
+                        dtype=np.float64,
+                    )
+            for step_index, gripper_pos in enumerate(target_positions):
+                left_gripper = float(gripper_pos) if arm_index == 0 else None
+                right_gripper = float(gripper_pos) if arm_index == 1 else None
+                paired_gripper = None if paired_positions is None else float(paired_positions[step_index])
+                if paired_gripper is not None:
+                    if int(paired_gripper_arm_index) == 0:
+                        left_gripper = paired_gripper
+                    else:
+                        right_gripper = paired_gripper
+                action = self.compose_action(
+                    left_gripper=left_gripper,
+                    right_gripper=right_gripper,
+                )
+                result, step_success = self._step_and_record(action, recorder)
+                if step_callback is not None:
+                    step_callback(
+                        {
+                            "phase": "smooth",
+                            "step_index": int(step_index),
+                            "commanded_gripper": float(gripper_pos),
+                            "paired_commanded_gripper": paired_gripper,
+                            "global_step": int(self.steps_taken),
+                        }
+                    )
+                if step_success and allow_success_early:
+                    self.last_status = "success"
+                    success = True
+                    break
+                if result.terminated or result.truncated:
+                    self.last_status = "terminated_during_gripper_smooth_close"
+                    break
+            if not success and self.last_status == "running":
+                settle_count = self.GRIPPER_SETTLE_STEPS if settle_steps is None else max(0, int(settle_steps))
+                paired_settle_positions = None
+                if (
+                    paired_gripper_release_after_smooth
+                    and paired_gripper_arm_index is not None
+                    and paired_gripper_pos is not None
+                    and paired_start_pos is not None
+                    and settle_count > 0
+                ):
+                    paired_settle_positions = np.linspace(
+                        float(paired_start_pos),
+                        float(paired_gripper_pos),
+                        num=settle_count + 1,
+                        dtype=np.float64,
+                    )[1:]
+                for step_index in range(settle_count):
+                    left_gripper = pos if arm_index == 0 else None
+                    right_gripper = pos if arm_index == 1 else None
+                    if paired_gripper_arm_index is not None and paired_gripper_pos is not None:
+                        paired_gripper = (
+                            float(paired_settle_positions[step_index])
+                            if paired_settle_positions is not None
+                            else float(paired_gripper_pos)
+                        )
+                        if int(paired_gripper_arm_index) == 0:
+                            left_gripper = paired_gripper
+                        else:
+                            right_gripper = paired_gripper
+                    else:
+                        paired_gripper = None
+                    action = self.compose_action(
+                        left_gripper=left_gripper,
+                        right_gripper=right_gripper,
+                    )
+                    result, step_success = self._step_and_record(action, recorder)
+                    if step_callback is not None:
+                        step_callback(
+                            {
+                                "phase": "settle",
+                                "step_index": int(step_index),
+                                "commanded_gripper": float(pos),
+                                "paired_commanded_gripper": paired_gripper,
+                                "global_step": int(self.steps_taken),
+                            }
+                        )
+                    if step_success and allow_success_early:
+                        self.last_status = "success"
+                        success = True
+                        break
+                    if result.terminated or result.truncated:
+                        self.last_status = "terminated_during_gripper_smooth_close"
+                        break
         if not success and fail_status is not None and self.last_status not in ("running", "success"):
             self.last_status = fail_status
         return success
@@ -914,6 +1023,17 @@ class FixedRateMotionPrimitives:
         recorder,
         fail_status: str,
         gripper_pos: float = 0.0,
+        pre_close_settle_steps: int = 0,
+        pre_close_paired_gripper_arm_index: int | None = None,
+        pre_close_paired_gripper_pos: float | None = None,
+        pre_close_paired_gripper_steps: int = 0,
+        close_smooth_steps: int | None = None,
+        close_settle_steps: int | None = None,
+        close_step_callback: Callable[[dict[str, Any]], None] | None = None,
+        paired_close_gripper_arm_index: int | None = None,
+        paired_close_gripper_pos: float | None = None,
+        paired_close_gripper_release_after_smooth: bool = False,
+        freeze_current_qpos_before_close: bool = False,
         pre_pose_candidates_builder: Callable[[np.ndarray, int, float, int], list[np.ndarray]] | None = None,
         selection_mode: str = "auto",
     ) -> tuple[GraspCandidate | None, bool]:
@@ -938,7 +1058,54 @@ class FixedRateMotionPrimitives:
         success = self._execute_plan(arm_index, candidate.grasp_plan, recorder)
         if success:
             return candidate, True
-        success = self.close_gripper(arm_index, recorder, pos=gripper_pos)
+        if freeze_current_qpos_before_close and pre_close_settle_steps > 0:
+            success = self.hold_pose(
+                recorder,
+                steps=int(pre_close_settle_steps),
+                allow_success_early=False,
+            )
+            if success:
+                return candidate, True
+            pre_close_settle_steps = 0
+        if freeze_current_qpos_before_close:
+            self.commanded_arm_qpos[arm_index] = self.current_qpos(arm_index).copy()
+            for paired_arm_index in (pre_close_paired_gripper_arm_index, paired_close_gripper_arm_index):
+                if paired_arm_index is not None:
+                    self.commanded_arm_qpos[int(paired_arm_index)] = self.current_qpos(int(paired_arm_index)).copy()
+        if (
+            pre_close_paired_gripper_arm_index is not None
+            and pre_close_paired_gripper_pos is not None
+            and pre_close_paired_gripper_steps > 0
+        ):
+            success = self.close_gripper(
+                int(pre_close_paired_gripper_arm_index),
+                recorder,
+                pos=float(pre_close_paired_gripper_pos),
+                allow_success_early=False,
+                smooth_steps=int(pre_close_paired_gripper_steps),
+                settle_steps=0,
+            )
+            if success:
+                return candidate, True
+        if pre_close_settle_steps > 0:
+            success = self.hold_pose(
+                recorder,
+                steps=int(pre_close_settle_steps),
+                allow_success_early=False,
+            )
+            if success:
+                return candidate, True
+        success = self.close_gripper(
+            arm_index,
+            recorder,
+            pos=gripper_pos,
+            smooth_steps=close_smooth_steps,
+            settle_steps=close_settle_steps,
+            step_callback=close_step_callback,
+            paired_gripper_arm_index=paired_close_gripper_arm_index,
+            paired_gripper_pos=paired_close_gripper_pos,
+            paired_gripper_release_after_smooth=paired_close_gripper_release_after_smooth,
+        )
         return candidate, success
 
     def place_actor(
