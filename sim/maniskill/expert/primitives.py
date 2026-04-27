@@ -357,6 +357,9 @@ class FixedRateMotionPrimitives:
             if success and allow_success_early:
                 self.last_status = "success"
                 return True
+            if success and result.terminated:
+                self.last_status = "success"
+                return True
             if result.terminated or result.truncated:
                 self.last_status = "terminated_during_hold"
                 return False
