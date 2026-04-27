@@ -44,6 +44,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
 
     def __init__(self, *args, legacy_rng_compat: bool = False, **kwargs):
         self.legacy_rng_compat = bool(legacy_rng_compat)
+        self.success_gate_enabled = True
         super().__init__(*args, **kwargs)
 
     def _load_scene(self, options: dict):
@@ -170,7 +171,9 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         ) & (
             torch.linalg.norm(self.box.angular_velocity, axis=1) <= BOX_SETTLE_ANGULAR_EPS
         )
-        success = base_info["robots_ready"] & spatial_success
+        success = base_info["robots_ready"] & spatial_success & right_gripper_open & right_ee_clear & box_static
+        if not bool(getattr(self, "success_gate_enabled", True)):
+            success = torch.zeros_like(success, dtype=torch.bool)
 
         base_info.update(
             {
@@ -180,7 +183,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
                 "right_gripper_open": right_gripper_open,
                 "right_ee_clear": right_ee_clear,
                 "box_static": box_static,
-                "success": success & right_gripper_open & right_ee_clear & box_static,
+                "success": success,
             }
         )
         return base_info

@@ -169,6 +169,13 @@ class HandoverBlockSolver:
         self.last_debug_info: dict[str, object] = {}
         self.first_pick_debug: dict[str, object] = {}
 
+    def _set_success_gate_enabled(self, enabled: bool) -> bool | None:
+        if not hasattr(self.base_env, "success_gate_enabled"):
+            return None
+        previous = bool(self.base_env.success_gate_enabled)
+        self.base_env.success_gate_enabled = bool(enabled)
+        return previous
+
     @property
     def last_status(self) -> str:
         return self.ctrl.last_status
@@ -1903,7 +1910,12 @@ class HandoverBlockSolver:
         if self.ctrl.last_status != "running":
             return False, self.ctrl.steps_taken, self.ctrl.last_status
 
-        final_info = self.base_env.evaluate()
+        previous_success_gate_enabled = self._set_success_gate_enabled(True)
+        try:
+            final_info = self.base_env.evaluate()
+        finally:
+            if previous_success_gate_enabled is not None:
+                self._set_success_gate_enabled(previous_success_gate_enabled)
         target_fp_pose = self._target_functional_world_pose(1)
         final_debug_info = {
             "stage": "final_success_check",
@@ -1943,6 +1955,7 @@ class HandoverBlockSolver:
         self.ctrl.reset_episode(max_episode_steps)
         self.last_debug_info = {}
         self.first_pick_debug = {}
+        previous_success_gate_enabled = self._set_success_gate_enabled(False)
 
         try:
             if self.ctrl.settle_grippers_to_targets(
@@ -2452,3 +2465,6 @@ class HandoverBlockSolver:
         except EpisodeLimitReached:
             self.ctrl.last_status = "max_episode_steps_exceeded"
             return False, self.ctrl.steps_taken, self.ctrl.last_status
+        finally:
+            if previous_success_gate_enabled is not None:
+                self._set_success_gate_enabled(previous_success_gate_enabled)
