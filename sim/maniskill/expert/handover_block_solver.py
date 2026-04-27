@@ -129,12 +129,17 @@ class HandoverBlockSolver:
     RIGHT_PRE_PLACE_FALLBACK_STEPS = 12
     RIGHT_PRE_PLACE_FALLBACK_SETTLE_STEPS = 4
     RIGHT_PLACE_FALLBACK_IK_THRESHOLD = 5e-2
+    RIGHT_PLACE_FALLBACK_MAX_SHOULDER_DELTA = 0.8
+    RIGHT_PLACE_FALLBACK_MAX_JOINT_MOTION = 1.5
     RIGHT_PLACE_FALLBACK_STEPS = 12
     RIGHT_PLACE_FALLBACK_SETTLE_STEPS = 4
     RIGHT_PLACE_RELATIVE_FALLBACK_MAX_STEP = 0.02
     RIGHT_PLACE_RELATIVE_FALLBACK_IK_THRESHOLD = 6e-2
     RIGHT_PLACE_RELATIVE_FALLBACK_STEPS = 6
     RIGHT_PLACE_RELATIVE_FALLBACK_SETTLE_STEPS = 1
+    RIGHT_PLACE_ALLOW_RELEASE_FROM_PRE_PLACE = True
+    RIGHT_PLACE_RELEASE_FROM_PRE_PLACE_MAX_XY_ERROR = 0.06
+    RIGHT_PLACE_RELEASE_FROM_PRE_PLACE_MAX_Z_ABOVE = 0.12
     RIGHT_HANDOVER_DUAL_HOLD_STEPS = 0
     RIGHT_HANDOVER_PRE_CLOSE_SETTLE_STEPS = 8
     RIGHT_HANDOVER_CLOSE_SMOOTH_STEPS = 16
@@ -1241,6 +1246,8 @@ class HandoverBlockSolver:
         right_pre_place_fallback_debug = None
         right_place_fallback_debug = None
         right_place_relative_fallback_debug = None
+        right_place_release_from_pre_place_debug = None
+        skip_right_place_correction = False
         if selected_place_candidate is not None:
             selected_place_variant_index = int(selected_place_candidate["variant_index"])
             selected_place_grasp_plan_source = str(selected_place_candidate["grasp_plan_source"])
@@ -1319,6 +1326,36 @@ class HandoverBlockSolver:
                 recorder,
             ):
                 return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                release_desired_box_center = np.asarray(target_fp_pose, dtype=np.float64)[:3].copy()
+                release_desired_box_center[2] += float(self.box_half_size[2])
+                release_box_pose = np.asarray(self._box_pose(), dtype=np.float64)
+                release_residual = release_desired_box_center - release_box_pose[:3]
+                release_xy_error = float(np.linalg.norm(release_residual[:2]))
+                release_z_above = float(release_box_pose[2] - release_desired_box_center[2])
+                right_place_release_from_pre_place_debug = {
+                    "used": False,
+                    "reason": "right_place_failed",
+                    "max_xy_error": float(self.RIGHT_PLACE_RELEASE_FROM_PRE_PLACE_MAX_XY_ERROR),
+                    "max_z_above": float(self.RIGHT_PLACE_RELEASE_FROM_PRE_PLACE_MAX_Z_ABOVE),
+                    "desired_box_center": release_desired_box_center.round(4).tolist(),
+                    "box_pose": release_box_pose.round(4).tolist(),
+                    "residual": release_residual.round(4).tolist(),
+                    "xy_error": round(release_xy_error, 4),
+                    "z_above": round(release_z_above, 4),
+                    "failed_status": self.ctrl.last_status,
+                }
+                if (
+                    self.RIGHT_PLACE_ALLOW_RELEASE_FROM_PRE_PLACE
+                    and release_xy_error <= self.RIGHT_PLACE_RELEASE_FROM_PRE_PLACE_MAX_XY_ERROR
+                    and 0.0 <= release_z_above <= self.RIGHT_PLACE_RELEASE_FROM_PRE_PLACE_MAX_Z_ABOVE
+                ):
+                    right_place_release_from_pre_place_debug["used"] = True
+                    right_place_release_from_pre_place_debug["reason"] = "box_already_over_target"
+                    skip_right_place_correction = True
+                    self.ctrl.last_status = "running"
+                    self.ctrl.last_plan_debug = {}
+
             if self.ctrl.last_status != "running":
                 self.last_debug_info = {
                     "stage": "right_place",
@@ -1447,17 +1484,36 @@ class HandoverBlockSolver:
                 fallback_qpos, fallback_reason = self.ctrl.ik_to_pose_debug(
                     1,
                     right_place_planner_pose,
+                    n_init_qpos=1,
                     threshold=self.RIGHT_PLACE_FALLBACK_IK_THRESHOLD,
                 )
                 if fallback_qpos is not None:
+                    current_right_qpos = np.asarray(self.ctrl.current_qpos(1), dtype=np.float64)
                     right_place_fallback_arm_qpos = self.ctrl._arm_qpos_from_plan(fallback_qpos)
+                    right_place_fallback_delta = right_place_fallback_arm_qpos - current_right_qpos
+                    right_place_fallback_shoulder_delta = abs(float(right_place_fallback_delta[0]))
+                    right_place_fallback_joint_motion = float(np.linalg.norm(right_place_fallback_delta))
                     right_place_fallback_debug = {
-                        "used": True,
+                        "used": False,
                         "threshold": float(self.RIGHT_PLACE_FALLBACK_IK_THRESHOLD),
                         "ik_reason": fallback_reason,
                         "target_arm_qpos": right_place_fallback_arm_qpos.round(4).tolist(),
+                        "current_arm_qpos": current_right_qpos.round(4).tolist(),
+                        "shoulder_pan_delta": round(right_place_fallback_shoulder_delta, 4),
+                        "joint_motion": round(right_place_fallback_joint_motion, 4),
                         "primary_plan_debug": right_place_primary_plan_debug,
                     }
+                    if (
+                        right_place_fallback_shoulder_delta > self.RIGHT_PLACE_FALLBACK_MAX_SHOULDER_DELTA
+                        or right_place_fallback_joint_motion > self.RIGHT_PLACE_FALLBACK_MAX_JOINT_MOTION
+                    ):
+                        fallback_qpos = None
+                        fallback_reason = "rejected_large_joint_jump"
+                        right_place_fallback_debug["reject_reason"] = fallback_reason
+                    else:
+                        right_place_fallback_debug["used"] = True
+                if fallback_qpos is not None:
+                    right_place_fallback_arm_qpos = self.ctrl._arm_qpos_from_plan(fallback_qpos)
                     self.ctrl.last_status = "running"
                     if self.ctrl.move_to_qpos(
                         1,
@@ -1473,12 +1529,13 @@ class HandoverBlockSolver:
                         right_place_failure_plan_debug = dict(self.ctrl.last_plan_debug)
                         right_place_fallback_debug["move_debug"] = right_place_failure_plan_debug
                 else:
-                    right_place_fallback_debug = {
-                        "used": False,
-                        "threshold": float(self.RIGHT_PLACE_FALLBACK_IK_THRESHOLD),
-                        "ik_reason": fallback_reason,
-                        "primary_plan_debug": right_place_primary_plan_debug,
-                    }
+                    if right_place_fallback_debug is None:
+                        right_place_fallback_debug = {
+                            "used": False,
+                            "threshold": float(self.RIGHT_PLACE_FALLBACK_IK_THRESHOLD),
+                            "ik_reason": fallback_reason,
+                            "primary_plan_debug": right_place_primary_plan_debug,
+                        }
                     relative_trace: list[dict[str, object]] = []
                     relative_target_delta = (
                         np.asarray(right_place_pose, dtype=np.float64)[:3]
@@ -1510,6 +1567,7 @@ class HandoverBlockSolver:
                         step_ik_qpos, step_ik_reason = self.ctrl.ik_to_pose_debug(
                             1,
                             step_target_planner_pose,
+                            n_init_qpos=1,
                             threshold=self.RIGHT_PLACE_RELATIVE_FALLBACK_IK_THRESHOLD,
                         )
                         if step_ik_qpos is None:
@@ -1524,19 +1582,32 @@ class HandoverBlockSolver:
                                 "settle_steps": int(self.RIGHT_PLACE_RELATIVE_FALLBACK_SETTLE_STEPS),
                             }
                         else:
+                            current_right_qpos = np.asarray(self.ctrl.current_qpos(1), dtype=np.float64)
                             step_target_arm_qpos = self.ctrl._arm_qpos_from_plan(step_ik_qpos)
+                            step_qpos_delta = step_target_arm_qpos - current_right_qpos
+                            step_shoulder_delta = abs(float(step_qpos_delta[0]))
+                            step_joint_motion = float(np.linalg.norm(step_qpos_delta))
                             self.ctrl.last_status = "running"
                             self.ctrl.last_plan_debug = {
                                 "arm_index": 1,
                                 "target_gripper_pose": step_target_gripper_pose.round(4).tolist(),
                                 "target_planner_pose": step_target_planner_pose.round(4).tolist(),
+                                "current_arm_qpos": current_right_qpos.round(4).tolist(),
                                 "target_arm_qpos": step_target_arm_qpos.round(4).tolist(),
+                                "shoulder_pan_delta": round(step_shoulder_delta, 4),
+                                "joint_motion": round(step_joint_motion, 4),
                                 "ik_threshold": float(self.RIGHT_PLACE_RELATIVE_FALLBACK_IK_THRESHOLD),
                                 "ik_reason": step_ik_reason,
                                 "steps": int(self.RIGHT_PLACE_RELATIVE_FALLBACK_STEPS),
                                 "settle_steps": int(self.RIGHT_PLACE_RELATIVE_FALLBACK_SETTLE_STEPS),
                             }
-                            if self.ctrl.move_to_qpos(
+                            if (
+                                step_shoulder_delta > self.RIGHT_PLACE_FALLBACK_MAX_SHOULDER_DELTA
+                                or step_joint_motion > self.RIGHT_PLACE_FALLBACK_MAX_JOINT_MOTION
+                            ):
+                                self.ctrl.last_status = "right_place_relative_fallback_rejected"
+                                self.ctrl.last_plan_debug["reject_reason"] = "large_joint_jump"
+                            elif self.ctrl.move_to_qpos(
                                 1,
                                 step_target_arm_qpos,
                                 recorder,
@@ -1563,6 +1634,36 @@ class HandoverBlockSolver:
                             break
 
             if self.ctrl.last_status != "running":
+                release_desired_box_center = np.asarray(target_fp_pose, dtype=np.float64)[:3].copy()
+                release_desired_box_center[2] += float(self.box_half_size[2])
+                release_box_pose = np.asarray(self._box_pose(), dtype=np.float64)
+                release_residual = release_desired_box_center - release_box_pose[:3]
+                release_xy_error = float(np.linalg.norm(release_residual[:2]))
+                release_z_above = float(release_box_pose[2] - release_desired_box_center[2])
+                right_place_release_from_pre_place_debug = {
+                    "used": False,
+                    "reason": "right_place_failed",
+                    "max_xy_error": float(self.RIGHT_PLACE_RELEASE_FROM_PRE_PLACE_MAX_XY_ERROR),
+                    "max_z_above": float(self.RIGHT_PLACE_RELEASE_FROM_PRE_PLACE_MAX_Z_ABOVE),
+                    "desired_box_center": release_desired_box_center.round(4).tolist(),
+                    "box_pose": release_box_pose.round(4).tolist(),
+                    "residual": release_residual.round(4).tolist(),
+                    "xy_error": round(release_xy_error, 4),
+                    "z_above": round(release_z_above, 4),
+                    "failed_status": self.ctrl.last_status,
+                }
+                if (
+                    self.RIGHT_PLACE_ALLOW_RELEASE_FROM_PRE_PLACE
+                    and release_xy_error <= self.RIGHT_PLACE_RELEASE_FROM_PRE_PLACE_MAX_XY_ERROR
+                    and 0.0 <= release_z_above <= self.RIGHT_PLACE_RELEASE_FROM_PRE_PLACE_MAX_Z_ABOVE
+                ):
+                    right_place_release_from_pre_place_debug["used"] = True
+                    right_place_release_from_pre_place_debug["reason"] = "box_already_over_target"
+                    skip_right_place_correction = True
+                    self.ctrl.last_status = "running"
+                    self.ctrl.last_plan_debug = {}
+
+            if self.ctrl.last_status != "running":
                 self.last_debug_info = {
                     "stage": "right_place",
                     **left_release_clear_debug,
@@ -1578,6 +1679,7 @@ class HandoverBlockSolver:
                     "right_pre_place_fallback_debug": right_pre_place_fallback_debug,
                     "right_place_fallback_debug": right_place_fallback_debug,
                     "right_place_relative_fallback_debug": right_place_relative_fallback_debug,
+                    "right_place_release_from_pre_place_debug": right_place_release_from_pre_place_debug,
                     "target_fp_pose": np.asarray(target_fp_pose, dtype=np.float64).round(4).tolist(),
                     "place_target_pose": np.asarray(place_target_pose, dtype=np.float64).round(4).tolist(),
                     "right_pre_place_world_offset": np.asarray(self.RIGHT_PRE_PLACE_WORLD_OFFSET, dtype=np.float64).round(4).tolist(),
@@ -1617,6 +1719,7 @@ class HandoverBlockSolver:
                 "right_pre_place_fallback_debug": right_pre_place_fallback_debug,
                 "right_place_fallback_debug": right_place_fallback_debug,
                 "right_place_relative_fallback_debug": right_place_relative_fallback_debug,
+                "right_place_release_from_pre_place_debug": right_place_release_from_pre_place_debug,
                 "target_fp_pose": np.asarray(target_fp_pose, dtype=np.float64).round(4).tolist(),
                 "place_target_pose": np.asarray(place_target_pose, dtype=np.float64).round(4).tolist(),
                 "right_pre_place_pose": np.asarray(right_pre_place_pose, dtype=np.float64).round(4).tolist(),
@@ -1634,7 +1737,16 @@ class HandoverBlockSolver:
         right_place_correction_trace: list[dict[str, object]] = []
         desired_box_center = np.asarray(target_fp_pose, dtype=np.float64)[:3].copy()
         desired_box_center[2] += float(self.box_half_size[2])
-        for correction_index in range(int(self.RIGHT_PLACE_CORRECTION_ITERS)):
+        if skip_right_place_correction:
+            right_place_correction_trace.append(
+                {
+                    "skipped": True,
+                    "reason": "release_from_pre_place",
+                    "desired_box_center": desired_box_center.round(4).tolist(),
+                    "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                }
+            )
+        for correction_index in range(0 if skip_right_place_correction else int(self.RIGHT_PLACE_CORRECTION_ITERS)):
             current_box_pose = np.asarray(self._box_pose(), dtype=np.float64)
             residual = desired_box_center - current_box_pose[:3]
             if (
@@ -1677,6 +1789,7 @@ class HandoverBlockSolver:
                     "right_pre_place_fallback_debug": right_pre_place_fallback_debug,
                     "right_place_fallback_debug": right_place_fallback_debug,
                     "right_place_relative_fallback_debug": right_place_relative_fallback_debug,
+                    "right_place_release_from_pre_place_debug": right_place_release_from_pre_place_debug,
                     "target_fp_pose": np.asarray(target_fp_pose, dtype=np.float64).round(4).tolist(),
                     "desired_box_center": desired_box_center.round(4).tolist(),
                     "right_place_correction_trace": right_place_correction_trace,
@@ -1708,6 +1821,7 @@ class HandoverBlockSolver:
                 "right_place_pose": np.asarray(right_place_pose, dtype=np.float64).round(4).tolist(),
                 "right_place_fallback_debug": right_place_fallback_debug,
                 "right_place_relative_fallback_debug": right_place_relative_fallback_debug,
+                "right_place_release_from_pre_place_debug": right_place_release_from_pre_place_debug,
                 "right_place_correction_trace": right_place_correction_trace,
                 "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
                 "right_gripper_pose": np.asarray(self.ctrl.current_gripper_pose(1), dtype=np.float64).round(4).tolist(),
@@ -1800,6 +1914,7 @@ class HandoverBlockSolver:
             "right_pre_place_fallback_debug": right_pre_place_fallback_debug,
             "right_place_fallback_debug": right_place_fallback_debug,
             "right_place_relative_fallback_debug": right_place_relative_fallback_debug,
+            "right_place_release_from_pre_place_debug": right_place_release_from_pre_place_debug,
             "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
             "target_fp_pose": np.asarray(target_fp_pose, dtype=np.float64).round(4).tolist(),
             "box_to_target_xy": (
