@@ -400,8 +400,25 @@ class BaseBimanualEnv(BaseEnv):
             self._set_gripper(torch.zeros(len(env_idx), device=self.device), arm_index=0, env_idx=env_idx)
             self._set_gripper(torch.zeros(len(env_idx), device=self.device), arm_index=1, env_idx=env_idx)
 
+    def _arm_joint_limits(self, robot, arm_joints, target_qpos: torch.Tensor):
+        qlimits = robot.get_qlimits().to(device=target_qpos.device, dtype=target_qpos.dtype)
+        if qlimits.ndim == 2:
+            qlimits = qlimits.unsqueeze(0)
+        arm_dof = len(arm_joints)
+        if qlimits.shape[1] < arm_dof:
+            return None
+        limits = qlimits[:, :arm_dof, :]
+        if limits.shape[0] == 1 and target_qpos.shape[0] > 1:
+            limits = limits.expand(target_qpos.shape[0], -1, -1)
+        return limits[:, :, 0], limits[:, :, 1]
+
     def _apply_arm_action(self, robot, arm_joints, target_qpos: torch.Tensor):
-        target_arm_qpos = torch.clamp(target_qpos, min=-np.pi, max=np.pi)
+        joint_limits = self._arm_joint_limits(robot, arm_joints, target_qpos)
+        if joint_limits is None:
+            target_arm_qpos = target_qpos
+        else:
+            lower, upper = joint_limits
+            target_arm_qpos = torch.minimum(torch.maximum(target_qpos, lower), upper)
         robot.set_joint_drive_targets(target_arm_qpos, joints=arm_joints)
         robot.set_joint_drive_velocity_targets(
             torch.zeros_like(target_arm_qpos),
