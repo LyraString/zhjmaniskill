@@ -34,9 +34,12 @@ class PolicyManualInterventionCollector:
     MANUAL_RIGHT_TRANSLATION_STEP = 0.03
     MANUAL_LIFT_STEP = 0.02
     MANUAL_RIGHT_LIFT_STEP = 0.03
-    MANUAL_MOVE_STEPS = 8
-    MANUAL_SETTLE_STEPS = 4
+    MANUAL_MOVE_STEPS = 5
+    MANUAL_SETTLE_STEPS = 1
     MANUAL_ENTRY_FREEZE_STEPS = 8
+    MANUAL_GRIPPER_CLOSED_HOLD_THRESHOLD = 0.2
+    MANUAL_GRIPPER_CLOSED_DRIVE_VALUE = -0.2
+    POLICY_GRIP_GUARD_TAKEOVER_DISTANCE = 0.16
     MANUAL_AUTO_ALIGN_STEP = 0.035
     MANUAL_RIGHT_AUTO_ALIGN_STEP = 0.055
     MANUAL_AUTO_ALIGN_GRASP_SWITCH_DISTANCE = 0.05
@@ -77,6 +80,8 @@ class PolicyManualInterventionCollector:
         self.model = self.adapter.get_model({"ckpt_path": ckpt_path})
         self.solver = HandoverBlockSolver(env_backend)
         self.last_debug_info: dict[str, Any] = {}
+        self._manual_hold_arm_qpos: dict[int, np.ndarray] = {}
+        self._policy_grip_guard_arm_index: int | None = None
 
     def _maybe_render(self) -> None:
         if getattr(self.backend, "render_mode", None) == "human":
@@ -133,6 +138,92 @@ class PolicyManualInterventionCollector:
         for arm_index in (0, 1):
             self.solver.ctrl.commanded_arm_qpos[arm_index] = self.solver.ctrl.current_qpos(arm_index).copy()
 
+    def _reset_manual_hold_targets(self) -> None:
+        self._manual_hold_arm_qpos = {
+            arm_index: self.solver.ctrl.current_qpos(arm_index).copy()
+            for arm_index in (0, 1)
+        }
+
+    def _remember_manual_hold_target(self, arm_index: int, qpos: np.ndarray | None = None) -> None:
+        if qpos is None:
+            qpos = self.solver.ctrl.current_qpos(int(arm_index))
+        self._manual_hold_arm_qpos[int(arm_index)] = np.asarray(qpos, dtype=np.float64).copy()
+
+    def _manual_hold_target(self, arm_index: int) -> np.ndarray:
+        arm_index = int(arm_index)
+        if arm_index not in self._manual_hold_arm_qpos:
+            self._remember_manual_hold_target(arm_index)
+        return self._manual_hold_arm_qpos[arm_index].copy()
+
+    def _manual_gripper_hold_value(self, arm_index: int) -> float:
+        value = float(self.solver.ctrl.commanded_gripper[int(arm_index)])
+        if value <= self.MANUAL_GRIPPER_CLOSED_HOLD_THRESHOLD:
+            return 0.0
+        return value
+
+    def _set_manual_gripper_drive_override(self, arm_index: int, gripper_value: float) -> None:
+        setter = getattr(self.base_env, "set_manual_gripper_drive_override", None)
+        if setter is None:
+            return
+        if float(gripper_value) <= self.MANUAL_GRIPPER_CLOSED_HOLD_THRESHOLD:
+            setter(int(arm_index), self.MANUAL_GRIPPER_CLOSED_DRIVE_VALUE)
+        else:
+            setter(int(arm_index), None)
+
+    def _clear_manual_gripper_drive_overrides(self) -> None:
+        clearer = getattr(self.base_env, "clear_manual_gripper_drive_overrides", None)
+        if clearer is not None:
+            clearer()
+
+    def _disable_policy_grip_guard(self) -> None:
+        if self._policy_grip_guard_arm_index is not None:
+            self._set_manual_gripper_drive_override(self._policy_grip_guard_arm_index, 1.0)
+        self._policy_grip_guard_arm_index = None
+
+    def _enable_policy_grip_guard_if_closed(self, arm_index: int) -> None:
+        arm_index = int(arm_index)
+        if float(self.solver.ctrl.current_gripper_value(arm_index)) > self.MANUAL_GRIPPER_CLOSED_HOLD_THRESHOLD:
+            return
+        self._policy_grip_guard_arm_index = arm_index
+        self.solver.ctrl.commanded_gripper[arm_index] = 0.0
+        self._set_manual_gripper_drive_override(arm_index, 0.0)
+        if self.debug:
+            print(f"[manual] policy grip guard enabled: {self._arm_name(arm_index)}")
+
+    def _opposite_gripper_has_taken_over(self, guarded_arm_index: int) -> bool:
+        other_arm_index = 1 - int(guarded_arm_index)
+        if float(self.solver.ctrl.current_gripper_value(other_arm_index)) > self.MANUAL_GRIPPER_CLOSED_HOLD_THRESHOLD:
+            return False
+        box_pose = np.asarray(self.solver._box_pose(), dtype=np.float64)
+        other_pose = np.asarray(self.solver.ctrl.current_gripper_pose(other_arm_index), dtype=np.float64)
+        distance = float(np.linalg.norm(other_pose[:3] - box_pose[:3]))
+        return distance <= self.POLICY_GRIP_GUARD_TAKEOVER_DISTANCE
+
+    def _apply_policy_grip_guard(self, action: np.ndarray) -> np.ndarray:
+        guarded_arm_index = self._policy_grip_guard_arm_index
+        if guarded_arm_index is None:
+            return action
+        if self._opposite_gripper_has_taken_over(guarded_arm_index):
+            if self.debug:
+                print(f"[manual] policy grip guard released: {self._arm_name(guarded_arm_index)}")
+            self._disable_policy_grip_guard()
+            return action
+
+        guarded_action = np.asarray(action, dtype=np.float32).copy()
+        gripper_index = 6 if int(guarded_arm_index) == 0 else 13
+        guarded_action[gripper_index] = 0.0
+        self.solver.ctrl.commanded_gripper[int(guarded_arm_index)] = 0.0
+        self._set_manual_gripper_drive_override(int(guarded_arm_index), 0.0)
+        return guarded_action
+
+    @staticmethod
+    def _manual_terminal_status(result, default_status: str) -> str | None:
+        if result.truncated:
+            return "episode_limit_reached"
+        if result.terminated:
+            return default_status
+        return None
+
     def _zero_arm_velocity(self, arm_index: int) -> None:
         robot = self.base_env.get_arm_robot(int(arm_index))
         qvel = robot.get_qvel().clone()
@@ -180,7 +271,13 @@ class PolicyManualInterventionCollector:
         if active_qpos is None:
             active_qpos = self.solver.ctrl.current_qpos(active_arm_index)
         if inactive_qpos is None:
-            inactive_qpos = self.solver.ctrl.current_qpos(inactive_arm_index)
+            inactive_qpos = self._manual_hold_target(inactive_arm_index)
+        if left_gripper is None:
+            left_gripper = self._manual_gripper_hold_value(0)
+        if right_gripper is None:
+            right_gripper = self._manual_gripper_hold_value(1)
+        self._set_manual_gripper_drive_override(0, float(left_gripper))
+        self._set_manual_gripper_drive_override(1, float(right_gripper))
         if active_arm_index == 0:
             return self.solver.ctrl.compose_action(
                 left_qpos=active_qpos,
@@ -205,7 +302,7 @@ class PolicyManualInterventionCollector:
         settle_steps: int,
     ) -> bool:
         start_qpos = self.solver.ctrl.current_qpos(arm_index)
-        inactive_qpos = self.solver.ctrl.current_qpos(1 - int(arm_index))
+        inactive_qpos = self._manual_hold_target(1 - int(arm_index))
         inactive_start_pose = np.asarray(self.solver.ctrl.current_gripper_pose(1 - int(arm_index)), dtype=np.float64)
         target_qpos = np.asarray(target_qpos, dtype=np.float64).reshape(start_qpos.shape)
         trajectory = np.linspace(start_qpos, target_qpos, num=int(steps)).astype(np.float64, copy=False)
@@ -214,24 +311,27 @@ class PolicyManualInterventionCollector:
             self._zero_arm_velocity(1 - int(arm_index))
             action = self._manual_action(arm_index, active_qpos=qpos, inactive_qpos=inactive_qpos)
             result, success = self.solver.ctrl._step_and_record(action, recorder)
-            if success:
+            if success or self.solver.ctrl.current_success():
                 self.solver.ctrl.last_status = "success"
                 return True
-            if result.terminated or result.truncated:
-                self.solver.ctrl.last_status = "terminated_during_qpos_move"
+            terminal_status = self._manual_terminal_status(result, "terminated_during_qpos_move")
+            if terminal_status is not None:
+                self.solver.ctrl.last_status = terminal_status
                 return False
         for _ in range(int(settle_steps)):
             self._freeze_arm_qpos(1 - int(arm_index), inactive_qpos)
             self._zero_arm_velocity(1 - int(arm_index))
             action = self._manual_action(arm_index, active_qpos=target_qpos, inactive_qpos=inactive_qpos)
             result, success = self.solver.ctrl._step_and_record(action, recorder)
-            if success:
+            if success or self.solver.ctrl.current_success():
                 self.solver.ctrl.last_status = "success"
                 return True
-            if result.terminated or result.truncated:
-                self.solver.ctrl.last_status = "terminated_during_qpos_move"
+            terminal_status = self._manual_terminal_status(result, "terminated_during_qpos_move")
+            if terminal_status is not None:
+                self.solver.ctrl.last_status = terminal_status
                 return False
         self._sync_manual_arm_targets()
+        self._remember_manual_hold_target(arm_index, target_qpos)
         inactive_end_pose = np.asarray(self.solver.ctrl.current_gripper_pose(1 - int(arm_index)), dtype=np.float64)
         self.solver.ctrl.last_plan_debug["inactive_gripper_drift"] = round(
             float(np.linalg.norm(inactive_end_pose[:3] - inactive_start_pose[:3])),
@@ -251,7 +351,7 @@ class PolicyManualInterventionCollector:
         right_gripper: float | None = None,
     ) -> bool:
         active_qpos = self.solver.ctrl.current_qpos(active_arm_index)
-        inactive_qpos = self.solver.ctrl.current_qpos(1 - int(active_arm_index))
+        inactive_qpos = self._manual_hold_target(1 - int(active_arm_index))
         for _ in range(int(steps)):
             self._freeze_arm_qpos(active_arm_index, active_qpos)
             self._freeze_arm_qpos(1 - int(active_arm_index), inactive_qpos)
@@ -265,13 +365,15 @@ class PolicyManualInterventionCollector:
                 right_gripper=right_gripper,
             )
             result, success = self.solver.ctrl._step_and_record(action, recorder)
-            if success:
+            if success or self.solver.ctrl.current_success():
                 self.solver.ctrl.last_status = "success"
                 return True
-            if result.terminated or result.truncated:
-                self.solver.ctrl.last_status = "terminated_during_hold"
+            terminal_status = self._manual_terminal_status(result, "terminated_during_hold")
+            if terminal_status is not None:
+                self.solver.ctrl.last_status = terminal_status
                 return False
         self._sync_manual_arm_targets()
+        self._remember_manual_hold_target(active_arm_index, active_qpos)
         return False
 
     def _manual_translation_step(self, arm_index: int) -> float:
@@ -810,8 +912,10 @@ class PolicyManualInterventionCollector:
         self.solver.ctrl.reset_episode(max_episode_steps=max(int(remaining_steps), 1))
         previous_success_detection = self.solver.ctrl.success_detection_enabled
         self.solver.ctrl.success_detection_enabled = False
+        self._clear_manual_gripper_drive_overrides()
 
         active_arm_index = int(initial_arm_index)
+        self._reset_manual_hold_targets()
         self._manual_hold_pose(
             recorder,
             active_arm_index=active_arm_index,
@@ -854,6 +958,7 @@ class PolicyManualInterventionCollector:
 
             while True:
                 snapshot = self._manual_state_snapshot(active_arm_index)
+                steps_left = int(self.solver.ctrl.step_limit - self.solver.ctrl.steps_taken)
                 print(
                     "[manual] "
                     f"arm={snapshot['arm_name']} "
@@ -861,7 +966,8 @@ class PolicyManualInterventionCollector:
                     f"gripper={snapshot['gripper_pose'][:3]} "
                     f"other_{snapshot['other_arm_name']}={snapshot['other_gripper_pose'][:3]} "
                     f"box={snapshot['box_pose'][:3]} "
-                    f"gripper_val={snapshot['gripper_value']:.2f}"
+                    f"gripper_val={snapshot['gripper_value']:.2f} "
+                    f"steps_left={steps_left}"
                 )
                 command = self._read_manual_command()
 
@@ -873,12 +979,16 @@ class PolicyManualInterventionCollector:
                 if command in ("p", "status"):
                     continue
                 if command in ("1", "left", "l"):
+                    self._remember_manual_hold_target(active_arm_index)
                     active_arm_index = 0
+                    self._remember_manual_hold_target(active_arm_index)
                     self.last_debug_info["manual_commands"].append("switch:left")
                     print("[manual] active arm: left")
                     continue
                 if command in ("2", "right"):
+                    self._remember_manual_hold_target(active_arm_index)
                     active_arm_index = 1
+                    self._remember_manual_hold_target(active_arm_index)
                     self.last_debug_info["manual_commands"].append("switch:right")
                     print("[manual] active arm: right")
                     continue
@@ -937,6 +1047,7 @@ class PolicyManualInterventionCollector:
             self.last_debug_info["status"] = "episode_limit_reached"
             return "episode_limit_reached"
         finally:
+            self._clear_manual_gripper_drive_overrides()
             self.solver.ctrl.success_detection_enabled = previous_success_detection
 
     def _run_left_first_grasp_manual_intervention(
@@ -963,6 +1074,8 @@ class PolicyManualInterventionCollector:
         max_episode_steps: int,
     ) -> tuple[bool, int, str]:
         tracking = _ObsTrackingRecorder(recorder)
+        self._disable_policy_grip_guard()
+        self._clear_manual_gripper_drive_overrides()
         obs = self.backend.reset(seed=seed)
         tracking.start_episode(dict(obs.data))
         self._maybe_render()
@@ -993,7 +1106,17 @@ class PolicyManualInterventionCollector:
                     if tracking.last_obs is not None:
                         self.adapter.reset_model(self.model)
                         encoded_obs = self.adapter.encode_obs(tracking.last_obs)
+                    if status == "success":
+                        success = True
+                        break
                     if status == "manual_intervention_resumed":
+                        guard_arm_index = int(
+                            self.last_debug_info.get(
+                                "post_manual_active_arm_index",
+                                self._default_manual_arm_index(),
+                            )
+                        )
+                        self._enable_policy_grip_guard_if_closed(guard_arm_index)
                         resume_after_intervention = True
                     break
 
@@ -1007,10 +1130,16 @@ class PolicyManualInterventionCollector:
                     if tracking.last_obs is not None:
                         self.adapter.reset_model(self.model)
                         encoded_obs = self.adapter.encode_obs(tracking.last_obs)
+                    if status == "success":
+                        success = True
+                        break
                     if status == "manual_intervention_resumed":
+                        guard_arm_index = int(self.last_debug_info.get("post_manual_active_arm_index", 0))
+                        self._enable_policy_grip_guard_if_closed(guard_arm_index)
                         resume_after_intervention = True
                     break
 
+                action = self._apply_policy_grip_guard(action)
                 result = self.backend.step(
                     ActionSpec.from_value(action, action_type=self.action_type)
                 )
@@ -1051,4 +1180,6 @@ class PolicyManualInterventionCollector:
         if tracking.step_count >= int(max_episode_steps) and not success and status == "policy_rollout_finished":
             status = "max_episode_steps_reached"
 
+        self._disable_policy_grip_guard()
+        self._clear_manual_gripper_drive_overrides()
         return success, tracking.step_count, status

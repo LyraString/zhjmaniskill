@@ -28,6 +28,7 @@ class ManiSkillEnvBackend:
         render_backend: str | None = None,
         sim_freq: int | None = None,
         control_freq: int | None = None,
+        max_episode_steps: int | None = None,
         sim_config: dict[str, Any] | None = None,
         env_kwargs: dict[str, Any] | None = None,
     ) -> None:
@@ -39,6 +40,7 @@ class ManiSkillEnvBackend:
         self.render_backend = render_backend
         self.requested_sim_freq = sim_freq
         self.requested_control_freq = control_freq
+        self.max_episode_steps = int(max_episode_steps) if max_episode_steps is not None else None
         self.requested_sim_config = dict(sim_config or {})
         self.env_kwargs = dict(env_kwargs or {})
 
@@ -52,6 +54,8 @@ class ManiSkillEnvBackend:
             make_kwargs.setdefault("sim_backend", sim_backend)
         if render_backend is not None:
             make_kwargs.setdefault("render_backend", render_backend)
+        if self.max_episode_steps is not None:
+            make_kwargs.setdefault("max_episode_steps", self.max_episode_steps)
         merged_sim_config = dict(self.requested_sim_config)
         if sim_freq is not None:
             merged_sim_config["sim_freq"] = int(sim_freq)
@@ -82,6 +86,7 @@ class ManiSkillEnvBackend:
             "sim_steps_per_control": sim_steps_per_control,
             "sim_backend": self.sim_backend,
             "render_backend": self.render_backend,
+            "max_episode_steps": self.max_episode_steps,
         }
         if sim_freq:
             info["sim_dt"] = 1.0 / float(sim_freq)

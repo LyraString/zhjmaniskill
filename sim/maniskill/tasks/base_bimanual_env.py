@@ -49,6 +49,7 @@ class BaseBimanualEnv(BaseEnv):
         self.embodiment_spec = embodiment_spec
         self.left_gripper_val = 0.0
         self.right_gripper_val = 0.0
+        self._manual_gripper_drive_override: dict[int, float] = {}
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
         action_low = np.asarray([-np.pi] * self.ARM_DOF + [0.0] + [-np.pi] * self.ARM_DOF + [0.0], dtype=np.float32)
         action_high = np.asarray([np.pi] * self.ARM_DOF + [1.0] + [np.pi] * self.ARM_DOF + [1.0], dtype=np.float32)
@@ -228,6 +229,15 @@ class BaseBimanualEnv(BaseEnv):
         else:
             self.right_gripper_val = state
 
+    def set_manual_gripper_drive_override(self, arm_index: int, gripper_val: float | None) -> None:
+        if gripper_val is None:
+            self._manual_gripper_drive_override.pop(int(arm_index), None)
+            return
+        self._manual_gripper_drive_override[int(arm_index)] = float(gripper_val)
+
+    def clear_manual_gripper_drive_overrides(self) -> None:
+        self._manual_gripper_drive_override.clear()
+
     def get_arm_robot(self, arm_index: int):
         return self.left_robot if arm_index == 0 else self.right_robot
 
@@ -351,8 +361,15 @@ class BaseBimanualEnv(BaseEnv):
         if gripper_val.numel() == 1 and target_envs > 1:
             gripper_val = gripper_val.repeat(target_envs)
         gripper_val = torch.clamp(gripper_val, 0.0, 1.0)
+        drive_gripper_val = gripper_val
+        override = self._manual_gripper_drive_override.get(int(arm_index))
+        if override is not None:
+            drive_gripper_val = torch.minimum(
+                drive_gripper_val,
+                torch.full_like(drive_gripper_val, float(override)),
+            )
         gripper_scale = self.embodiment_spec.gripper_scale(arm_index)
-        real_gripper_val = gripper_scale[0] + gripper_val * (gripper_scale[1] - gripper_scale[0])
+        real_gripper_val = gripper_scale[0] + drive_gripper_val * (gripper_scale[1] - gripper_scale[0])
 
         joints = self.left_gripper if arm_index == 0 else self.right_gripper
         self._set_gripper_state_tensor(gripper_val, arm_index=arm_index, env_idx=env_idx)
