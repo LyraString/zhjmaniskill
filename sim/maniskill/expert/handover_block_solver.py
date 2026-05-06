@@ -84,7 +84,7 @@ class HandoverBlockSolver:
     HANDOVER_PRE_GRASP_DISTANCE = 0.08
     GRASP_DISTANCE = 0.0
     LEFT_FIRST_GRASP_DISTANCE = -0.02
-    RIGHT_HANDOVER_GRASP_DISTANCE = 0.0
+    RIGHT_HANDOVER_GRASP_DISTANCE = -0.02
     ROTATE_NUM = 10
     LEFT_ROTATE_LIM = (-0.6, 0.6)
     RIGHT_ROTATE_LIM = (-0.6, 0.6)
@@ -96,6 +96,7 @@ class HandoverBlockSolver:
     LEFT_FIRST_GRASP_CLAMP_LIFT_DISTANCE = 0.05
     LEFT_FIRST_GRASP_CLAMP_LIFT_QPOS_STEPS = 10
     LEFT_FIRST_GRASP_CLAMP_LIFT_SETTLE_STEPS = 8
+    LEFT_FIRST_GRASP_MAX_GRASP_PLAN_LENGTH = 160
     LEFT_FIRST_GRASP_APPROACH_OFFSET = np.asarray([0.0, -0.10, 0.0], dtype=np.float64)
     ALLOW_LEFT_FIRST_GRASP_APPROACH_FALLBACK = True
     LEFT_FIRST_GRASP_BOX_AXIS_SHIFT = 0.04
@@ -144,19 +145,23 @@ class HandoverBlockSolver:
     RIGHT_HANDOVER_PRE_CLOSE_SETTLE_STEPS = 8
     RIGHT_HANDOVER_CLOSE_SMOOTH_STEPS = 16
     RIGHT_HANDOVER_CLOSE_SETTLE_STEPS = 12
-    RIGHT_HANDOVER_POST_CLOSE_HOLD_STEPS = 8
+    RIGHT_HANDOVER_POST_CLOSE_HOLD_STEPS = 20
     RIGHT_HANDOVER_GRIPPER_HOLD_POS = 0.0
     LEFT_PRERELEASE_BEFORE_RIGHT_HANDOVER_CLOSE = 0.0
     LEFT_PRERELEASE_BEFORE_RIGHT_HANDOVER_CLOSE_STEPS = 0
     LEFT_RELEASE_DURING_RIGHT_HANDOVER_CLOSE = 1.0
     LEFT_RELEASE_AFTER_RIGHT_HANDOVER_CLOSE = True
     LEFT_RELEASE_OPEN_SMOOTH_STEPS = 16
-    LEFT_RELEASE_OPEN_SETTLE_STEPS = 6
+    LEFT_RELEASE_OPEN_SETTLE_STEPS = 10
     LEFT_RELEASE_CLEAR_WORLD_DELTA = np.asarray([0.0, -0.05, 0.04], dtype=np.float64)
     LEFT_RELEASE_CLEAR_LIFT_DELTA = np.asarray([0.0, 0.0, 0.06], dtype=np.float64)
     LEFT_RELEASE_CLEAR_RETREAT_DELTA = np.asarray([0.0, -0.10, 0.02], dtype=np.float64)
     LEFT_RELEASE_CLEAR_STEPS = 16
     LEFT_RELEASE_CLEAR_SETTLE_STEPS = 4
+    LEFT_RELEASE_CLEAR_IK_THRESHOLD = 1e-2
+    LEFT_RELEASE_CLEAR_MIN_LIFT_DELTA = 0.035
+    LEFT_RELEASE_CLEAR_LIFT_RETRY_DELTA = np.asarray([0.0, 0.0, 0.04], dtype=np.float64)
+    LEFT_RELEASE_CLEAR_LIFT_MAX_ATTEMPTS = 2
     FINAL_RELEASE_SETTLE_STEPS = 4
     FINAL_SETTLE_STEPS = 12
 
@@ -1133,30 +1138,63 @@ class HandoverBlockSolver:
             if float(np.linalg.norm(left_release_clear_delta)) <= 1e-8:
                 continue
             left_release_stage_start_pose = np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64)
-            if self.ctrl.move_by_displacement_via_ik(
-                0,
-                recorder,
-                x=float(left_release_clear_delta[0]),
-                y=float(left_release_clear_delta[1]),
-                z=float(left_release_clear_delta[2]),
-                move_axis="world",
-                steps=self.LEFT_RELEASE_CLEAR_STEPS,
-                settle_steps=self.LEFT_RELEASE_CLEAR_SETTLE_STEPS,
-                fail_status=f"{left_release_clear_stage}_failed",
-            ):
-                return True, self.ctrl.steps_taken, self.ctrl.last_status
-            left_release_stage_end_pose = np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64)
-            left_release_clear_trace.append(
-                {
-                    "stage": left_release_clear_stage,
-                    "command_delta": left_release_clear_delta.round(4).tolist(),
-                    "start_pose": left_release_stage_start_pose.round(4).tolist(),
-                    "end_pose": left_release_stage_end_pose.round(4).tolist(),
-                    "actual_delta": (left_release_stage_end_pose[:3] - left_release_stage_start_pose[:3])
-                    .round(4)
-                    .tolist(),
-                }
+            lift_stage = left_release_clear_stage == "left_release_clear_lift"
+            max_attempts = (
+                max(1, int(self.LEFT_RELEASE_CLEAR_LIFT_MAX_ATTEMPTS))
+                if lift_stage
+                else 1
             )
+            stage_attempts: list[dict[str, object]] = []
+            for attempt_index in range(max_attempts):
+                command_delta = (
+                    left_release_clear_delta
+                    if attempt_index == 0
+                    else np.asarray(self.LEFT_RELEASE_CLEAR_LIFT_RETRY_DELTA, dtype=np.float64)
+                )
+                attempt_start_pose = np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64)
+                if self.ctrl.move_gripper_by_displacement_via_ik(
+                    0,
+                    recorder,
+                    x=float(command_delta[0]),
+                    y=float(command_delta[1]),
+                    z=float(command_delta[2]),
+                    move_axis="world",
+                    steps=self.LEFT_RELEASE_CLEAR_STEPS,
+                    settle_steps=self.LEFT_RELEASE_CLEAR_SETTLE_STEPS,
+                    fail_status=f"{left_release_clear_stage}_failed",
+                    ik_threshold=self.LEFT_RELEASE_CLEAR_IK_THRESHOLD,
+                ):
+                    return True, self.ctrl.steps_taken, self.ctrl.last_status
+                attempt_end_pose = np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64)
+                stage_attempts.append(
+                    {
+                        "attempt_index": int(attempt_index),
+                        "command_delta": command_delta.round(4).tolist(),
+                        "start_pose": attempt_start_pose.round(4).tolist(),
+                        "end_pose": attempt_end_pose.round(4).tolist(),
+                        "actual_delta": (attempt_end_pose[:3] - attempt_start_pose[:3]).round(4).tolist(),
+                    }
+                )
+                if self.ctrl.last_status != "running":
+                    break
+                if not lift_stage:
+                    break
+                actual_lift_delta = float(attempt_end_pose[2] - left_release_stage_start_pose[2])
+                if actual_lift_delta >= float(self.LEFT_RELEASE_CLEAR_MIN_LIFT_DELTA):
+                    break
+
+            left_release_stage_end_pose = np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64)
+            left_release_stage_record = {
+                "stage": left_release_clear_stage,
+                "command_delta": left_release_clear_delta.round(4).tolist(),
+                "start_pose": left_release_stage_start_pose.round(4).tolist(),
+                "end_pose": left_release_stage_end_pose.round(4).tolist(),
+                "actual_delta": (left_release_stage_end_pose[:3] - left_release_stage_start_pose[:3])
+                .round(4)
+                .tolist(),
+                "attempts": stage_attempts,
+            }
+            left_release_clear_trace.append(left_release_stage_record)
             if self.ctrl.last_status != "running":
                 self.last_debug_info = {
                     "stage": left_release_clear_stage,
@@ -1174,6 +1212,28 @@ class HandoverBlockSolver:
                     "plan_debug": dict(self.ctrl.last_plan_debug),
                 }
                 return False, self.ctrl.steps_taken, self.ctrl.last_status
+            if lift_stage:
+                actual_lift_delta = float(left_release_stage_end_pose[2] - left_release_stage_start_pose[2])
+                if actual_lift_delta < float(self.LEFT_RELEASE_CLEAR_MIN_LIFT_DELTA):
+                    self.ctrl.last_status = "left_release_clear_lift_insufficient"
+                    self.last_debug_info = {
+                        "stage": left_release_clear_stage,
+                        "left_release_before_clear_pose": left_release_before_clear_pose.round(4).tolist(),
+                        "left_release_after_clear_pose": left_release_stage_end_pose.round(4).tolist(),
+                        "left_release_clear_trace": left_release_clear_trace,
+                        "required_lift_delta": round(float(self.LEFT_RELEASE_CLEAR_MIN_LIFT_DELTA), 4),
+                        "actual_lift_delta": round(actual_lift_delta, 4),
+                        "left_ee_pose": np.asarray(self.ctrl.current_ee_pose(0), dtype=np.float64).round(4).tolist(),
+                        "left_gripper_pose": np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64).round(4).tolist(),
+                        "left_qpos": np.asarray(self.ctrl.current_qpos(0), dtype=np.float64).round(4).tolist(),
+                        "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
+                        "right_gripper_pose": np.asarray(self.ctrl.current_gripper_pose(1), dtype=np.float64).round(4).tolist(),
+                        "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                        "right_handover_alignment": right_handover_alignment,
+                        "right_handover_close_trace": right_handover_close_trace,
+                        "plan_debug": dict(self.ctrl.last_plan_debug),
+                    }
+                    return False, self.ctrl.steps_taken, self.ctrl.last_status
         left_release_after_clear_pose = np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64)
         left_release_clear_debug = {
             "left_release_before_clear_pose": left_release_before_clear_pose.round(4).tolist(),
@@ -1990,6 +2050,7 @@ class HandoverBlockSolver:
                 preferred_top_down_quat=TOP_DOWN_PREFERRED_GRASP_QUATS[0],
                 pre_pose_candidates_builder=self._left_first_grasp_pre_pose_candidates_from_box_pose,
                 selection_mode="prefer_side",
+                max_grasp_plan_length=self.LEFT_FIRST_GRASP_MAX_GRASP_PLAN_LENGTH,
             )
             if pick_candidate is None:
                 self.ctrl.last_status = "left_pick_plan_failed"
@@ -2175,7 +2236,7 @@ class HandoverBlockSolver:
                     }
                     return False, self.ctrl.steps_taken, self.ctrl.last_status
 
-            if self.ctrl.move_by_displacement_via_ik(
+            if self.ctrl.move_gripper_by_displacement_via_ik(
                 0,
                 recorder,
                 z=self.LEFT_FIRST_GRASP_CLAMP_LIFT_DISTANCE,

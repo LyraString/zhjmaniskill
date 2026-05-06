@@ -575,6 +575,7 @@ class FixedRateMotionPrimitives:
         steps: int = 10,
         settle_steps: int = 8,
         fail_status: str,
+        ik_threshold: float | None = None,
     ) -> bool:
         target_pose = self.current_ee_pose(arm_index).copy()
         if move_axis == "world":
@@ -586,7 +587,10 @@ class FixedRateMotionPrimitives:
         if quat is not None:
             target_pose[3:] = np.asarray(quat, dtype=np.float64).reshape(4)
 
-        ik_qpos, ik_reason = self.ik_to_pose_debug(arm_index, target_pose)
+        if ik_threshold is None:
+            ik_qpos, ik_reason = self.ik_to_pose_debug(arm_index, target_pose)
+        else:
+            ik_qpos, ik_reason = self.ik_to_pose_debug(arm_index, target_pose, threshold=float(ik_threshold))
         if ik_qpos is None:
             self.last_plan_debug = {
                 "arm_index": int(arm_index),
@@ -601,6 +605,67 @@ class FixedRateMotionPrimitives:
 
         self.last_plan_debug = {
             "arm_index": int(arm_index),
+            "target_pose": np.asarray(target_pose, dtype=np.float64).round(4).tolist(),
+            "target_arm_qpos": self._arm_qpos_from_plan(ik_qpos).round(4).tolist(),
+            "move_axis": str(move_axis),
+            "ik_reason": ik_reason,
+            "steps": int(steps),
+            "settle_steps": int(settle_steps),
+        }
+        return self.move_to_qpos(
+            arm_index,
+            self._arm_qpos_from_plan(ik_qpos),
+            recorder,
+            steps=steps,
+            settle_steps=settle_steps,
+        )
+
+    def move_gripper_by_displacement_via_ik(
+        self,
+        arm_index: int,
+        recorder,
+        *,
+        x: float = 0.0,
+        y: float = 0.0,
+        z: float = 0.0,
+        quat: np.ndarray | None = None,
+        move_axis: str = "world",
+        steps: int = 10,
+        settle_steps: int = 8,
+        fail_status: str,
+        ik_threshold: float | None = None,
+    ) -> bool:
+        target_gripper_pose = self.current_gripper_pose(arm_index).copy()
+        if move_axis == "world":
+            target_gripper_pose[:3] += np.asarray([x, y, z], dtype=np.float64)
+        else:
+            dir_vec = pose_to_matrix(target_gripper_pose)[:3, 0]
+            dir_vec /= np.linalg.norm(dir_vec)
+            target_gripper_pose[:3] += -z * dir_vec
+        if quat is not None:
+            target_gripper_pose[3:] = np.asarray(quat, dtype=np.float64).reshape(4)
+        target_pose = self.gripper_pose_to_planner_pose(arm_index, target_gripper_pose)
+
+        if ik_threshold is None:
+            ik_qpos, ik_reason = self.ik_to_pose_debug(arm_index, target_pose)
+        else:
+            ik_qpos, ik_reason = self.ik_to_pose_debug(arm_index, target_pose, threshold=float(ik_threshold))
+        if ik_qpos is None:
+            self.last_plan_debug = {
+                "arm_index": int(arm_index),
+                "target_gripper_pose": np.asarray(target_gripper_pose, dtype=np.float64).round(4).tolist(),
+                "target_pose": np.asarray(target_pose, dtype=np.float64).round(4).tolist(),
+                "move_axis": str(move_axis),
+                "ik_reason": ik_reason,
+                "steps": int(steps),
+                "settle_steps": int(settle_steps),
+            }
+            self.last_status = fail_status
+            return False
+
+        self.last_plan_debug = {
+            "arm_index": int(arm_index),
+            "target_gripper_pose": np.asarray(target_gripper_pose, dtype=np.float64).round(4).tolist(),
             "target_pose": np.asarray(target_pose, dtype=np.float64).round(4).tolist(),
             "target_arm_qpos": self._arm_qpos_from_plan(ik_qpos).round(4).tolist(),
             "move_axis": str(move_axis),
@@ -833,6 +898,7 @@ class FixedRateMotionPrimitives:
         preferred_top_down_quat: np.ndarray | None = None,
         pre_pose_candidates_builder: Callable[[np.ndarray, int, float, int], list[np.ndarray]] | None = None,
         selection_mode: str = "auto",
+        max_grasp_plan_length: int | None = None,
     ) -> GraspCandidate | None:
         self.sync_sim_state()
 
@@ -916,6 +982,16 @@ class FixedRateMotionPrimitives:
                     start_qpos=next_qpos,
                 )
                 grasp_plan_source = "screw"
+                if (
+                    grasp_plan is not None
+                    and max_grasp_plan_length is not None
+                    and len(grasp_plan["position"]) > int(max_grasp_plan_length)
+                ):
+                    grasp_reason = (
+                        f"rejected:screw_path_length "
+                        f"{len(grasp_plan['position'])}>{int(max_grasp_plan_length)}"
+                    )
+                    grasp_plan = None
                 if grasp_plan is None:
                     grasp_plan, grasp_reason = self.plan_to_pose_debug(
                         arm_index,
@@ -924,6 +1000,15 @@ class FixedRateMotionPrimitives:
                     )
                     if grasp_plan is not None:
                         grasp_plan_source = "pose_fallback"
+                        if (
+                            max_grasp_plan_length is not None
+                            and len(grasp_plan["position"]) > int(max_grasp_plan_length)
+                        ):
+                            grasp_reason = (
+                                f"rejected:pose_path_length "
+                                f"{len(grasp_plan['position'])}>{int(max_grasp_plan_length)}"
+                            )
+                            grasp_plan = None
                 if grasp_plan is None:
                     attempts.append(
                         {
@@ -940,6 +1025,9 @@ class FixedRateMotionPrimitives:
                             "pre_reason": pre_reason,
                             "grasp_reason": grasp_reason,
                             "grasp_plan_source": None,
+                            "max_grasp_plan_length": (
+                                None if max_grasp_plan_length is None else int(max_grasp_plan_length)
+                            ),
                         }
                     )
                     continue
@@ -991,6 +1079,8 @@ class FixedRateMotionPrimitives:
                         "pre_reason": pre_reason,
                         "grasp_reason": grasp_reason,
                         "grasp_plan_source": grasp_plan_source,
+                        "pre_plan_len": int(len(pre_plan["position"])),
+                        "grasp_plan_len": int(len(grasp_plan["position"])),
                     }
                 )
             if best_for_contact is None:
