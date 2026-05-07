@@ -33,10 +33,10 @@ class PolicyManualInterventionCollector:
     TRIGGER_GRIPPER_BOX_DISTANCE = 0.28
     BOX_ON_TABLE_MARGIN = 0.03
     INITIAL_OPEN_STEPS = 4
-    MANUAL_TRANSLATION_STEP = 0.015
-    MANUAL_RIGHT_TRANSLATION_STEP = 0.03
-    MANUAL_LIFT_STEP = 0.02
-    MANUAL_RIGHT_LIFT_STEP = 0.03
+    MANUAL_TRANSLATION_STEP = 0.025
+    MANUAL_RIGHT_TRANSLATION_STEP = 0.04
+    MANUAL_LIFT_STEP = 0.015
+    MANUAL_RIGHT_LIFT_STEP = 0.04
     MANUAL_MOVE_STEPS = 5
     MANUAL_SETTLE_STEPS = 1
     MANUAL_ENTRY_FREEZE_STEPS = 8
@@ -48,9 +48,15 @@ class PolicyManualInterventionCollector:
     MANUAL_AUTO_ALIGN_GRASP_SWITCH_DISTANCE = 0.05
     MANUAL_AUTO_ALIGN_ORIENTATION_DISTANCE = 0.08
     MANUAL_AUTO_ALIGN_PLAN_STEPS = 24
+    MANUAL_LEFT_AUTO_ALIGN_PLAN_STEPS = 16
+    MANUAL_LEFT_AUTO_ALIGN_BOX_MOVE_REJECT = 0.008
+    MANUAL_LEFT_AUTO_ALIGN_BOX_Z_DROP_REJECT = 0.01
+    MANUAL_RIGHT_AUTO_ALIGN_BOX_MOVE_REJECT = 0.025
+    MANUAL_RIGHT_AUTO_ALIGN_BOX_Z_DROP_REJECT = 0.02
     MANUAL_INPUT_POLL_SEC = 0.05
     MANUAL_IK_THRESHOLD = 0.01
     MANUAL_RETRY_SCALES = (1.0, 0.5, 0.25)
+    MANUAL_VERTICAL_DIRECTION_MISMATCH_EPS = 0.003
     MANUAL_MAX_SHOULDER_PAN_DELTA = 0.45
     MANUAL_RIGHT_MAX_SHOULDER_PAN_DELTA = 0.7
     MANUAL_MAX_JOINT_MOTION = 1.2
@@ -590,6 +596,21 @@ class PolicyManualInterventionCollector:
             return self.MANUAL_RIGHT_AUTO_ALIGN_STEP
         return self.MANUAL_AUTO_ALIGN_STEP
 
+    def _manual_auto_align_plan_steps(self, arm_index: int) -> int:
+        if int(arm_index) == 0:
+            return int(self.MANUAL_LEFT_AUTO_ALIGN_PLAN_STEPS)
+        return int(self.MANUAL_AUTO_ALIGN_PLAN_STEPS)
+
+    def _manual_auto_align_box_move_reject(self, arm_index: int) -> float:
+        if int(arm_index) == 0:
+            return float(self.MANUAL_LEFT_AUTO_ALIGN_BOX_MOVE_REJECT)
+        return float(self.MANUAL_RIGHT_AUTO_ALIGN_BOX_MOVE_REJECT)
+
+    def _manual_auto_align_box_z_drop_reject(self, arm_index: int) -> float:
+        if int(arm_index) == 0:
+            return float(self.MANUAL_LEFT_AUTO_ALIGN_BOX_Z_DROP_REJECT)
+        return float(self.MANUAL_RIGHT_AUTO_ALIGN_BOX_Z_DROP_REJECT)
+
     @staticmethod
     def _table_horizontal_pose(pose: np.ndarray) -> np.ndarray:
         pose = np.asarray(pose, dtype=np.float64).reshape(7)
@@ -640,25 +661,17 @@ class PolicyManualInterventionCollector:
             return np.asarray([0.0, 0.0, lift_step], dtype=np.float64)
         if command == "f":
             return np.asarray([0.0, 0.0, -lift_step], dtype=np.float64)
-
-        box_pose = np.asarray(self.solver._box_pose(), dtype=np.float64)
-        gripper_pose = np.asarray(self.solver.ctrl.current_gripper_pose(arm_index), dtype=np.float64)
-        to_box_xy = box_pose[:2] - gripper_pose[:2]
-        norm = float(np.linalg.norm(to_box_xy))
-        if norm < 1e-6:
-            forward_xy = np.asarray([1.0, 0.0], dtype=np.float64)
-        else:
-            forward_xy = to_box_xy / norm
-        left_xy = np.asarray([-forward_xy[1], forward_xy[0]], dtype=np.float64)
-
+        # Manual keyboard control should stay in the table frame.  Box-relative
+        # directions become unintuitive once the gripper points down or crosses
+        # the box, which is exactly the handover/repair case.
         if command == "w":
-            delta_xy = forward_xy * step
+            delta_xy = np.asarray([0.0, step], dtype=np.float64)
         elif command == "s":
-            delta_xy = -forward_xy * step
+            delta_xy = np.asarray([0.0, -step], dtype=np.float64)
         elif command == "a":
-            delta_xy = left_xy * step
+            delta_xy = np.asarray([-step, 0.0], dtype=np.float64)
         elif command == "d":
-            delta_xy = -left_xy * step
+            delta_xy = np.asarray([step, 0.0], dtype=np.float64)
         else:
             delta_xy = np.asarray([0.0, 0.0], dtype=np.float64)
         return np.asarray([delta_xy[0], delta_xy[1], 0.0], dtype=np.float64)
@@ -760,9 +773,12 @@ class PolicyManualInterventionCollector:
 
         inactive_qpos = self._manual_hold_target(1 - int(arm_index))
         current_arm_qpos = self.solver.ctrl.current_qpos(arm_index)
+        initial_box_pose = np.asarray(self.solver._box_pose(), dtype=np.float64)
         executed_steps = 0
         skipped_steps = 0
-        max_steps = int(self.MANUAL_AUTO_ALIGN_PLAN_STEPS)
+        max_steps = self._manual_auto_align_plan_steps(arm_index)
+        box_move_reject = self._manual_auto_align_box_move_reject(arm_index)
+        box_z_drop_reject = self._manual_auto_align_box_z_drop_reject(arm_index)
 
         for waypoint in plan_positions:
             target_arm_qpos = self.solver.ctrl._arm_qpos_from_plan(waypoint)
@@ -814,6 +830,23 @@ class PolicyManualInterventionCollector:
                 self.solver.ctrl.last_status = terminal_status
                 return self.solver.ctrl.last_status
 
+            box_pose_after = np.asarray(self.solver._box_pose(), dtype=np.float64)
+            box_displacement = float(np.linalg.norm(box_pose_after[:3] - initial_box_pose[:3]))
+            box_z_drop = float(initial_box_pose[2] - box_pose_after[2])
+            self.solver.ctrl.last_plan_debug["box_pose_before"] = initial_box_pose.round(4).tolist()
+            self.solver.ctrl.last_plan_debug["box_pose_after"] = box_pose_after.round(4).tolist()
+            self.solver.ctrl.last_plan_debug["box_displacement"] = round(box_displacement, 4)
+            self.solver.ctrl.last_plan_debug["box_z_drop"] = round(box_z_drop, 4)
+            self.solver.ctrl.last_plan_debug["box_move_reject"] = round(float(box_move_reject), 4)
+            self.solver.ctrl.last_plan_debug["box_z_drop_reject"] = round(float(box_z_drop_reject), 4)
+            if (
+                box_displacement > box_move_reject
+                or box_z_drop > box_z_drop_reject
+            ):
+                self.solver.ctrl.last_plan_debug["guard_reason"] = "auto_align_box_collision"
+                self.solver.ctrl.last_status = "manual_move_rejected"
+                return None
+
             current_arm_qpos = target_arm_qpos
             executed_steps += 1
             if executed_steps >= max_steps:
@@ -842,9 +875,9 @@ class PolicyManualInterventionCollector:
     def _print_manual_help(self) -> None:
         print(
             "[manual] commands: "
-            "viewer: up/down or w/s=toward/away box  left/right or a/d=box-relative left/right  u/j or r/f=up/down  "
+            "viewer: up/down or w/s=table +Y/-Y  left/right or a/d=table -X/+X  u/j or r/f=up/down  "
             "g=auto-align  1=left  2=right  o=open  c=close  p=status  h=help  n=resume  q=abort | "
-            "terminal fallback: w/s=toward/away box  a/d=box-relative left/right  r/f=up/down  "
+            "terminal fallback: w/s=table +Y/-Y  a/d=table -X/+X  r/f=up/down  "
             "g=auto-align  1/2=left/right  o=open  c=close  u=lift  p=status  h/help/?  n/resume  q/abort  "
             "(terminal commands require Enter)"
         )
@@ -1075,12 +1108,23 @@ class PolicyManualInterventionCollector:
             actual_delta = end_pose[:3] - start_pose[:3]
             self.solver.ctrl.last_plan_debug["actual_gripper_pose"] = end_pose.round(4).tolist()
             self.solver.ctrl.last_plan_debug["actual_delta"] = actual_delta.round(4).tolist()
+            requested_z = float(scaled_delta[2])
+            actual_z = float(actual_delta[2])
             if self.debug and command in ("r", "f", "u"):
                 print(
                     "[manual] command "
                     f"`{command}` requested_delta={np.asarray(scaled_delta, dtype=np.float64).round(4).tolist()} "
                     f"actual_delta={actual_delta.round(4).tolist()}"
                 )
+            if (
+                command in ("r", "f", "u")
+                and abs(requested_z) > 1e-6
+                and actual_z * np.sign(requested_z) < -self.MANUAL_VERTICAL_DIRECTION_MISMATCH_EPS
+            ):
+                self.solver.ctrl.last_plan_debug["guard_reason"] = "vertical_direction_mismatch"
+                self.solver.ctrl.last_plan_debug["requested_z"] = round(requested_z, 4)
+                self.solver.ctrl.last_plan_debug["actual_z"] = round(actual_z, 4)
+                self.solver.ctrl.last_status = "manual_move_rejected"
             break
         else:
             if last_reject_debug is not None:
