@@ -456,6 +456,7 @@ class RobotWorkspace(BaseWorkspace):
                     render_backend=render_backend,
                     sim_freq=getattr(cfg.training, "sim_freq", None),
                     control_freq=getattr(cfg.training, "control_freq", None),
+                    point_cloud_sampling=getattr(cfg.training, "point_cloud_sampling", "fast"),
                     sim_config=sim_config,
                     robot_uids=getattr(cfg.training, "robot_uids", None),
                     reward_mode=getattr(cfg.training, "reward_mode", None),

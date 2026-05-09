@@ -47,6 +47,7 @@ class ManiSkillVectorFPORunner:
         render_mode=None,
         sim_freq=None,
         control_freq=None,
+        point_cloud_sampling="fast",
         sim_config=None,
         **backend_kwargs,
     ):
@@ -77,6 +78,7 @@ class ManiSkillVectorFPORunner:
             render_mode=render_mode,
             sim_freq=sim_freq,
             control_freq=control_freq,
+            point_cloud_sampling=point_cloud_sampling,
             sim_config=sim_config,
             **backend_kwargs,
         )

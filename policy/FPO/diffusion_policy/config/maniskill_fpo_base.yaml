@@ -130,6 +130,7 @@ training:
   render_mode: ${task.maniskill.render_mode}
   sim_backend: null
   render_backend: null
+  point_cloud_sampling: fast
   reward_mode: ${task.maniskill.reward_mode}
   robot_uids: ${task.maniskill.robot_uids}
   sim_freq: ${task.maniskill.sim_freq}

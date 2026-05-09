@@ -62,6 +62,7 @@ class ManiSkillTaskFactory(TaskFactory):
         render_backend = resolved_kwargs.pop("render_backend", None)
         sim_freq = resolved_kwargs.pop("sim_freq", None)
         control_freq = resolved_kwargs.pop("control_freq", None)
+        point_cloud_sampling = resolved_kwargs.pop("point_cloud_sampling", None)
         sim_config = resolved_kwargs.pop("sim_config", None)
 
         _resolved_action_type, control_mode = resolve_runtime_control_mode(
@@ -79,6 +80,9 @@ class ManiSkillTaskFactory(TaskFactory):
             render_backend=str(render_backend) if render_backend not in (None, "") else None,
             sim_freq=int(sim_freq) if sim_freq is not None else None,
             control_freq=int(control_freq) if control_freq is not None else None,
+            point_cloud_sampling=(
+                str(point_cloud_sampling) if point_cloud_sampling not in (None, "") else None
+            ),
             sim_config=dict(sim_config or {}),
             env_kwargs=dict(resolved_kwargs),
         )

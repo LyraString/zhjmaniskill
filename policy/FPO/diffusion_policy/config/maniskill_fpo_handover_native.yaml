@@ -7,10 +7,12 @@ name: maniskill_fpo_handover_native
 exp_name: handover_block_native
 
 training:
-  online_iters: 200
-  timesteps_per_batch: 200
-  max_timesteps_per_episode: 100
+  online_iters: 3000
+  timesteps_per_batch: 3200
+  max_timesteps_per_episode: 1000
   n_updates_per_iteration: 2
   num_minibatches: 2
-  num_envs: 2
-  checkpoint_every: 10
+  num_envs: 32
+  checkpoint_every: 100
+  max_total_fpo_samples_per_call: 32
+  num_fpo_samples: 2

@@ -73,6 +73,7 @@ training:
   debug: False
   resume: False
   resume_ckpt_path: null
+  checkpoint_run_name: null
   sim_backend: null
   render_backend: null
   lr_scheduler: cosine

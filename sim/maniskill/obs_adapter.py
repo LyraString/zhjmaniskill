@@ -14,6 +14,7 @@ DEFAULT_POINT_CLOUD_SIZE = 512
 DEFAULT_POINT_CLOUD_PRIMARY_CAMERA = "head_camera"
 DEFAULT_POINT_CLOUD_CROP_MIN = np.asarray([-0.6, -0.35, 0.7401], dtype=np.float32)
 DEFAULT_POINT_CLOUD_CROP_MAX = np.asarray([0.6, 0.35, 2.0], dtype=np.float32)
+DEFAULT_POINT_CLOUD_SAMPLING = "fps"
 ENV_POINT_CLOUD_EXCLUDED_SEG_IDS: dict[str, tuple[int, ...]] = {
     "HandoverBlock-v1": (3,),
 }
@@ -88,11 +89,21 @@ def _farthest_point_sample(point_cloud_xyz: np.ndarray, target_points: int) -> n
     return sampled
 
 
-def _postprocess_point_cloud(point_cloud_xyz: np.ndarray, target_points: int) -> np.ndarray:
+def _postprocess_point_cloud(
+    point_cloud_xyz: np.ndarray,
+    target_points: int,
+    *,
+    sampling: str = DEFAULT_POINT_CLOUD_SAMPLING,
+) -> np.ndarray:
     point_cloud_xyz = np.asarray(point_cloud_xyz, dtype=np.float32).reshape(-1, 3)
     cropped = _crop_point_cloud(point_cloud_xyz)
     if cropped.shape[0] == 0:
         return np.zeros((target_points, 3), dtype=np.float32)
+
+    sampling = str(sampling).lower()
+    if sampling in {"fast", "resize", "linspace"}:
+        return _resize_point_cloud(cropped, target_points)
+
     sampled = _farthest_point_sample(cropped, target_points)
     return _resize_point_cloud(sampled, target_points)
 
@@ -178,6 +189,7 @@ def _extract_point_cloud_from_sensor_data(
     target_points: int = DEFAULT_POINT_CLOUD_SIZE,
     *,
     env_id: str | None = None,
+    sampling: str = DEFAULT_POINT_CLOUD_SAMPLING,
 ) -> np.ndarray | None:
     sensor_data = payload.get("sensor_data")
     sensor_param = payload.get("sensor_param")
@@ -189,7 +201,7 @@ def _extract_point_cloud_from_sensor_data(
     if isinstance(head_images, Mapping) and isinstance(head_param, Mapping):
         head_xyz = _extract_world_xyz_from_camera(head_images, head_param, env_id=env_id)
         if head_xyz is not None:
-            return _postprocess_point_cloud(head_xyz, target_points)
+            return _postprocess_point_cloud(head_xyz, target_points, sampling=sampling)
 
     point_sets: list[np.ndarray] = []
     for cam_uid, images in sensor_data.items():
@@ -206,7 +218,7 @@ def _extract_point_cloud_from_sensor_data(
         return None
 
     merged = np.concatenate(point_sets, axis=0)
-    return _postprocess_point_cloud(merged, target_points)
+    return _postprocess_point_cloud(merged, target_points, sampling=sampling)
 
 
 def _extract_point_cloud(
@@ -214,11 +226,13 @@ def _extract_point_cloud(
     target_points: int = DEFAULT_POINT_CLOUD_SIZE,
     *,
     env_id: str | None = None,
+    sampling: str = DEFAULT_POINT_CLOUD_SAMPLING,
 ) -> np.ndarray | None:
     point_cloud = _extract_point_cloud_from_sensor_data(
         payload,
         target_points=target_points,
         env_id=env_id,
+        sampling=sampling,
     )
     if point_cloud is not None:
         return point_cloud
@@ -232,13 +246,21 @@ def _extract_point_cloud(
             xyz = xyzw[valid, :3]
         else:
             xyz = xyzw[:, :3]
-        return _postprocess_point_cloud(xyz, target_points)
+        return _postprocess_point_cloud(xyz, target_points, sampling=sampling)
     if pointcloud is not None:
-        return _postprocess_point_cloud(_to_xyz(_squeeze_single_env(pointcloud)), target_points)
+        return _postprocess_point_cloud(
+            _to_xyz(_squeeze_single_env(pointcloud)),
+            target_points,
+            sampling=sampling,
+        )
 
     point_cloud = payload.get("point_cloud")
     if point_cloud is not None:
-        return _postprocess_point_cloud(_to_xyz(_squeeze_single_env(point_cloud)), target_points)
+        return _postprocess_point_cloud(
+            _to_xyz(_squeeze_single_env(point_cloud)),
+            target_points,
+            sampling=sampling,
+        )
 
     return None
 
@@ -264,7 +286,12 @@ def convert_maniskill_obs(raw_obs: Any, metadata: dict[str, Any] | None = None) 
     if isinstance(converted, Mapping):
         payload = dict(converted)
         env_id = None if metadata is None else metadata.get("env_id")
-        point_cloud = _extract_point_cloud(payload, env_id=env_id)
+        sampling = (
+            DEFAULT_POINT_CLOUD_SAMPLING
+            if metadata is None
+            else metadata.get("point_cloud_sampling", DEFAULT_POINT_CLOUD_SAMPLING)
+        )
+        point_cloud = _extract_point_cloud(payload, env_id=env_id, sampling=sampling)
         if point_cloud is not None:
             payload["point_cloud"] = point_cloud
 

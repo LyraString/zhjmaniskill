@@ -16,10 +16,20 @@ from sim.maniskill.obs_adapter import convert_maniskill_obs
 import mani_skill.envs  # noqa: F401
 
 
-def _slice_batched_value(value: Any, index: int, batch_size: int) -> Any:
+def _to_numpy_tree(value: Any) -> Any:
     if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "numpy"):
-        value = value.detach().cpu().numpy()
+        return value.detach().cpu().numpy()
 
+    if isinstance(value, Mapping):
+        return {key: _to_numpy_tree(val) for key, val in value.items()}
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return type(value)(_to_numpy_tree(item) for item in value)
+
+    return value
+
+
+def _slice_batched_value(value: Any, index: int, batch_size: int) -> Any:
     if isinstance(value, np.ndarray):
         if value.ndim >= 1 and value.shape[0] == batch_size:
             return value[index]
@@ -71,6 +81,7 @@ class ManiSkillVectorEnvBackend:
         render_backend: str | None = None,
         sim_freq: int | None = None,
         control_freq: int | None = None,
+        point_cloud_sampling: str | None = None,
         sim_config: dict[str, Any] | None = None,
         env_kwargs: dict[str, Any] | None = None,
     ) -> None:
@@ -85,6 +96,7 @@ class ManiSkillVectorEnvBackend:
         self.requested_control_freq = control_freq
         self.requested_sim_config = dict(sim_config or {})
         self.env_kwargs = dict(env_kwargs or {})
+        self.point_cloud_sampling = str(point_cloud_sampling or "fps")
 
         make_kwargs = dict(self.env_kwargs)
         make_kwargs.setdefault("num_envs", self.num_envs)
@@ -128,6 +140,10 @@ class ManiSkillVectorEnvBackend:
         return info
 
     def _split_observations(self, raw_obs: Any, info: Any | None = None):
+        raw_obs = _to_numpy_tree(raw_obs)
+        if info is not None:
+            info = _to_numpy_tree(info)
+
         observations = []
         for env_index in range(self.num_envs):
             obs_i = _slice_batched_value(raw_obs, index=env_index, batch_size=self.num_envs)
@@ -142,6 +158,7 @@ class ManiSkillVectorEnvBackend:
                 "env_index": env_index,
                 "obs_mode": self.obs_mode,
                 "control_mode": self.control_mode,
+                "point_cloud_sampling": self.point_cloud_sampling,
                 **self._fixed_rate_info,
             }
             if info is not None:
@@ -212,6 +229,10 @@ class ManiSkillVectorEnvBackend:
         )
         raw_obs, reward, terminated, truncated, info = self.env.step(batched_action)
         observations = self._split_observations(raw_obs)
+        reward = _to_numpy_tree(reward)
+        terminated = _to_numpy_tree(terminated)
+        truncated = _to_numpy_tree(truncated)
+        info = _to_numpy_tree(info)
 
         results = []
         for env_index in range(self.num_envs):
