@@ -98,6 +98,7 @@ def run_evaluation(args) -> None:
         "robot_uids": args.robot_uids,
         "sim_freq": args.sim_freq,
         "control_freq": args.control_freq,
+        "max_episode_steps": args.max_episode_steps,
     }
     _resolved_action_type, resolved_control_mode = resolve_runtime_control_mode(
         action_type=runtime_kwargs["action_type"],
