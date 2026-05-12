@@ -326,25 +326,33 @@ class BaseBimanualEnv(BaseEnv):
 
     def _initialize_robot_state(self, robot, env_idx: torch.Tensor, arm_index: int):
         env_idx = common.to_tensor(env_idx, device=self.device).to(torch.long).reshape(-1)
-        qpos = robot.get_qpos().clone()
-        qvel = robot.get_qvel().clone()
-        if qpos.numel() == 0:
+        current_qpos = robot.get_qpos()
+        current_qvel = robot.get_qvel()
+        if current_qpos.numel() == 0:
             return
-        qpos[env_idx] = 0
-        qvel[env_idx] = 0
+        qpos = torch.zeros(
+            (len(env_idx), current_qpos.shape[1]),
+            device=self.device,
+            dtype=current_qpos.dtype,
+        )
+        qvel = torch.zeros(
+            (len(env_idx), current_qvel.shape[1]),
+            device=self.device,
+            dtype=current_qvel.dtype,
+        )
 
         home = self.embodiment_spec.homestate(arm_index)
         if len(home) > 0:
             home = torch.tensor(home, device=self.device, dtype=qpos.dtype)
             dof = min(home.shape[0], qpos.shape[1])
-            qpos[env_idx, :dof] = home[:dof]
+            qpos[:, :dof] = home[:dof]
 
         robot.set_qpos(qpos)
         robot.set_qvel(qvel)
         arm_joints = self.left_arm_joints if arm_index == 0 else self.right_arm_joints
         arm_dof = min(len(arm_joints), qpos.shape[1])
         if arm_dof > 0:
-            robot.set_joint_drive_targets(qpos[env_idx, :arm_dof], joints=arm_joints[:arm_dof])
+            robot.set_joint_drive_targets(qpos[:, :arm_dof], joints=arm_joints[:arm_dof])
             robot.set_joint_drive_velocity_targets(
                 torch.zeros((len(env_idx), arm_dof), device=self.device, dtype=qvel.dtype),
                 joints=arm_joints[:arm_dof],
