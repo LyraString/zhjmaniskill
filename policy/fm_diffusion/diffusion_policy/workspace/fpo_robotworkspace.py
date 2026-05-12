@@ -39,6 +39,7 @@ from diffusion_policy.env_runner.fpo_runner import FPORunner
 from diffusion_policy.env_runner.vector_fpo_runner import VectorFPORunner
 from diffusion_policy.env_runner.maniskill_fpo_runner import ManiSkillFPORunner
 from diffusion_policy.env_runner.maniskill_vector_fpo_runner import ManiSkillVectorFPORunner
+from diffusion_policy.env_runner.maniskill_cuda_fpo_runner import ManiSkillCudaFPORunner
 from sim.maniskill.task_profiles import resolve_runtime_control_mode
 
 # # Maniskill并行训练环境
@@ -442,8 +443,9 @@ class RobotWorkspace(BaseWorkspace):
                 control_mode=getattr(cfg.training, "control_mode", None),
             )
             if num_envs > 1:
-                env = ManiSkillVectorFPORunner(
+                env = ManiSkillCudaFPORunner(
                     task_name=cfg.task.name,
+                    shape_meta=OmegaConf.to_container(cfg.shape_meta, resolve=True),
                     task_profile=task_profile,
                     env_id=task_env_id,
                     num_envs=num_envs,
@@ -648,10 +650,209 @@ class RobotWorkspace(BaseWorkspace):
     
     def collect_rollout(self, env, device):
         num_envs = int(getattr(self.cfg.training, "num_envs", 1))
-        if num_envs <= 1:
+        if str(getattr(self.cfg.training, "env_backend", "robotwin_legacy")) == "maniskill" and num_envs > 1:
+            return self.collect_rollout_maniskill_cuda_vector(env, device, num_envs)
+        elif num_envs <= 1:
             return self.collect_rollout_single(env, device)
         else:
             return self.collect_rollout_vector(env, device, num_envs)
+
+    def _init_batched_obs_history(self, obs, n_steps):
+        hist = {}
+        for key, value in obs.items():
+            expand_shape = (value.shape[0], n_steps, *value.shape[1:])
+            hist[key] = value.unsqueeze(1).expand(expand_shape).clone()
+        return hist
+
+    def _append_batched_obs_history(self, obs_hist, obs):
+        return {
+            key: torch.cat([value[:, 1:], obs[key].unsqueeze(1)], dim=1)
+            for key, value in obs_hist.items()
+        }
+
+    def _reset_batched_obs_history_envs(self, obs_hist, obs, env_ids):
+        if len(env_ids) == 0:
+            return
+        env_idx = torch.as_tensor(env_ids, device=next(iter(obs_hist.values())).device, dtype=torch.long)
+        for key, value in obs_hist.items():
+            reset_value = obs[key][env_idx].unsqueeze(1).expand(-1, value.shape[1], *value.shape[2:])
+            value[env_idx] = reset_value
+
+    def collect_rollout_maniskill_cuda_vector(self, env, device, num_envs):
+        cfg_t = self.cfg.training
+        show_rollout_tqdm = bool(getattr(cfg_t, "show_rollout_tqdm", True))
+        rollout_tqdm_interval = float(getattr(cfg_t, "rollout_tqdm_interval_sec", 1.0))
+        target_steps = int(cfg_t.timesteps_per_batch)
+        max_ep_steps = int(cfg_t.max_timesteps_per_episode)
+        n_obs_steps = int(self.cfg.n_obs_steps)
+        base_num_fpo_samples = int(cfg_t.num_fpo_samples)
+        max_total_fpo_samples = int(getattr(cfg_t, "max_total_fpo_samples_per_call", 0))
+        reward_scaling = float(getattr(cfg_t, "reward_scaling", 1.0))
+
+        obs, _ = env.reset()
+        obs_hist = self._init_batched_obs_history(obs, n_obs_steps)
+
+        ep_rews = [[] for _ in range(num_envs)]
+        ep_vals = [[] for _ in range(num_envs)]
+        ep_dones = [[] for _ in range(num_envs)]
+        ep_truncs = [[] for _ in range(num_envs)]
+        ep_discounts = [[] for _ in range(num_envs)]
+        ep_steps = [0 for _ in range(num_envs)]
+
+        batch_rews, batch_vals, batch_dones = [], [], []
+        batch_truncs, batch_discounts, batch_bootstrap_values = [], [], []
+        flat_critic_obs, flat_naction_target = [], []
+        flat_loss_eps, flat_loss_t, flat_init_cfm_loss = [], [], []
+        flat_cond_data, flat_cond_mask, flat_global_cond = [], [], []
+
+        steps = 0
+        rollout_pbar = None
+        if show_rollout_tqdm:
+            rollout_pbar = tqdm.tqdm(
+                total=target_steps,
+                desc="Rollout",
+                dynamic_ncols=True,
+                leave=False,
+                mininterval=rollout_tqdm_interval,
+                position=1,
+            )
+
+        try:
+            while steps < target_steps:
+                num_fpo_samples = base_num_fpo_samples
+                if max_total_fpo_samples > 0:
+                    per_env_budget = max_total_fpo_samples // max(1, num_envs)
+                    num_fpo_samples = max(1, min(base_num_fpo_samples, per_env_budget))
+
+                with torch.inference_mode():
+                    out = self.model.sample_action_with_info(
+                        obs_hist,
+                        num_fpo_samples=num_fpo_samples,
+                    )
+                    critic_in = out["global_cond"]
+                    v = self.critic(critic_in).squeeze(-1)
+
+                actions = out["action"][:, 0].detach()
+                next_obs, rew, terminated, truncated, _ = env.step(actions)
+                done_tensor = torch.logical_or(terminated, truncated)
+                next_obs_hist = self._append_batched_obs_history(obs_hist, next_obs)
+
+                finished_env_ids = []
+                done_env_ids = []
+                reached_max_env_ids = []
+                for env_id in range(num_envs):
+                    done = bool(done_tensor[env_id].item())
+                    trunc = float(bool(truncated[env_id].item()))
+                    discount = 0.0 if bool(terminated[env_id].item()) else 1.0
+
+                    ep_rews[env_id].append(float(rew[env_id].item()) * reward_scaling)
+                    ep_vals[env_id].append(float(v[env_id].item()))
+                    ep_dones[env_id].append(float(done))
+                    ep_truncs[env_id].append(trunc)
+                    ep_discounts[env_id].append(discount)
+                    ep_steps[env_id] += 1
+
+                    reached_max = ep_steps[env_id] >= max_ep_steps
+                    if done or reached_max:
+                        finished_env_ids.append(env_id)
+                        if done:
+                            done_env_ids.append(env_id)
+                        else:
+                            reached_max_env_ids.append(env_id)
+
+                if finished_env_ids:
+                    with torch.inference_mode():
+                        last_v_all = self.critic(
+                            self._build_critic_input_from_obs(next_obs_hist)
+                        ).squeeze(-1)
+                    for env_id in finished_env_ids:
+                        batch_rews.append(ep_rews[env_id])
+                        batch_vals.append(ep_vals[env_id])
+                        batch_dones.append(ep_dones[env_id])
+                        batch_truncs.append(ep_truncs[env_id])
+                        batch_discounts.append(ep_discounts[env_id])
+                        batch_bootstrap_values.append(float(last_v_all[env_id].item()))
+
+                        ep_rews[env_id] = []
+                        ep_vals[env_id] = []
+                        ep_dones[env_id] = []
+                        ep_truncs[env_id] = []
+                        ep_discounts[env_id] = []
+                        ep_steps[env_id] = 0
+
+                if done_env_ids:
+                    reset_obs = None
+                    for env_id in done_env_ids:
+                        reset_obs, _ = env.reset_at([env_id])
+                    if reset_obs is not None:
+                        self._reset_batched_obs_history_envs(next_obs_hist, reset_obs, done_env_ids)
+
+                if reached_max_env_ids:
+                    self._reset_batched_obs_history_envs(
+                        next_obs_hist,
+                        next_obs,
+                        reached_max_env_ids,
+                    )
+
+                flat_critic_obs.append(critic_in.detach())
+                flat_naction_target.append(out["naction_pred"].detach())
+                flat_loss_eps.append(out["loss_eps"].detach())
+                flat_loss_t.append(out["loss_t"].detach())
+                flat_init_cfm_loss.append(out["initial_cfm_loss"].detach())
+                flat_cond_data.append(out["cond_data"].detach())
+                flat_cond_mask.append(out["cond_mask"].detach())
+                flat_global_cond.append(out["global_cond"].detach())
+
+                obs_hist = next_obs_hist
+                steps += num_envs
+                if rollout_pbar is not None:
+                    rollout_pbar.update(num_envs)
+
+            if any(len(ep_rews[i]) > 0 for i in range(num_envs)):
+                with torch.inference_mode():
+                    last_v_all = self.critic(
+                        self._build_critic_input_from_obs(obs_hist)
+                    ).squeeze(-1)
+                for env_id in range(num_envs):
+                    if len(ep_rews[env_id]) == 0:
+                        continue
+                    batch_rews.append(ep_rews[env_id])
+                    batch_vals.append(ep_vals[env_id])
+                    batch_dones.append(ep_dones[env_id])
+                    batch_truncs.append(ep_truncs[env_id])
+                    batch_discounts.append(ep_discounts[env_id])
+                    batch_bootstrap_values.append(float(last_v_all[env_id].item()))
+        finally:
+            if rollout_pbar is not None:
+                rollout_pbar.close()
+
+        flat_rewards = [r for ep in batch_rews for r in ep]
+        ep_lens = [len(ep) for ep in batch_rews if len(ep) > 0]
+
+        reward_mean = float(np.mean(flat_rewards)) if len(flat_rewards) > 0 else 0.0
+        ep_len_mean = float(np.mean(ep_lens)) if len(ep_lens) > 0 else 0.0
+
+        rollout = {
+            "batch_rews": batch_rews,
+            "batch_vals": batch_vals,
+            "batch_dones": batch_dones,
+            "critic_obs": torch.cat(flat_critic_obs, dim=0),
+            "naction_target": torch.cat(flat_naction_target, dim=0),
+            "cond_data": torch.cat(flat_cond_data, dim=0),
+            "cond_mask": torch.cat(flat_cond_mask, dim=0),
+            "global_cond": torch.cat(flat_global_cond, dim=0),
+            "reward_mean": reward_mean,
+            "ep_len_mean": ep_len_mean,
+            "batch_truncs": batch_truncs,
+            "batch_discounts": batch_discounts,
+            "batch_bootstrap_values": batch_bootstrap_values,
+        }
+
+        rollout["loss_eps"] = torch.cat(flat_loss_eps, dim=0)
+        rollout["loss_t"] = torch.cat(flat_loss_t, dim=0)
+        rollout["initial_cfm_loss"] = torch.cat(flat_init_cfm_loss, dim=0)
+
+        return rollout
     
     def collect_rollout_single(self, env, device):
         cfg_t = self.cfg.training
