@@ -647,6 +647,37 @@ class RobotWorkspace(BaseWorkspace):
             torch.tensor(all_adv, dtype=torch.float32),
             torch.tensor(all_ret, dtype=torch.float32),
         )
+
+    def calculate_gae_tensor(self, rewards, values, truncs, discounts, boundaries, bootstrap_values):
+        gamma = float(self.cfg.training.gamma)
+        lmbda = float(self.cfg.training.lmbda)
+        discounting = float(getattr(self.cfg.training, "discounting", 1.0))
+
+        rewards = rewards.to(dtype=torch.float32)
+        values = values.to(dtype=torch.float32)
+        truncs = truncs.to(dtype=torch.float32)
+        discounts = discounts.to(dtype=torch.float32) * discounting
+        boundaries = boundaries.to(dtype=torch.float32)
+        bootstrap_values = bootstrap_values.to(dtype=torch.float32)
+
+        num_steps, num_envs = rewards.shape
+        adv = torch.zeros_like(rewards)
+        ret = torch.zeros_like(rewards)
+        next_value = bootstrap_values[-1]
+        gae_adv = torch.zeros(num_envs, device=rewards.device, dtype=torch.float32)
+
+        for t in reversed(range(num_steps)):
+            use_step_bootstrap = boundaries[t] > 0
+            step_next_value = torch.where(use_step_bootstrap, bootstrap_values[t], next_value)
+            trunc_mask = 1.0 - truncs[t]
+            delta = rewards[t] + gamma * step_next_value * discounts[t] - values[t]
+            carry_mask = (1.0 - boundaries[t]) * trunc_mask
+            gae_adv = delta + gamma * lmbda * discounts[t] * carry_mask * gae_adv
+            adv[t] = gae_adv
+            ret[t] = gae_adv + values[t]
+            next_value = values[t]
+
+        return adv.reshape(-1), ret.reshape(-1)
     
     def collect_rollout(self, env, device):
         num_envs = int(getattr(self.cfg.training, "num_envs", 1))
@@ -692,15 +723,11 @@ class RobotWorkspace(BaseWorkspace):
         obs, _ = env.reset()
         obs_hist = self._init_batched_obs_history(obs, n_obs_steps)
 
-        ep_rews = [[] for _ in range(num_envs)]
-        ep_vals = [[] for _ in range(num_envs)]
-        ep_dones = [[] for _ in range(num_envs)]
-        ep_truncs = [[] for _ in range(num_envs)]
-        ep_discounts = [[] for _ in range(num_envs)]
         ep_steps = [0 for _ in range(num_envs)]
+        ep_len_totals = []
 
-        batch_rews, batch_vals, batch_dones = [], [], []
-        batch_truncs, batch_discounts, batch_bootstrap_values = [], [], []
+        reward_steps, value_steps = [], []
+        trunc_steps, discount_steps, boundary_steps, bootstrap_steps = [], [], [], []
         flat_critic_obs, flat_naction_target = [], []
         flat_loss_eps, flat_loss_t, flat_init_cfm_loss = [], [], []
         flat_cond_data, flat_cond_mask, flat_global_cond = [], [], []
@@ -737,48 +764,38 @@ class RobotWorkspace(BaseWorkspace):
                 done_tensor = torch.logical_or(terminated, truncated)
                 next_obs_hist = self._append_batched_obs_history(obs_hist, next_obs)
 
+                reward_steps.append((rew.detach().to(device=device, dtype=torch.float32) * reward_scaling))
+                value_steps.append(v.detach().to(device=device, dtype=torch.float32))
+                trunc_steps.append(truncated.detach().to(device=device, dtype=torch.float32))
+                discount_steps.append((~terminated).detach().to(device=device, dtype=torch.float32))
+
                 finished_env_ids = []
-                done_env_ids = []
+                done_env_ids = done_tensor.nonzero(as_tuple=False).flatten().detach().cpu().tolist()
+                done_env_id_set = set(done_env_ids)
                 reached_max_env_ids = []
                 for env_id in range(num_envs):
-                    done = bool(done_tensor[env_id].item())
-                    trunc = float(bool(truncated[env_id].item()))
-                    discount = 0.0 if bool(terminated[env_id].item()) else 1.0
-
-                    ep_rews[env_id].append(float(rew[env_id].item()) * reward_scaling)
-                    ep_vals[env_id].append(float(v[env_id].item()))
-                    ep_dones[env_id].append(float(done))
-                    ep_truncs[env_id].append(trunc)
-                    ep_discounts[env_id].append(discount)
                     ep_steps[env_id] += 1
+                    if ep_steps[env_id] >= max_ep_steps and env_id not in done_env_id_set:
+                        reached_max_env_ids.append(env_id)
 
-                    reached_max = ep_steps[env_id] >= max_ep_steps
-                    if done or reached_max:
-                        finished_env_ids.append(env_id)
-                        if done:
-                            done_env_ids.append(env_id)
-                        else:
-                            reached_max_env_ids.append(env_id)
+                finished_env_ids = sorted(set(done_env_ids + reached_max_env_ids))
+                boundary = torch.zeros(num_envs, device=device, dtype=torch.float32)
+                if finished_env_ids:
+                    boundary[torch.as_tensor(finished_env_ids, device=device, dtype=torch.long)] = 1.0
+                boundary_steps.append(boundary)
 
                 if finished_env_ids:
                     with torch.inference_mode():
                         last_v_all = self.critic(
                             self._build_critic_input_from_obs(next_obs_hist)
                         ).squeeze(-1)
-                    for env_id in finished_env_ids:
-                        batch_rews.append(ep_rews[env_id])
-                        batch_vals.append(ep_vals[env_id])
-                        batch_dones.append(ep_dones[env_id])
-                        batch_truncs.append(ep_truncs[env_id])
-                        batch_discounts.append(ep_discounts[env_id])
-                        batch_bootstrap_values.append(float(last_v_all[env_id].item()))
+                    bootstrap_steps.append(last_v_all.detach().to(device=device, dtype=torch.float32))
 
-                        ep_rews[env_id] = []
-                        ep_vals[env_id] = []
-                        ep_dones[env_id] = []
-                        ep_truncs[env_id] = []
-                        ep_discounts[env_id] = []
+                    for env_id in finished_env_ids:
+                        ep_len_totals.append(ep_steps[env_id])
                         ep_steps[env_id] = 0
+                else:
+                    bootstrap_steps.append(torch.zeros(num_envs, device=device, dtype=torch.float32))
 
                 if done_env_ids:
                     reset_obs = None
@@ -808,34 +825,41 @@ class RobotWorkspace(BaseWorkspace):
                 if rollout_pbar is not None:
                     rollout_pbar.update(num_envs)
 
-            if any(len(ep_rews[i]) > 0 for i in range(num_envs)):
+            if any(ep_step > 0 for ep_step in ep_steps):
                 with torch.inference_mode():
                     last_v_all = self.critic(
                         self._build_critic_input_from_obs(obs_hist)
                     ).squeeze(-1)
-                for env_id in range(num_envs):
-                    if len(ep_rews[env_id]) == 0:
-                        continue
-                    batch_rews.append(ep_rews[env_id])
-                    batch_vals.append(ep_vals[env_id])
-                    batch_dones.append(ep_dones[env_id])
-                    batch_truncs.append(ep_truncs[env_id])
-                    batch_discounts.append(ep_discounts[env_id])
-                    batch_bootstrap_values.append(float(last_v_all[env_id].item()))
+                final_bootstrap = last_v_all.detach().to(device=device, dtype=torch.float32)
+                for env_id, ep_step in enumerate(ep_steps):
+                    if ep_step > 0:
+                        ep_len_totals.append(ep_step)
+            else:
+                final_bootstrap = torch.zeros(num_envs, device=device, dtype=torch.float32)
         finally:
             if rollout_pbar is not None:
                 rollout_pbar.close()
 
-        flat_rewards = [r for ep in batch_rews for r in ep]
-        ep_lens = [len(ep) for ep in batch_rews if len(ep) > 0]
+        rewards = torch.stack(reward_steps, dim=0)
+        values = torch.stack(value_steps, dim=0)
+        truncs = torch.stack(trunc_steps, dim=0)
+        discounts = torch.stack(discount_steps, dim=0)
+        boundaries = torch.stack(boundary_steps, dim=0)
+        bootstrap_values = torch.stack([*bootstrap_steps, final_bootstrap], dim=0)
 
-        reward_mean = float(np.mean(flat_rewards)) if len(flat_rewards) > 0 else 0.0
-        ep_len_mean = float(np.mean(ep_lens)) if len(ep_lens) > 0 else 0.0
+        advantages, returns = self.calculate_gae_tensor(
+            rewards,
+            values,
+            truncs,
+            discounts,
+            boundaries,
+            bootstrap_values,
+        )
+
+        reward_mean = float(rewards.mean().detach().cpu().item()) if rewards.numel() > 0 else 0.0
+        ep_len_mean = float(np.mean(ep_len_totals)) if len(ep_len_totals) > 0 else 0.0
 
         rollout = {
-            "batch_rews": batch_rews,
-            "batch_vals": batch_vals,
-            "batch_dones": batch_dones,
             "critic_obs": torch.cat(flat_critic_obs, dim=0),
             "naction_target": torch.cat(flat_naction_target, dim=0),
             "cond_data": torch.cat(flat_cond_data, dim=0),
@@ -843,9 +867,8 @@ class RobotWorkspace(BaseWorkspace):
             "global_cond": torch.cat(flat_global_cond, dim=0),
             "reward_mean": reward_mean,
             "ep_len_mean": ep_len_mean,
-            "batch_truncs": batch_truncs,
-            "batch_discounts": batch_discounts,
-            "batch_bootstrap_values": batch_bootstrap_values,
+            "advantages": advantages,
+            "returns": returns,
         }
 
         rollout["loss_eps"] = torch.cat(flat_loss_eps, dim=0)
@@ -1226,21 +1249,20 @@ class RobotWorkspace(BaseWorkspace):
         rho_min = float(getattr(cfg_t, "rho_min", 1e-6))
         rho_max = float(getattr(cfg_t, "rho_max", 100.0))
 
-        flat_trunc = []
-        for ep in rollout["batch_truncs"]:
-            flat_trunc.extend(ep)
-        flat_trunc = torch.tensor(flat_trunc, dtype=torch.float32, device=device)
-
         # ---- GAE ----
-        advantages, returns = self.calculate_gae(
-            rollout["batch_rews"],
-            rollout["batch_vals"],
-            rollout["batch_truncs"],
-            rollout["batch_discounts"],\
-            rollout["batch_bootstrap_values"],
-        )
-        advantages = advantages.to(device)
-        returns = returns.to(device)
+        if "advantages" in rollout and "returns" in rollout:
+            advantages = rollout["advantages"].to(device)
+            returns = rollout["returns"].to(device)
+        else:
+            advantages, returns = self.calculate_gae(
+                rollout["batch_rews"],
+                rollout["batch_vals"],
+                rollout["batch_truncs"],
+                rollout["batch_discounts"],
+                rollout["batch_bootstrap_values"],
+            )
+            advantages = advantages.to(device)
+            returns = returns.to(device)
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -1254,7 +1276,6 @@ class RobotWorkspace(BaseWorkspace):
         global_cond = rollout["global_cond"].to(device)          # [S, D]
 
         S = critic_obs.shape[0]
-        idx_all = np.arange(S)
         # 先给一个简单minibatch策略
         num_minibatches = int(getattr(cfg_t, "num_minibatches", 4))
         minibatch_size = max(1, S // num_minibatches)
@@ -1267,13 +1288,12 @@ class RobotWorkspace(BaseWorkspace):
         clipped_ratio_fracs = []
 
         for _ in range(n_updates):
-            np.random.shuffle(idx_all)
+            idx_all = torch.randperm(S, device=device)
             for start in range(0, S, minibatch_size):
                 end = start + minibatch_size
-                idx_np = idx_all[start:end]
-                if len(idx_np) == 0:
+                idx = idx_all[start:end]
+                if idx.numel() == 0:
                     continue
-                idx = torch.as_tensor(idx_np, device=device, dtype=torch.long)
 
                 mb_adv = advantages[idx]              # [B]
                 mb_ret = returns[idx]                 # [B]
