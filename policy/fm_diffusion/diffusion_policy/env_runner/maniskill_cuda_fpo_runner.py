@@ -19,6 +19,7 @@ from sim.maniskill.obs_adapter import (
     DEFAULT_POINT_CLOUD_CROP_MAX,
     DEFAULT_POINT_CLOUD_CROP_MIN,
     DEFAULT_POINT_CLOUD_PRIMARY_CAMERA,
+    DEFAULT_POINT_CLOUD_SAMPLING,
     ENV_POINT_CLOUD_EXCLUDED_SEG_IDS,
 )
 from sim.maniskill.task_profiles import (
@@ -51,7 +52,7 @@ class ManiSkillCudaFPORunner:
         render_backend: str | None = None,
         sim_freq: int | None = None,
         control_freq: int | None = None,
-        point_cloud_sampling: str = "fast",
+        point_cloud_sampling: str = DEFAULT_POINT_CLOUD_SAMPLING,
         sim_config: Mapping[str, Any] | None = None,
         **env_kwargs,
     ) -> None:
@@ -79,9 +80,9 @@ class ManiSkillCudaFPORunner:
             control_mode=control_mode,
         )
         sampling = str(point_cloud_sampling).lower()
-        if sampling not in {"fast", "resize", "linspace"}:
+        if sampling not in {"fps", "fast", "resize", "linspace"}:
             raise ValueError(
-                "ManiSkillCudaFPORunner currently supports only fast/resize/linspace "
+                "ManiSkillCudaFPORunner currently supports only fps/fast/resize/linspace "
                 f"point-cloud sampling, got `{point_cloud_sampling}`."
             )
 
@@ -298,8 +299,35 @@ class ManiSkillCudaFPORunner:
         clouds = []
         for env_id in range(self.num_envs):
             points = xyz[env_id][keep[env_id]]
-            clouds.append(self._resize_point_cloud(points))
+            clouds.append(self._sample_point_cloud(points))
         return torch.stack(clouds, dim=0)
+
+    def _sample_point_cloud(self, points: torch.Tensor) -> torch.Tensor:
+        if self.point_cloud_sampling in {"fast", "resize", "linspace"}:
+            return self._resize_point_cloud(points)
+
+        sampled = self._farthest_point_sample(points)
+        return self._resize_point_cloud(sampled)
+
+    def _farthest_point_sample(self, points: torch.Tensor) -> torch.Tensor:
+        target_points = self.point_cloud_points
+        num_points = points.shape[0]
+        points = points.to(device=self.device, dtype=torch.float32)
+        if num_points <= target_points:
+            return points
+
+        sampled = torch.empty((target_points, 3), device=self.device, dtype=torch.float32)
+        sampled[0] = points[0]
+        min_dist_sq = torch.sum((points - sampled[0]) ** 2, dim=1)
+        farthest_idx = torch.argmax(min_dist_sq)
+
+        for sample_idx in range(1, target_points):
+            sampled[sample_idx] = points[farthest_idx]
+            dist_sq = torch.sum((points - sampled[sample_idx]) ** 2, dim=1)
+            min_dist_sq = torch.minimum(min_dist_sq, dist_sq)
+            farthest_idx = torch.argmax(min_dist_sq)
+
+        return sampled
 
     def _resize_point_cloud(self, points: torch.Tensor) -> torch.Tensor:
         target_points = self.point_cloud_points
