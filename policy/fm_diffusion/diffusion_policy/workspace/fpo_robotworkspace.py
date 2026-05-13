@@ -66,6 +66,27 @@ def _safe_float(v, default=0.0):
         return float(default)
 
 
+ONLINE_ROLLOUT_DIAG_KEYS = (
+    "rollout_action_abs_max",
+    "rollout_action_abs_mean",
+    "rollout_action_mean",
+    "rollout_action_std",
+    "rollout_reward_stage_mean",
+    "rollout_reward_stage_max",
+    "rollout_reward_stage_frac_0",
+    "rollout_reward_stage_frac_1",
+    "rollout_reward_stage_frac_2",
+    "rollout_reward_stage_frac_3",
+    "rollout_reward_stage_frac_4",
+    "rollout_reward_left_to_box_mean",
+    "rollout_reward_right_to_box_mean",
+    "rollout_reward_box_to_handover_mean",
+    "rollout_reward_box_to_target_mean",
+    "rollout_reward_left_holding_frac",
+    "rollout_reward_right_holding_frac",
+)
+
+
 def _format_online_progress(it, total, step_log):
     iter_idx = int(it) + 1
     total_iters = int(total)
@@ -76,12 +97,15 @@ def _format_online_progress(it, total, step_log):
     critic_loss = _safe_float(step_log.get("critic_loss", 0.0))
     rho_mean = _safe_float(step_log.get("rho_mean", 0.0))
     clipped_ratio_frac = _safe_float(step_log.get("clipped_ratio_frac", 0.0))
+    stage_mean = _safe_float(step_log.get("rollout_reward_stage_mean", 0.0))
+    action_abs_max = _safe_float(step_log.get("rollout_action_abs_max", 0.0))
 
     return (
         f"[online_fpo] iter {iter_idx}/{total_iters} | "
         f"reward={mean_reward:.4f} ep_len={mean_ep_len:.2f} | "
         f"actor={actor_loss:.4f} critic={critic_loss:.4f} | "
-        f"rho={rho_mean:.4f} clip_frac={clipped_ratio_frac:.4f}"
+        f"rho={rho_mean:.4f} clip_frac={clipped_ratio_frac:.4f} | "
+        f"stage={stage_mean:.2f} action_abs_max={action_abs_max:.3f}"
     )
 # --------------------------------新增结束--------------------------------
 
@@ -526,6 +550,9 @@ class RobotWorkspace(BaseWorkspace):
                             "mean_reward": rollout["reward_mean"],
                             "mean_ep_len": rollout["ep_len_mean"],
                         }
+                        for diag_key in ONLINE_ROLLOUT_DIAG_KEYS:
+                            if diag_key in rollout:
+                                step_log[diag_key] = rollout[diag_key]
 
                         if cfg.training.use_ema:
                             ema.step(self.model)
@@ -548,6 +575,7 @@ class RobotWorkspace(BaseWorkspace):
                             "actor": f"{_safe_float(step_log['actor_loss']):.3f}",
                             "critic": f"{_safe_float(step_log['critic_loss']):.3f}",
                             "rho": f"{_safe_float(step_log['rho_mean']):.3f}",
+                            "stage": f"{_safe_float(step_log.get('rollout_reward_stage_mean', 0.0)):.2f}",
                         })
 
                         if (tb_writer is not None) and (((it + 1) % max(1, tb_log_every)) == 0):
@@ -559,6 +587,9 @@ class RobotWorkspace(BaseWorkspace):
                             tb_writer.add_scalar("online/rho_mean", _safe_float(step_log["rho_mean"]), tb_step)
                             tb_writer.add_scalar("online/cfm_diff_mean", _safe_float(step_log["cfm_diff_mean"]), tb_step)
                             tb_writer.add_scalar("online/clipped_ratio_frac", _safe_float(step_log["clipped_ratio_frac"]), tb_step)
+                            for diag_key in ONLINE_ROLLOUT_DIAG_KEYS:
+                                if diag_key in step_log:
+                                    tb_writer.add_scalar(f"online/{diag_key}", _safe_float(step_log[diag_key]), tb_step)
                             tb_writer.add_scalar("online/iter", float(it), tb_step)
 
                         tqdm.tqdm.write(progress_line)
@@ -731,6 +762,31 @@ class RobotWorkspace(BaseWorkspace):
         flat_critic_obs, flat_naction_target = [], []
         flat_loss_eps, flat_loss_t, flat_init_cfm_loss = [], [], []
         flat_cond_data, flat_cond_mask, flat_global_cond = [], [], []
+        action_abs_max_steps, action_abs_mean_steps = [], []
+        action_mean_steps, action_std_steps = [], []
+        info_metric_keys = (
+            "reward_stage",
+            "reward_left_to_box",
+            "reward_right_to_box",
+            "reward_box_to_handover",
+            "reward_box_to_target",
+            "reward_left_holding",
+            "reward_right_holding",
+        )
+        info_metric_steps = {key: [] for key in info_metric_keys}
+
+        def append_info_metric(info, key):
+            if not isinstance(info, dict) or key not in info:
+                return
+            value = info[key]
+            if value is None:
+                return
+            if isinstance(value, torch.Tensor):
+                tensor = value.detach().to(device=device, dtype=torch.float32).reshape(-1)
+            else:
+                tensor = torch.as_tensor(value, device=device, dtype=torch.float32).reshape(-1)
+            if tensor.numel() > 0:
+                info_metric_steps[key].append(tensor)
 
         steps = 0
         rollout_pbar = None
@@ -760,7 +816,15 @@ class RobotWorkspace(BaseWorkspace):
                     v = self.critic(critic_in).squeeze(-1)
 
                 actions = out["action"][:, 0].detach()
-                next_obs, rew, terminated, truncated, _ = env.step(actions)
+                action_stats = actions.detach().to(device=device, dtype=torch.float32)
+                action_abs_max_steps.append(action_stats.abs().amax())
+                action_abs_mean_steps.append(action_stats.abs().mean())
+                action_mean_steps.append(action_stats.mean())
+                action_std_steps.append(action_stats.std(unbiased=False))
+
+                next_obs, rew, terminated, truncated, info = env.step(actions)
+                for info_metric_key in info_metric_keys:
+                    append_info_metric(info, info_metric_key)
                 done_tensor = torch.logical_or(terminated, truncated)
                 next_obs_hist = self._append_batched_obs_history(obs_hist, next_obs)
 
@@ -859,6 +923,41 @@ class RobotWorkspace(BaseWorkspace):
         reward_mean = float(rewards.mean().detach().cpu().item()) if rewards.numel() > 0 else 0.0
         ep_len_mean = float(np.mean(ep_len_totals)) if len(ep_len_totals) > 0 else 0.0
 
+        def scalar_mean(values):
+            if not values:
+                return 0.0
+            return float(torch.stack(values).mean().detach().cpu().item())
+
+        def scalar_max(values):
+            if not values:
+                return 0.0
+            return float(torch.stack(values).max().detach().cpu().item())
+
+        def metric_values(key):
+            values = info_metric_steps.get(key, [])
+            if not values:
+                return None
+            return torch.cat(values, dim=0)
+
+        def metric_mean(key):
+            values = metric_values(key)
+            if values is None or values.numel() == 0:
+                return 0.0
+            return float(values.mean().detach().cpu().item())
+
+        stage_values = metric_values("reward_stage")
+        stage_mean = 0.0
+        stage_max = 0.0
+        stage_fracs = {stage_id: 0.0 for stage_id in range(5)}
+        if stage_values is not None and stage_values.numel() > 0:
+            stage_mean = float(stage_values.mean().detach().cpu().item())
+            stage_max = float(stage_values.max().detach().cpu().item())
+            stage_ids = stage_values.round().to(dtype=torch.long)
+            for stage_id in range(5):
+                stage_fracs[stage_id] = float(
+                    (stage_ids == stage_id).to(dtype=torch.float32).mean().detach().cpu().item()
+                )
+
         rollout = {
             "critic_obs": torch.cat(flat_critic_obs, dim=0),
             "naction_target": torch.cat(flat_naction_target, dim=0),
@@ -869,6 +968,23 @@ class RobotWorkspace(BaseWorkspace):
             "ep_len_mean": ep_len_mean,
             "advantages": advantages,
             "returns": returns,
+            "rollout_action_abs_max": scalar_max(action_abs_max_steps),
+            "rollout_action_abs_mean": scalar_mean(action_abs_mean_steps),
+            "rollout_action_mean": scalar_mean(action_mean_steps),
+            "rollout_action_std": scalar_mean(action_std_steps),
+            "rollout_reward_stage_mean": stage_mean,
+            "rollout_reward_stage_max": stage_max,
+            "rollout_reward_stage_frac_0": stage_fracs[0],
+            "rollout_reward_stage_frac_1": stage_fracs[1],
+            "rollout_reward_stage_frac_2": stage_fracs[2],
+            "rollout_reward_stage_frac_3": stage_fracs[3],
+            "rollout_reward_stage_frac_4": stage_fracs[4],
+            "rollout_reward_left_to_box_mean": metric_mean("reward_left_to_box"),
+            "rollout_reward_right_to_box_mean": metric_mean("reward_right_to_box"),
+            "rollout_reward_box_to_handover_mean": metric_mean("reward_box_to_handover"),
+            "rollout_reward_box_to_target_mean": metric_mean("reward_box_to_target"),
+            "rollout_reward_left_holding_frac": metric_mean("reward_left_holding"),
+            "rollout_reward_right_holding_frac": metric_mean("reward_right_holding"),
         }
 
         rollout["loss_eps"] = torch.cat(flat_loss_eps, dim=0)

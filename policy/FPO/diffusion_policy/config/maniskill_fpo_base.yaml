@@ -113,7 +113,7 @@ training:
   max_total_fpo_samples_per_call: 8
   online_iters: 1
   ratio_mode: per_sample
-  clamp_logratio: 0.2
+  clamp_logratio: 5
   rho_min: 1.0e-6
   rho_max: 100
   num_minibatches: 1
