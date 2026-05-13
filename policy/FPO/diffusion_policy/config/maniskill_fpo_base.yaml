@@ -63,7 +63,7 @@ val_dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1.0e-5
+  lr: 1.0e-6
   betas: [0.95, 0.999]
   eps: 1.0e-8
   weight_decay: 1.0e-6
@@ -79,7 +79,7 @@ critic:
 
 critic_optimizer:
   _target_: torch.optim.AdamW
-  lr: 1.0e-4
+  lr: 1.0e-5
   betas: [0.95, 0.999]
   eps: 1.0e-8
   weight_decay: 1.0e-6
@@ -113,7 +113,7 @@ training:
   max_total_fpo_samples_per_call: 8
   online_iters: 1
   ratio_mode: per_sample
-  clamp_logratio: 5.0
+  clamp_logratio: 0.2
   rho_min: 1.0e-6
   rho_max: 100
   num_minibatches: 1

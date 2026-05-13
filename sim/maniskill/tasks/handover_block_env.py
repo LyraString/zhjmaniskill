@@ -22,6 +22,14 @@ BOX_CENTER_Z = 0.842
 TARGET_CENTER_Z = 0.741
 BOX_BASE_QUAT = [0.981, 0.0, 0.0, 0.195]
 BOX_YAW_LIMIT = 0.2
+REWARD_LEFT_GRASP_DIST = 0.18
+REWARD_HANDOVER_DIST = 0.16
+REWARD_RIGHT_GRASP_DIST = 0.18
+REWARD_TARGET_NEAR_DIST = 0.08
+REWARD_LEFT_CLEAR_DIST = 0.18
+REWARD_GRIPPER_CLOSED_THRESHOLD = 0.25
+REWARD_BOX_LIFT_Z = BOX_CENTER_Z + 0.025
+REWARD_DROP_Z = TARGET_CENTER_Z + 0.02
 
 
 def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
@@ -45,6 +53,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
     def __init__(self, *args, legacy_rng_compat: bool = False, **kwargs):
         self.legacy_rng_compat = bool(legacy_rng_compat)
         self.success_gate_enabled = True
+        self.reward_stage = None
         super().__init__(*args, **kwargs)
 
     def _load_scene(self, options: dict):
@@ -142,6 +151,14 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             else:
                 target_xyz[:, 2] = torch.as_tensor(target_z_np, device=self.device, dtype=torch.float32).reshape(b)
             self.target_box.set_pose(Pose.create_from_pq(p=target_xyz))
+            self._get_reward_stage()[env_idx.to(torch.long)] = 0
+
+    def _get_reward_stage(self) -> torch.Tensor:
+        if not isinstance(self.reward_stage, torch.Tensor) or self.reward_stage.shape != (self.num_envs,):
+            self.reward_stage = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        else:
+            self.reward_stage = self.reward_stage.to(device=self.device, dtype=torch.long)
+        return self.reward_stage
 
     def evaluate(self):
         base_info = super().evaluate()
@@ -212,11 +229,94 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         return obs
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
-        reward = super().compute_dense_reward(obs=obs, action=action, info=info)
-        reward = reward + info["xy_aligned"].to(torch.float32)
-        reward = reward + info["z_aligned"].to(torch.float32)
-        reward = reward + 2.0 * info["spatial_success"].to(torch.float32)
-        reward = reward + info["right_gripper_open"].to(torch.float32)
-        reward = reward + info["right_ee_clear"].to(torch.float32)
-        reward = reward + info["box_static"].to(torch.float32)
+        stage = self._get_reward_stage()
+        dtype = self.box.pose.p.dtype
+        device = self.device
+
+        box_pos = self.box.pose.p
+        left_ee_pos = self.get_arm_end_effector_link(arm_index=0).pose.p
+        right_ee_pos = self.get_arm_end_effector_link(arm_index=1).pose.p
+
+        box_bottom_center = box_pos.clone()
+        box_bottom_center[:, 2] -= float(BOX_HALF_SIZE[2])
+        target_top_center = self.target_box.pose.p.clone()
+        target_top_center[:, 2] += float(TARGET_HALF_SIZE[2])
+        handover_pos = torch.tensor(
+            BLOCK_MIDDLE_POSE[:3],
+            device=device,
+            dtype=dtype,
+        ).repeat(self.num_envs, 1)
+
+        left_to_box = torch.linalg.norm(left_ee_pos - box_pos, dim=1)
+        right_to_box = torch.linalg.norm(right_ee_pos - box_pos, dim=1)
+        box_to_handover = torch.linalg.norm(box_pos - handover_pos, dim=1)
+        box_to_target = torch.linalg.norm(box_bottom_center - target_top_center, dim=1)
+
+        left_gripper_val = self._get_gripper_state_tensor(arm_index=0).squeeze(-1)
+        right_gripper_val = self._get_gripper_state_tensor(arm_index=1).squeeze(-1)
+        left_closed = left_gripper_val < REWARD_GRIPPER_CLOSED_THRESHOLD
+        right_closed = right_gripper_val < REWARD_GRIPPER_CLOSED_THRESHOLD
+        box_lifted = box_pos[:, 2] > REWARD_BOX_LIFT_Z
+        box_dropped = box_pos[:, 2] < REWARD_DROP_Z
+        left_clear = left_to_box > REWARD_LEFT_CLEAR_DIST
+
+        left_holding = left_closed & (left_to_box < REWARD_LEFT_GRASP_DIST) & box_lifted
+        handover_ready = box_to_handover < REWARD_HANDOVER_DIST
+        right_holding = right_closed & (right_to_box < REWARD_RIGHT_GRASP_DIST)
+        target_near = box_to_target < REWARD_TARGET_NEAR_DIST
+
+        next_stage = stage.clone()
+        next_stage = torch.where((next_stage == 0) & left_holding, torch.ones_like(next_stage), next_stage)
+        next_stage = torch.where((next_stage == 1) & handover_ready, torch.full_like(next_stage, 2), next_stage)
+        next_stage = torch.where((next_stage == 2) & right_holding, torch.full_like(next_stage, 3), next_stage)
+        next_stage = torch.where((next_stage == 3) & target_near, torch.full_like(next_stage, 4), next_stage)
+        self.reward_stage = next_stage
+        stage = next_stage
+
+        reward = 0.2 * info["robots_ready"].to(torch.float32)
+        action_penalty = torch.zeros_like(reward)
+        if isinstance(action, torch.Tensor):
+            action_penalty = torch.mean(torch.square(action.to(device=device, dtype=torch.float32)), dim=-1)
+
+        stage0 = stage == 0
+        stage1 = stage == 1
+        stage2 = stage == 2
+        stage3 = stage == 3
+        stage4 = stage >= 4
+
+        left_reach_reward = torch.exp(-8.0 * left_to_box)
+        left_grasp_reward = left_closed.to(torch.float32) * (left_to_box < REWARD_LEFT_GRASP_DIST).to(torch.float32)
+        handover_reward = torch.exp(-6.0 * box_to_handover)
+        right_reach_reward = torch.exp(-8.0 * right_to_box)
+        right_grasp_reward = right_closed.to(torch.float32) * (right_to_box < REWARD_RIGHT_GRASP_DIST).to(torch.float32)
+        target_reward = torch.exp(-10.0 * box_to_target)
+        final_release_reward = (
+            info["right_gripper_open"].to(torch.float32)
+            + info["right_ee_clear"].to(torch.float32)
+            + info["box_static"].to(torch.float32)
+        )
+
+        reward = reward + stage0.to(torch.float32) * (left_reach_reward + 0.5 * left_grasp_reward)
+        reward = reward + stage1.to(torch.float32) * (1.0 + 2.0 * handover_reward + 0.5 * left_closed.to(torch.float32))
+        reward = reward + stage2.to(torch.float32) * (
+            2.0 + right_reach_reward + 0.5 * right_grasp_reward + 0.5 * left_closed.to(torch.float32)
+        )
+        reward = reward + stage3.to(torch.float32) * (
+            3.0 + 3.0 * target_reward + 0.5 * right_closed.to(torch.float32) + 0.5 * left_clear.to(torch.float32)
+        )
+        reward = reward + stage4.to(torch.float32) * (4.0 + 4.0 * target_reward + final_release_reward)
+        reward = reward + 10.0 * info["success"].to(torch.float32)
+        reward = reward - 1.0 * box_dropped.to(torch.float32)
+        reward = reward - 0.01 * action_penalty
+
+        info.update(
+            reward_stage=stage.to(torch.float32),
+            reward_left_to_box=left_to_box,
+            reward_right_to_box=right_to_box,
+            reward_box_to_handover=box_to_handover,
+            reward_box_to_target=box_to_target,
+            reward_box_lifted=box_lifted,
+            reward_left_holding=left_holding,
+            reward_right_holding=right_holding,
+        )
         return reward
