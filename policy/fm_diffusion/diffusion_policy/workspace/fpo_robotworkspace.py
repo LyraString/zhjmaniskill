@@ -137,6 +137,11 @@ def _create_identity_normalizer_from_shape_meta(shape_meta: dict) -> LinearNorma
     normalizer["action"] = _create_identity_field_normalizer(action_dim)
     return normalizer
 
+
+def _payload_has_model_normalizer(payload: dict) -> bool:
+    model_state = payload.get("state_dicts", {}).get("model", {})
+    return any(str(key).startswith("normalizer.") for key in model_state.keys())
+
 class RobotWorkspace(BaseWorkspace):
     include_keys = ["global_step", "epoch"]
 
@@ -173,7 +178,10 @@ class RobotWorkspace(BaseWorkspace):
         head_camera_type = cfg.head_camera_type
 
         # resume training
+        loaded_checkpoint_payload = None
         if cfg.training.resume:
+            load_optimizer_state = bool(getattr(cfg.training, "load_optimizer_state", True))
+            exclude_keys = tuple() if load_optimizer_state else ("optimizer",)
             # lastest_ckpt_path = self.get_checkpoint_path()
             # if lastest_ckpt_path.is_file():
             #     print(f"Resuming from checkpoint {lastest_ckpt_path}")
@@ -183,36 +191,50 @@ class RobotWorkspace(BaseWorkspace):
                 ckpt_path = pathlib.Path(resume_ckpt_path)
                 if not ckpt_path.is_file():
                     raise FileNotFoundError(f"Specified resume checkpoint not found: {ckpt_path}")
-                print(f"Resuming from specified checkpoint {ckpt_path}")
-                self.load_checkpoint(path=ckpt_path)
+                loaded_checkpoint_payload = self.load_checkpoint(path=ckpt_path, exclude_keys=exclude_keys)
             else:
                 lastest_ckpt_path = self.get_checkpoint_path()
                 if lastest_ckpt_path.is_file():
-                    print(f"Resuming from checkpoint {lastest_ckpt_path}")
-                    self.load_checkpoint(path=lastest_ckpt_path)
+                    loaded_checkpoint_payload = self.load_checkpoint(path=lastest_ckpt_path, exclude_keys=exclude_keys)
+
+        init_actor_from_ema = bool(getattr(cfg.training, "init_actor_from_ema", False))
+        if init_actor_from_ema and (loaded_checkpoint_payload is not None):
+            if not cfg.training.use_ema or self.ema_model is None:
+                raise RuntimeError("training.init_actor_from_ema=True requires training.use_ema=True.")
+            self.model.load_state_dict(self.ema_model.state_dict())
 
         env_backend = str(getattr(cfg.training, "env_backend", "robotwin_legacy"))
         skip_offline_dataset = bool(getattr(cfg.training, "online_only_no_dataset", False))
+        preserve_ckpt_normalizer = bool(getattr(cfg.training, "preserve_ckpt_normalizer", False))
+        use_ckpt_normalizer = (
+            preserve_ckpt_normalizer
+            and (loaded_checkpoint_payload is not None)
+            and _payload_has_model_normalizer(loaded_checkpoint_payload)
+        )
 
         dataset = None
         train_dataloader = None
         val_dataset = None
         val_dataloader = None
         if env_backend == "maniskill" and skip_offline_dataset:
-            normalizer = _create_identity_normalizer_from_shape_meta(cfg.shape_meta)
+            normalizer = None if use_ckpt_normalizer else _create_identity_normalizer_from_shape_meta(cfg.shape_meta)
         else:
             dataset = hydra.utils.instantiate(cfg.task.dataset)
             assert isinstance(dataset, BaseImageDataset)
             train_dataloader = create_dataloader(dataset, **cfg.dataloader)
-            normalizer = dataset.get_normalizer()
+            normalizer = None if use_ckpt_normalizer else dataset.get_normalizer()
 
             # configure validation dataset
             val_dataset = dataset.get_validation_dataset()
             val_dataloader = create_dataloader(val_dataset, **cfg.val_dataloader)
 
-        self.model.set_normalizer(normalizer)
-        if cfg.training.use_ema:
-            self.ema_model.set_normalizer(normalizer)
+        if normalizer is None:
+            if not use_ckpt_normalizer:
+                raise RuntimeError("No normalizer is available for FPO training.")
+        else:
+            self.model.set_normalizer(normalizer)
+            if cfg.training.use_ema:
+                self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
         lr_scheduler = None

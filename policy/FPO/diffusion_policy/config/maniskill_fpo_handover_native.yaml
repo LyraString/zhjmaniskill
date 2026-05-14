@@ -7,6 +7,9 @@ name: maniskill_fpo_handover_native
 exp_name: handover_block_native
 
 training:
+  preserve_ckpt_normalizer: True
+  init_actor_from_ema: True
+  load_optimizer_state: False
   online_iters: 3000
   timesteps_per_batch: 3200
   max_timesteps_per_episode: 1000
