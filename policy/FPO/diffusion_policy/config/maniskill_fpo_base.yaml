@@ -105,7 +105,7 @@ training:
   tqdm_interval_sec: 1.0
   gamma: 0.99
   lmbda: 0.99
-  clip_coef: 0.02
+  clip_coef: 0.01
   timesteps_per_batch: 64
   max_timesteps_per_episode: 50
   n_updates_per_iteration: 1
@@ -113,11 +113,11 @@ training:
   max_total_fpo_samples_per_call: 8
   online_iters: 1
   ratio_mode: per_sample
-  clamp_logratio: 5
+  clamp_logratio: 0.2
   rho_min: 1.0e-6
-  rho_max: 100
+  rho_max: 2.0
   num_minibatches: 1
-  max_grad_norm: 1.0
+  max_grad_norm: 0.5
   value_loss_coeff: 0.25
   reward_scaling: 1.0
   discounting: 1.0

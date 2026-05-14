@@ -92,7 +92,6 @@ def _format_online_progress(it, total, step_log):
     total_iters = int(total)
 
     mean_reward = _safe_float(step_log.get("mean_reward", 0.0))
-    mean_ep_len = _safe_float(step_log.get("mean_ep_len", 0.0))
     actor_loss = _safe_float(step_log.get("actor_loss", 0.0))
     critic_loss = _safe_float(step_log.get("critic_loss", 0.0))
     rho_mean = _safe_float(step_log.get("rho_mean", 0.0))
@@ -102,7 +101,7 @@ def _format_online_progress(it, total, step_log):
 
     return (
         f"[online_fpo] iter {iter_idx}/{total_iters} | "
-        f"reward={mean_reward:.4f} ep_len={mean_ep_len:.2f} | "
+        f"reward={mean_reward:.4f} | "
         f"actor={actor_loss:.4f} critic={critic_loss:.4f} | "
         f"rho={rho_mean:.4f} clip_frac={clipped_ratio_frac:.4f} | "
         f"stage={stage_mean:.2f} action_abs_max={action_abs_max:.3f}"
@@ -571,7 +570,6 @@ class RobotWorkspace(BaseWorkspace):
                         progress_line = _format_online_progress(it, online_iters, step_log)
                         pbar.set_postfix({
                             "rew": f"{_safe_float(step_log['mean_reward']):.3f}",
-                            "ep": f"{_safe_float(step_log['mean_ep_len']):.1f}",
                             "actor": f"{_safe_float(step_log['actor_loss']):.3f}",
                             "critic": f"{_safe_float(step_log['critic_loss']):.3f}",
                             "rho": f"{_safe_float(step_log['rho_mean']):.3f}",
