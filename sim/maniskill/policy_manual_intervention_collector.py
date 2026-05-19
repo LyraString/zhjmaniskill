@@ -43,6 +43,7 @@ class PolicyManualInterventionCollector:
     MANUAL_GRIPPER_CLOSED_HOLD_THRESHOLD = 0.2
     MANUAL_GRIPPER_CLOSED_DRIVE_VALUE = -0.2
     POLICY_GRIP_GUARD_TAKEOVER_DISTANCE = 0.16
+    POLICY_POSE_GUARD_APPROACH_DISTANCE = 0.28
     MANUAL_AUTO_ALIGN_STEP = 0.035
     MANUAL_RIGHT_AUTO_ALIGN_STEP = 0.055
     MANUAL_AUTO_ALIGN_GRASP_SWITCH_DISTANCE = 0.05
@@ -57,6 +58,9 @@ class PolicyManualInterventionCollector:
     MANUAL_IK_THRESHOLD = 0.01
     MANUAL_RETRY_SCALES = (1.0, 0.5, 0.25)
     MANUAL_VERTICAL_DIRECTION_MISMATCH_EPS = 0.003
+    MANUAL_VERTICAL_MIN_PROGRESS = 0.006
+    MANUAL_VERTICAL_PROGRESS_RATIO = 0.25
+    MANUAL_HANDOVER_HOLDER_MIN_LIFT = 0.035
     MANUAL_MAX_SHOULDER_PAN_DELTA = 0.45
     MANUAL_RIGHT_MAX_SHOULDER_PAN_DELTA = 0.7
     MANUAL_MAX_JOINT_MOTION = 1.2
@@ -65,6 +69,7 @@ class PolicyManualInterventionCollector:
     MANUAL_TRIGGER_KEY = "m"
     MANUAL_RIGHT_HORIZONTAL_GRASP = True
     MANUAL_RIGHT_HORIZONTAL_YAW_VARIANTS = (-0.16, -0.08, 0.0, 0.08, 0.16)
+    MANUAL_HANDOVER_HOLDER_LIFT = 0.0
     MANUAL_HANDOVER_LEFT_CLEAR_LIFT = 0.10
 
     def __init__(
@@ -96,6 +101,9 @@ class PolicyManualInterventionCollector:
         self._manual_hold_arm_qpos: dict[int, np.ndarray] = {}
         self._manual_hold_gripper_qpos: dict[int, np.ndarray] = {}
         self._policy_grip_guard_arm_index: int | None = None
+        self._policy_grip_guard_pose_active = False
+        self._manual_handover_holder_lift_done = False
+        self._manual_force_guarded_box_hold = False
         self._manual_trigger_down_latched = False
         self._manual_guarded_box_relative_anchor: np.ndarray | None = None
 
@@ -131,6 +139,26 @@ class PolicyManualInterventionCollector:
             for arm in (0, 1)
         ]
         return int(np.argmin(distances))
+
+    def _manual_trigger_arm_index(self) -> int:
+        guarded_arm_index = self._policy_grip_guard_arm_index
+        if guarded_arm_index is None:
+            return self._default_manual_arm_index()
+        # During handover, manual intervention should control the receiving /
+        # placing right arm. The left arm is only a guarded holder before
+        # takeover; after takeover the right arm itself is the guarded holder.
+        return 1
+
+    def _guarded_arm_manual_command_blocked(self, arm_index: int, command: str) -> bool:
+        guarded_arm_index = self._policy_grip_guard_arm_index
+        if guarded_arm_index is None or int(guarded_arm_index) != int(arm_index):
+            return False
+        guarded_arm_index = int(guarded_arm_index)
+        if guarded_arm_index != 0:
+            return False
+        if self._opposite_gripper_has_taken_over(guarded_arm_index):
+            return False
+        return command in ("w", "s", "a", "d", "r", "f", "u", "g", "o", "c")
 
     def _manual_state_snapshot(self, arm_index: int = 0) -> dict[str, Any]:
         box_pose = np.asarray(self.solver._box_pose(), dtype=np.float64)
@@ -214,12 +242,15 @@ class PolicyManualInterventionCollector:
         if self._policy_grip_guard_arm_index is not None:
             self._set_manual_gripper_drive_override(self._policy_grip_guard_arm_index, 1.0)
         self._policy_grip_guard_arm_index = None
+        self._policy_grip_guard_pose_active = False
+        self._manual_force_guarded_box_hold = False
 
     def _enable_policy_grip_guard_if_closed(self, arm_index: int) -> None:
         arm_index = int(arm_index)
         if float(self.solver.ctrl.current_gripper_value(arm_index)) > self.MANUAL_GRIPPER_CLOSED_HOLD_THRESHOLD:
             return
         self._policy_grip_guard_arm_index = arm_index
+        self._policy_grip_guard_pose_active = False
         self.solver.ctrl.commanded_gripper[arm_index] = 0.0
         self._remember_manual_gripper_hold_target(arm_index)
         self._set_manual_gripper_drive_override(arm_index, 0.0)
@@ -243,6 +274,29 @@ class PolicyManualInterventionCollector:
         distance = float(np.linalg.norm(other_pose[:3] - box_pose[:3]))
         return distance <= self.POLICY_GRIP_GUARD_TAKEOVER_DISTANCE
 
+    def _opposite_gripper_box_distance(self, guarded_arm_index: int) -> float:
+        other_arm_index = 1 - int(guarded_arm_index)
+        box_pose = np.asarray(self.solver._box_pose(), dtype=np.float64)
+        other_pose = np.asarray(self.solver.ctrl.current_gripper_pose(other_arm_index), dtype=np.float64)
+        return float(np.linalg.norm(other_pose[:3] - box_pose[:3]))
+
+    def _ensure_policy_pose_guard_if_needed(self, guarded_arm_index: int) -> bool:
+        guarded_arm_index = int(guarded_arm_index)
+        if self._policy_grip_guard_pose_active:
+            return True
+        if self._opposite_gripper_box_distance(guarded_arm_index) > self.POLICY_POSE_GUARD_APPROACH_DISTANCE:
+            return False
+
+        # The left arm must remain free while it transports the box to the
+        # handover pose. Once the opposite gripper is close enough to approach,
+        # latch the current pose and hold it until takeover.
+        self._remember_manual_hold_target(guarded_arm_index)
+        self._remember_manual_gripper_hold_target(guarded_arm_index)
+        self._policy_grip_guard_pose_active = True
+        if self.debug:
+            print(f"[manual] policy pose guard enabled: {self._arm_name(guarded_arm_index)}")
+        return True
+
     def _apply_policy_grip_guard(self, action: np.ndarray) -> np.ndarray:
         guarded_arm_index = self._policy_grip_guard_arm_index
         if guarded_arm_index is None:
@@ -254,11 +308,44 @@ class PolicyManualInterventionCollector:
             return action
 
         guarded_action = np.asarray(action, dtype=np.float32).copy()
-        gripper_index = 6 if int(guarded_arm_index) == 0 else 13
+        guarded_arm_index = int(guarded_arm_index)
+        if guarded_arm_index == 0:
+            gripper_index = 6
+        else:
+            gripper_index = 13
         guarded_action[gripper_index] = 0.0
-        self.solver.ctrl.commanded_gripper[int(guarded_arm_index)] = 0.0
-        self._set_manual_gripper_drive_override(int(guarded_arm_index), 0.0)
+        self.solver.ctrl.commanded_gripper[guarded_arm_index] = 0.0
+        self._set_manual_gripper_drive_override(guarded_arm_index, 0.0)
+
+        if self._ensure_policy_pose_guard_if_needed(guarded_arm_index):
+            guarded_qpos = self._manual_hold_target(guarded_arm_index)
+            guarded_gripper_qpos = self._manual_gripper_hold_target(guarded_arm_index)
+            if guarded_arm_index == 0:
+                guarded_action[0:6] = guarded_qpos.astype(np.float32, copy=False)
+            else:
+                guarded_action[7:13] = guarded_qpos.astype(np.float32, copy=False)
+            self.solver.ctrl.commanded_arm_qpos[guarded_arm_index] = guarded_qpos.copy()
+            self._freeze_arm_qpos(guarded_arm_index, guarded_qpos)
+            self._freeze_gripper_qpos(guarded_arm_index, guarded_gripper_qpos)
+            self._zero_arm_velocity(guarded_arm_index)
         return guarded_action
+
+    def _restore_policy_grip_guard_state(self) -> None:
+        guarded_arm_index = self._policy_grip_guard_arm_index
+        if guarded_arm_index is None:
+            return
+        guarded_arm_index = int(guarded_arm_index)
+        if self._opposite_gripper_has_taken_over(guarded_arm_index):
+            return
+        self.solver.ctrl.commanded_gripper[guarded_arm_index] = 0.0
+        self._set_manual_gripper_drive_override(guarded_arm_index, 0.0)
+        if self._ensure_policy_pose_guard_if_needed(guarded_arm_index):
+            guarded_qpos = self._manual_hold_target(guarded_arm_index)
+            guarded_gripper_qpos = self._manual_gripper_hold_target(guarded_arm_index)
+            self.solver.ctrl.commanded_arm_qpos[guarded_arm_index] = guarded_qpos.copy()
+            self._freeze_arm_qpos(guarded_arm_index, guarded_qpos)
+            self._freeze_gripper_qpos(guarded_arm_index, guarded_gripper_qpos)
+            self._zero_arm_velocity(guarded_arm_index)
 
     @staticmethod
     def _manual_terminal_status(result, default_status: str) -> str | None:
@@ -370,10 +457,13 @@ class PolicyManualInterventionCollector:
 
     def _apply_manual_guarded_box_hold(self, active_arm_index: int) -> None:
         guarded_arm_index = self._policy_grip_guard_arm_index
-        if guarded_arm_index is None or int(guarded_arm_index) == int(active_arm_index):
+        if guarded_arm_index is None:
             self._manual_guarded_box_relative_anchor = None
             return
         guarded_arm_index = int(guarded_arm_index)
+        if int(guarded_arm_index) == int(active_arm_index) and not self._manual_force_guarded_box_hold:
+            self._manual_guarded_box_relative_anchor = None
+            return
         if self._opposite_gripper_has_taken_over(guarded_arm_index):
             self._manual_guarded_box_relative_anchor = None
             return
@@ -689,7 +779,7 @@ class PolicyManualInterventionCollector:
                 preferred_quat=self.solver._preferred_grasp_quat(0),
                 preferred_top_down_quat=TOP_DOWN_PREFERRED_GRASP_QUATS[0],
                 pre_pose_candidates_builder=self.solver._left_first_grasp_pre_pose_candidates_from_box_pose,
-                selection_mode="prefer_side",
+                selection_mode="prefer_low_motion",
                 max_grasp_plan_length=self.solver.LEFT_FIRST_GRASP_MAX_GRASP_PLAN_LENGTH,
             )
             return candidate, {
@@ -1024,6 +1114,9 @@ class PolicyManualInterventionCollector:
         y: float = 0.0,
         z: float = 0.0,
         world_delta: np.ndarray | None = None,
+        force_table_horizontal: bool = False,
+        min_z_progress: float | None = None,
+        return_nonfatal_status: bool = False,
     ) -> str | None:
         current_gripper_pose = np.asarray(self.solver.ctrl.current_gripper_pose(arm_index), dtype=np.float64)
         if world_delta is None:
@@ -1044,7 +1137,7 @@ class PolicyManualInterventionCollector:
             scaled_delta = world_delta * float(scale)
             target_gripper_pose = current_gripper_pose.copy()
             target_gripper_pose[:3] += scaled_delta
-            if int(arm_index) == 1 and self.MANUAL_RIGHT_HORIZONTAL_GRASP:
+            if force_table_horizontal or (int(arm_index) == 1 and self.MANUAL_RIGHT_HORIZONTAL_GRASP):
                 target_gripper_pose = self._table_horizontal_pose(target_gripper_pose)
             target_pose = self.solver.ctrl.gripper_pose_to_planner_pose(arm_index, target_gripper_pose)
 
@@ -1067,6 +1160,7 @@ class PolicyManualInterventionCollector:
 
             target_arm_qpos = self.solver.ctrl._arm_qpos_from_plan(ik_qpos)
             current_arm_qpos = self.solver.ctrl.current_qpos(arm_index)
+            start_arm_qpos = current_arm_qpos.copy()
             shoulder_pan_delta = float(np.abs(target_arm_qpos[0] - current_arm_qpos[0]))
             joint_motion = float(np.linalg.norm(target_arm_qpos - current_arm_qpos))
             shoulder_pan_limit = self._manual_shoulder_pan_limit(arm_index)
@@ -1110,17 +1204,40 @@ class PolicyManualInterventionCollector:
             self.solver.ctrl.last_plan_debug["actual_delta"] = actual_delta.round(4).tolist()
             requested_z = float(scaled_delta[2])
             actual_z = float(actual_delta[2])
-            if self.debug and command in ("r", "f", "u"):
+            vertical_guard_command = command in ("r", "f", "u", "handover_holder_lift")
+            if self.debug and vertical_guard_command:
                 print(
                     "[manual] command "
                     f"`{command}` requested_delta={np.asarray(scaled_delta, dtype=np.float64).round(4).tolist()} "
                     f"actual_delta={actual_delta.round(4).tolist()}"
                 )
+            min_required_z_progress = (
+                float(min_z_progress)
+                if min_z_progress is not None
+                else max(
+                    self.MANUAL_VERTICAL_MIN_PROGRESS,
+                    abs(requested_z) * self.MANUAL_VERTICAL_PROGRESS_RATIO,
+                )
+            )
             if (
-                command in ("r", "f", "u")
+                vertical_guard_command
                 and abs(requested_z) > 1e-6
-                and actual_z * np.sign(requested_z) < -self.MANUAL_VERTICAL_DIRECTION_MISMATCH_EPS
+                and actual_z * np.sign(requested_z)
+                < min_required_z_progress
             ):
+                restore_debug = dict(self.solver.ctrl.last_plan_debug)
+                restore_debug["guard_reason"] = "vertical_direction_mismatch"
+                restore_debug["requested_z"] = round(requested_z, 4)
+                restore_debug["actual_z"] = round(actual_z, 4)
+                restore_debug["min_required_z_progress"] = round(min_required_z_progress, 4)
+                self._manual_move_to_qpos(
+                    arm_index,
+                    start_arm_qpos,
+                    recorder,
+                    steps=self.MANUAL_MOVE_STEPS,
+                    settle_steps=0,
+                )
+                self.solver.ctrl.last_plan_debug = restore_debug
                 self.solver.ctrl.last_plan_debug["guard_reason"] = "vertical_direction_mismatch"
                 self.solver.ctrl.last_plan_debug["requested_z"] = round(requested_z, 4)
                 self.solver.ctrl.last_plan_debug["actual_z"] = round(actual_z, 4)
@@ -1137,9 +1254,16 @@ class PolicyManualInterventionCollector:
                     "world_delta": np.asarray(world_delta, dtype=np.float64).round(4).tolist(),
                 }
                 self.solver.ctrl.last_status = "manual_move_failed"
+        if return_nonfatal_status and self.solver.ctrl.last_status in (
+            "manual_move_failed",
+            "manual_move_rejected",
+        ):
+            return self.solver.ctrl.last_status
         if self._handle_nonfatal_manual_failure(command):
             return None
         if self.solver.ctrl.last_status in ("manual_move_rejected",):
+            if return_nonfatal_status:
+                return self.solver.ctrl.last_status
             failed = self.last_debug_info.setdefault("failed_commands", [])
             failed.append(
                 {
@@ -1159,6 +1283,12 @@ class PolicyManualInterventionCollector:
 
     def _run_manual_command(self, command: str, recorder, *, arm_index: int) -> str | None:
         self._sync_manual_arm_targets()
+        if self._guarded_arm_manual_command_blocked(arm_index, command):
+            print(
+                "[manual] guarded left arm is holding the box before right takeover; "
+                "switch to right arm with `2` for handover control"
+            )
+            return None
         if command in ("w", "s", "a", "d", "r", "f", "u"):
             return self._run_delta_command(
                 recorder,
@@ -1306,6 +1436,122 @@ class PolicyManualInterventionCollector:
             print("[manual] handover clear before resume: right guarded, left opened and lifted")
         return None
 
+    def _raise_left_holder_before_right_manual(self, recorder, active_arm_index: int) -> str | None:
+        if int(active_arm_index) != 1:
+            return None
+        if self._manual_handover_holder_lift_done:
+            return None
+        if self._policy_grip_guard_arm_index != 0:
+            return None
+        if self._opposite_gripper_has_taken_over(0):
+            return None
+
+        lift = float(self.MANUAL_HANDOVER_HOLDER_LIFT)
+        if lift <= 0.0:
+            return None
+        attempts = (
+            ("current_orientation", False, lift),
+            ("current_orientation_small", False, max(lift * 0.67, self.MANUAL_HANDOVER_HOLDER_MIN_LIFT)),
+        )
+        for attempt_name, force_table_horizontal, attempt_lift in attempts:
+            start_box_pose = np.asarray(self.solver._box_pose(), dtype=np.float64)
+            start_left_pose = np.asarray(self.solver.ctrl.current_gripper_pose(0), dtype=np.float64)
+            start_left_qpos = np.asarray(self.solver.ctrl.current_qpos(0), dtype=np.float64).copy()
+            start_left_gripper_qpos = np.asarray(
+                self.solver.ctrl.current_gripper_joint_qpos(0),
+                dtype=np.float64,
+            ).copy()
+            self._manual_force_guarded_box_hold = True
+            try:
+                self._manual_guarded_box_relative_anchor = None
+                terminal_status = self._run_delta_command(
+                    recorder,
+                    arm_index=0,
+                    command="handover_holder_lift",
+                    world_delta=np.asarray([0.0, 0.0, float(attempt_lift)], dtype=np.float64),
+                    force_table_horizontal=force_table_horizontal,
+                    min_z_progress=min(self.MANUAL_HANDOVER_HOLDER_MIN_LIFT, float(attempt_lift) * 0.8),
+                    return_nonfatal_status=True,
+                )
+                # Ensure the box pose is synchronized with the final holder pose,
+                # not just the penultimate physics step.
+                if terminal_status is None and self.solver.ctrl.last_status == "running":
+                    self._apply_manual_guarded_box_hold(active_arm_index=0)
+                    self._sync_manual_state_to_sim()
+            finally:
+                self._manual_force_guarded_box_hold = False
+            if terminal_status in ("manual_move_failed", "manual_move_rejected"):
+                self.solver.ctrl.commanded_arm_qpos[0] = start_left_qpos.copy()
+                self.solver.ctrl.commanded_gripper[0] = 0.0
+                self._freeze_arm_qpos(0, start_left_qpos)
+                self._freeze_gripper_qpos(0, start_left_gripper_qpos)
+                self._zero_arm_velocity(0)
+                self._set_box_pose_and_zero_velocity(start_box_pose)
+                self._manual_guarded_box_relative_anchor = None
+                self._sync_manual_state_to_sim()
+                self._remember_manual_hold_target(0, start_left_qpos)
+                self._remember_manual_gripper_hold_target(0, start_left_gripper_qpos)
+                if self.debug:
+                    print(
+                        "[manual] handover holder lift attempt failed: "
+                        f"{attempt_name} {terminal_status}"
+                    )
+                self.solver.ctrl.last_status = "running"
+                self.solver.ctrl.last_plan_debug = {}
+                continue
+            if terminal_status is not None:
+                return terminal_status
+            if self.solver.ctrl.last_status in ("manual_move_failed", "manual_move_rejected"):
+                if self.debug:
+                    print(
+                        "[manual] handover holder lift attempt failed: "
+                        f"{attempt_name} {self.solver.ctrl.last_status}"
+                    )
+                self.solver.ctrl.last_status = "running"
+                self.solver.ctrl.last_plan_debug = {}
+                continue
+
+            end_box_pose = np.asarray(self.solver._box_pose(), dtype=np.float64)
+            end_left_pose = np.asarray(self.solver.ctrl.current_gripper_pose(0), dtype=np.float64)
+            actual_box_lift = float(end_box_pose[2] - start_box_pose[2])
+            actual_left_lift = float(end_left_pose[2] - start_left_pose[2])
+            if (
+                actual_left_lift < self.MANUAL_HANDOVER_HOLDER_MIN_LIFT
+                or actual_box_lift < self.MANUAL_HANDOVER_HOLDER_MIN_LIFT * 0.5
+            ):
+                if self.debug:
+                    print(
+                        "[manual] handover holder lift insufficient: "
+                        f"mode={attempt_name} requested={float(attempt_lift):.3f}m "
+                        f"actual_box={actual_box_lift:.3f}m actual_left={actual_left_lift:.3f}m"
+                    )
+                self.solver.ctrl.commanded_arm_qpos[0] = start_left_qpos.copy()
+                self.solver.ctrl.commanded_gripper[0] = 0.0
+                self._freeze_arm_qpos(0, start_left_qpos)
+                self._freeze_gripper_qpos(0, start_left_gripper_qpos)
+                self._zero_arm_velocity(0)
+                self._set_box_pose_and_zero_velocity(start_box_pose)
+                self._manual_guarded_box_relative_anchor = None
+                self._sync_manual_state_to_sim()
+                self._remember_manual_hold_target(0, start_left_qpos)
+                self._remember_manual_gripper_hold_target(0, start_left_gripper_qpos)
+                continue
+            self._manual_handover_holder_lift_done = True
+            if self.debug:
+                print(
+                    "[manual] handover holder lifted before right control: "
+                    f"mode={attempt_name} requested={float(attempt_lift):.3f}m "
+                    f"actual_box={actual_box_lift:.3f}m actual_left={actual_left_lift:.3f}m"
+                )
+            return None
+
+        if self.debug:
+            print(
+                "[manual] handover holder lift failed: no upward IK move was accepted; "
+                "continue without extra lift"
+            )
+        return None
+
     def _run_manual_intervention(
         self,
         recorder: _ObsTrackingRecorder,
@@ -1330,6 +1576,10 @@ class PolicyManualInterventionCollector:
             active_arm_index=active_arm_index,
             steps=self.MANUAL_ENTRY_FREEZE_STEPS,
         )
+        lift_status = self._raise_left_holder_before_right_manual(recorder, active_arm_index)
+        if lift_status is not None:
+            self.last_debug_info = {"status": lift_status}
+            return lift_status
         snapshot = self._manual_state_snapshot(active_arm_index)
         self.last_debug_info = {
             "stage": "policy_manual_intervention_triggered",
@@ -1497,6 +1747,8 @@ class PolicyManualInterventionCollector:
         tracking = _ObsTrackingRecorder(recorder)
         self._disable_policy_grip_guard()
         self._clear_manual_gripper_drive_overrides()
+        self._manual_handover_holder_lift_done = False
+        self._manual_force_guarded_box_hold = False
         obs = self.backend.reset(seed=seed)
         tracking.start_episode(dict(obs.data))
         self._maybe_render()
@@ -1521,7 +1773,7 @@ class PolicyManualInterventionCollector:
                         remaining_steps=int(max_episode_steps) - tracking.step_count,
                         trigger_step=tracking.step_count,
                         trigger_label="viewer manual",
-                        initial_arm_index=self._default_manual_arm_index(),
+                        initial_arm_index=self._manual_trigger_arm_index(),
                         initial_open=False,
                     )
                     if tracking.last_obs is not None:
@@ -1534,7 +1786,7 @@ class PolicyManualInterventionCollector:
                         guard_arm_index = int(
                             self.last_debug_info.get(
                                 "post_manual_active_arm_index",
-                                self._default_manual_arm_index(),
+                                self._manual_trigger_arm_index(),
                             )
                         )
                         self._enable_policy_grip_guard_if_closed(guard_arm_index)
@@ -1564,6 +1816,8 @@ class PolicyManualInterventionCollector:
                 result = self.backend.step(
                     ActionSpec.from_value(action, action_type=self.action_type)
                 )
+                self._restore_policy_grip_guard_state()
+                self._sync_manual_state_to_sim()
                 tracking.append_step(action, dict(result.observation.data))
                 self._maybe_render()
                 encoded_obs = self.adapter.encode_obs(dict(result.observation.data))
@@ -1588,7 +1842,7 @@ class PolicyManualInterventionCollector:
                         remaining_steps=int(max_episode_steps) - tracking.step_count,
                         trigger_step=tracking.step_count,
                         trigger_label="viewer manual",
-                        initial_arm_index=self._default_manual_arm_index(),
+                        initial_arm_index=self._manual_trigger_arm_index(),
                         initial_open=False,
                     )
                     if tracking.last_obs is not None:
@@ -1601,7 +1855,7 @@ class PolicyManualInterventionCollector:
                         guard_arm_index = int(
                             self.last_debug_info.get(
                                 "post_manual_active_arm_index",
-                                self._default_manual_arm_index(),
+                                self._manual_trigger_arm_index(),
                             )
                         )
                         self._enable_policy_grip_guard_if_closed(guard_arm_index)

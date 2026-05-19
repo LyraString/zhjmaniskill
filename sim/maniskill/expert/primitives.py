@@ -934,6 +934,27 @@ class FixedRateMotionPrimitives:
                 return False
             return lhs.path_length < rhs.path_length
 
+        def lower_motion_candidate(lhs: GraspCandidate | None, rhs: GraspCandidate | None) -> bool:
+            if lhs is None:
+                return False
+            if rhs is None:
+                return True
+            shoulder_tol = 0.05
+            if lhs.shoulder_pan_delta < rhs.shoulder_pan_delta - shoulder_tol:
+                return True
+            if lhs.shoulder_pan_delta > rhs.shoulder_pan_delta + shoulder_tol:
+                return False
+            motion_tol = 0.1
+            if lhs.joint_motion < rhs.joint_motion - motion_tol:
+                return True
+            if lhs.joint_motion > rhs.joint_motion + motion_tol:
+                return False
+            if lhs.path_length < rhs.path_length:
+                return True
+            if lhs.path_length > rhs.path_length:
+                return False
+            return lhs.score < rhs.score
+
         current_qpos = self.current_full_qpos(arm_index)
         current_arm_qpos = self.current_qpos(arm_index)
         current_ee_pose = self.current_ee_pose(arm_index)
@@ -942,6 +963,7 @@ class FixedRateMotionPrimitives:
         best: GraspCandidate | None = None
         best_top_down: GraspCandidate | None = None
         best_side: GraspCandidate | None = None
+        best_low_motion: GraspCandidate | None = None
         attempts: list[dict[str, Any]] = []
         for contact_id in contact_ids:
             if pre_pose_candidates_builder is None:
@@ -1064,6 +1086,8 @@ class FixedRateMotionPrimitives:
                 )
                 if best_for_contact is None or better_candidate(candidate, best_for_contact, score_attr="score"):
                     best_for_contact = candidate
+                if lower_motion_candidate(candidate, best_low_motion):
+                    best_low_motion = candidate
                 attempts.append(
                     {
                         "contact_id": int(contact_id),
@@ -1096,6 +1120,8 @@ class FixedRateMotionPrimitives:
             return best_top_down if best_top_down is not None else best
         if selection_mode == "prefer_side":
             return best_side if best_side is not None else best
+        if selection_mode == "prefer_low_motion":
+            return best_low_motion if best_low_motion is not None else best
         if best_top_down is not None and best_top_down.top_down_score < 0.15:
             return best_top_down
         if best_side is not None and best_side.side_score < 0.15:
