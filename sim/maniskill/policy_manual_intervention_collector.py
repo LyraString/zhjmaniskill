@@ -61,7 +61,7 @@ class PolicyManualInterventionCollector:
     MANUAL_VERTICAL_MIN_PROGRESS = 0.006
     MANUAL_VERTICAL_PROGRESS_RATIO = 0.25
     MANUAL_HANDOVER_HOLDER_MIN_LIFT = 0.035
-    MANUAL_GUARDED_BOX_HOLD = False
+    MANUAL_GUARDED_BOX_HOLD = True
     MANUAL_MAX_SHOULDER_PAN_DELTA = 0.45
     MANUAL_RIGHT_MAX_SHOULDER_PAN_DELTA = 0.7
     MANUAL_MAX_JOINT_MOTION = 1.2
@@ -106,6 +106,7 @@ class PolicyManualInterventionCollector:
         self._policy_grip_guard_pose_active = False
         self._manual_handover_holder_lift_done = False
         self._manual_force_guarded_box_hold = False
+        self._manual_active_guarded_box_hold = False
         self._manual_trigger_down_latched = False
         self._manual_guarded_box_relative_anchor: np.ndarray | None = None
 
@@ -249,6 +250,8 @@ class PolicyManualInterventionCollector:
         self._policy_grip_guard_arm_index = None
         self._policy_grip_guard_pose_active = False
         self._manual_force_guarded_box_hold = False
+        self._manual_active_guarded_box_hold = False
+        self._manual_guarded_box_relative_anchor = None
 
     def _enable_policy_grip_guard_if_closed(self, arm_index: int) -> None:
         arm_index = int(arm_index)
@@ -528,7 +531,11 @@ class PolicyManualInterventionCollector:
             self._manual_guarded_box_relative_anchor = None
             return
         guarded_arm_index = int(guarded_arm_index)
-        if int(guarded_arm_index) == int(active_arm_index) and not self._manual_force_guarded_box_hold:
+        if (
+            int(guarded_arm_index) == int(active_arm_index)
+            and not self._manual_force_guarded_box_hold
+            and not self._manual_active_guarded_box_hold
+        ):
             self._manual_guarded_box_relative_anchor = None
             return
         if self._opposite_gripper_has_taken_over(guarded_arm_index):
@@ -1284,6 +1291,15 @@ class PolicyManualInterventionCollector:
 
             start_pose = current_gripper_pose.copy()
             self.solver.ctrl.last_plan_debug = plan_debug
+            previous_active_guarded_box_hold = self._manual_active_guarded_box_hold
+            self._manual_active_guarded_box_hold = (
+                previous_active_guarded_box_hold
+                or (
+                    self.MANUAL_GUARDED_BOX_HOLD
+                    and self._policy_grip_guard_arm_index is not None
+                    and int(self._policy_grip_guard_arm_index) == int(arm_index)
+                )
+            )
             self._manual_move_to_qpos(
                 arm_index,
                 target_arm_qpos,
@@ -1335,6 +1351,7 @@ class PolicyManualInterventionCollector:
                 self.solver.ctrl.last_plan_debug["requested_z"] = round(requested_z, 4)
                 self.solver.ctrl.last_plan_debug["actual_z"] = round(actual_z, 4)
                 self.solver.ctrl.last_status = "manual_move_rejected"
+            self._manual_active_guarded_box_hold = previous_active_guarded_box_hold
             break
         else:
             if last_reject_debug is not None:
@@ -1456,6 +1473,8 @@ class PolicyManualInterventionCollector:
             )
             return None
         if command == "o":
+            if self._policy_grip_guard_arm_index is not None and int(self._policy_grip_guard_arm_index) == int(arm_index):
+                self._disable_policy_grip_guard()
             self.solver.ctrl.commanded_gripper[arm_index] = 1.0
             gripper_kwargs = {"left_gripper": 1.0} if arm_index == 0 else {"right_gripper": 1.0}
             self._manual_hold_pose(
