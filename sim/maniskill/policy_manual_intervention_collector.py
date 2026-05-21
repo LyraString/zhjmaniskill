@@ -35,11 +35,11 @@ class PolicyManualInterventionCollector:
     INITIAL_OPEN_STEPS = 4
     MANUAL_TRANSLATION_STEP = 0.025
     MANUAL_RIGHT_TRANSLATION_STEP = 0.04
-    MANUAL_LIFT_STEP = 0.015
+    MANUAL_LIFT_STEP = 0.03
     MANUAL_RIGHT_LIFT_STEP = 0.04
     MANUAL_MOVE_STEPS = 5
     MANUAL_SETTLE_STEPS = 1
-    MANUAL_ENTRY_FREEZE_STEPS = 8
+    MANUAL_ENTRY_FREEZE_STEPS = 0
     MANUAL_GRIPPER_CLOSED_HOLD_THRESHOLD = 0.2
     MANUAL_GRIPPER_CLOSED_DRIVE_VALUE = -0.2
     POLICY_GRIP_GUARD_TAKEOVER_DISTANCE = 0.16
@@ -61,12 +61,14 @@ class PolicyManualInterventionCollector:
     MANUAL_VERTICAL_MIN_PROGRESS = 0.006
     MANUAL_VERTICAL_PROGRESS_RATIO = 0.25
     MANUAL_HANDOVER_HOLDER_MIN_LIFT = 0.035
+    MANUAL_GUARDED_BOX_HOLD = False
     MANUAL_MAX_SHOULDER_PAN_DELTA = 0.45
     MANUAL_RIGHT_MAX_SHOULDER_PAN_DELTA = 0.7
     MANUAL_MAX_JOINT_MOTION = 1.2
     MANUAL_RIGHT_MAX_JOINT_MOTION = 1.8
     MANUAL_JOINT_LIMIT_CLIP_TOL = 1e-3
     MANUAL_TRIGGER_KEY = "m"
+    MANUAL_DIRECT_QPOS_SERVO = True
     MANUAL_RIGHT_HORIZONTAL_GRASP = True
     MANUAL_RIGHT_HORIZONTAL_YAW_VARIANTS = (-0.16, -0.08, 0.0, 0.08, 0.16)
     MANUAL_HANDOVER_HOLDER_LIFT = 0.0
@@ -158,7 +160,10 @@ class PolicyManualInterventionCollector:
             return False
         if self._opposite_gripper_has_taken_over(guarded_arm_index):
             return False
-        return command in ("w", "s", "a", "d", "r", "f", "u", "g", "o", "c")
+        # Keep the left holder locked against lateral/open/auto-align commands
+        # before right takeover, but still allow an explicit upward lift.  The
+        # old blanket block made low handover poses impossible to repair.
+        return command in ("w", "s", "a", "d", "f", "g", "o", "c")
 
     def _manual_state_snapshot(self, arm_index: int = 0) -> dict[str, Any]:
         box_pose = np.asarray(self.solver._box_pose(), dtype=np.float64)
@@ -319,14 +324,12 @@ class PolicyManualInterventionCollector:
 
         if self._ensure_policy_pose_guard_if_needed(guarded_arm_index):
             guarded_qpos = self._manual_hold_target(guarded_arm_index)
-            guarded_gripper_qpos = self._manual_gripper_hold_target(guarded_arm_index)
             if guarded_arm_index == 0:
                 guarded_action[0:6] = guarded_qpos.astype(np.float32, copy=False)
             else:
                 guarded_action[7:13] = guarded_qpos.astype(np.float32, copy=False)
             self.solver.ctrl.commanded_arm_qpos[guarded_arm_index] = guarded_qpos.copy()
             self._freeze_arm_qpos(guarded_arm_index, guarded_qpos)
-            self._freeze_gripper_qpos(guarded_arm_index, guarded_gripper_qpos)
             self._zero_arm_velocity(guarded_arm_index)
         return guarded_action
 
@@ -341,10 +344,8 @@ class PolicyManualInterventionCollector:
         self._set_manual_gripper_drive_override(guarded_arm_index, 0.0)
         if self._ensure_policy_pose_guard_if_needed(guarded_arm_index):
             guarded_qpos = self._manual_hold_target(guarded_arm_index)
-            guarded_gripper_qpos = self._manual_gripper_hold_target(guarded_arm_index)
             self.solver.ctrl.commanded_arm_qpos[guarded_arm_index] = guarded_qpos.copy()
             self._freeze_arm_qpos(guarded_arm_index, guarded_qpos)
-            self._freeze_gripper_qpos(guarded_arm_index, guarded_gripper_qpos)
             self._zero_arm_velocity(guarded_arm_index)
 
     @staticmethod
@@ -423,12 +424,12 @@ class PolicyManualInterventionCollector:
             return
         guarded_arm_index = int(guarded_arm_index)
         guarded_qpos = self._manual_hold_target(guarded_arm_index)
-        guarded_gripper_qpos = self._manual_gripper_hold_target(guarded_arm_index)
         self.solver.ctrl.commanded_arm_qpos[guarded_arm_index] = guarded_qpos.copy()
         self.solver.ctrl.commanded_gripper[guarded_arm_index] = 0.0
         self._set_manual_gripper_drive_override(guarded_arm_index, 0.0)
         self._freeze_arm_qpos(guarded_arm_index, guarded_qpos)
-        self._freeze_gripper_qpos(guarded_arm_index, guarded_gripper_qpos)
+        # Keep the holder arm fixed, but leave its gripper under close-drive
+        # control so it can keep clamping instead of replaying an old opening.
         self._zero_arm_velocity(guarded_arm_index)
 
     def _set_box_pose_and_zero_velocity(self, pose: np.ndarray) -> None:
@@ -446,6 +447,69 @@ class PolicyManualInterventionCollector:
             self.base_env.box.set_linear_velocity(zero_batch)
             self.base_env.box.set_angular_velocity(zero_batch)
 
+    def _manual_scene_state_snapshot(self) -> dict[str, Any]:
+        return {
+            "steps_taken": int(self.solver.ctrl.steps_taken),
+            "arm_qpos": {
+                arm_index: self.solver.ctrl.current_qpos(arm_index).copy()
+                for arm_index in (0, 1)
+            },
+            "gripper_qpos": {
+                arm_index: self.solver.ctrl.current_gripper_joint_qpos(arm_index).copy()
+                for arm_index in (0, 1)
+            },
+            "commanded_arm_qpos": {
+                arm_index: self.solver.ctrl.commanded_arm_qpos[arm_index].copy()
+                for arm_index in (0, 1)
+            },
+            "commanded_gripper": {
+                arm_index: float(self.solver.ctrl.commanded_gripper[arm_index])
+                for arm_index in (0, 1)
+            },
+            "box_pose": np.asarray(self.solver._box_pose(), dtype=np.float64).copy(),
+        }
+
+    def _restore_manual_scene_state(self, snapshot: dict[str, Any]) -> None:
+        self.solver.ctrl.steps_taken = int(snapshot["steps_taken"])
+        for arm_index in (0, 1):
+            self.solver.ctrl.commanded_arm_qpos[arm_index] = np.asarray(
+                snapshot["commanded_arm_qpos"][arm_index],
+                dtype=np.float64,
+            ).copy()
+            self.solver.ctrl.commanded_gripper[arm_index] = float(
+                snapshot["commanded_gripper"][arm_index]
+            )
+            self._freeze_arm_qpos(arm_index, snapshot["arm_qpos"][arm_index])
+            self._freeze_gripper_qpos(arm_index, snapshot["gripper_qpos"][arm_index])
+            self._zero_arm_velocity(arm_index)
+        self._set_box_pose_and_zero_velocity(snapshot["box_pose"])
+        self._sync_manual_state_to_sim()
+
+    @staticmethod
+    def _manual_recorder_state_snapshot(recorder) -> dict[str, Any]:
+        raw_recorder = getattr(recorder, "_recorder", None)
+        raw_lengths: dict[str, int] = {}
+        for attr_name in ("_point_cloud", "_agent_pos", "_actions"):
+            value = getattr(raw_recorder, attr_name, None)
+            if isinstance(value, list):
+                raw_lengths[attr_name] = len(value)
+        last_obs = getattr(recorder, "last_obs", None)
+        return {
+            "step_count": int(getattr(recorder, "step_count", 0)),
+            "last_obs": None if last_obs is None else dict(last_obs),
+            "raw_lengths": raw_lengths,
+        }
+
+    @staticmethod
+    def _restore_manual_recorder_state(recorder, snapshot: dict[str, Any]) -> None:
+        recorder.step_count = int(snapshot["step_count"])
+        recorder.last_obs = None if snapshot["last_obs"] is None else dict(snapshot["last_obs"])
+        raw_recorder = getattr(recorder, "_recorder", None)
+        for attr_name, length in snapshot["raw_lengths"].items():
+            value = getattr(raw_recorder, attr_name, None)
+            if isinstance(value, list):
+                del value[int(length) :]
+
     def _sync_manual_state_to_sim(self) -> None:
         scene = getattr(self.base_env, "scene", None)
         if scene is None or not bool(getattr(scene, "gpu_sim_enabled", False)):
@@ -456,6 +520,9 @@ class PolicyManualInterventionCollector:
         scene._gpu_fetch_all()
 
     def _apply_manual_guarded_box_hold(self, active_arm_index: int) -> None:
+        if not self.MANUAL_GUARDED_BOX_HOLD:
+            self._manual_guarded_box_relative_anchor = None
+            return
         guarded_arm_index = self._policy_grip_guard_arm_index
         if guarded_arm_index is None:
             self._manual_guarded_box_relative_anchor = None
@@ -565,6 +632,10 @@ class PolicyManualInterventionCollector:
             self._freeze_arm_qpos(1 - int(arm_index), inactive_qpos)
             self._zero_arm_velocity(1 - int(arm_index))
             self._lock_guarded_arm_for_manual_step(arm_index)
+            if self.MANUAL_DIRECT_QPOS_SERVO:
+                self._freeze_arm_qpos(arm_index, qpos)
+                self._zero_arm_velocity(arm_index)
+                self._sync_manual_state_to_sim()
             action = self._manual_action(arm_index, active_qpos=qpos, inactive_qpos=inactive_qpos)
             result, success = self._manual_step_and_record(action, recorder, active_arm_index=arm_index)
             self._lock_guarded_arm_for_manual_step(arm_index)
@@ -579,6 +650,10 @@ class PolicyManualInterventionCollector:
             self._freeze_arm_qpos(1 - int(arm_index), inactive_qpos)
             self._zero_arm_velocity(1 - int(arm_index))
             self._lock_guarded_arm_for_manual_step(arm_index)
+            if self.MANUAL_DIRECT_QPOS_SERVO:
+                self._freeze_arm_qpos(arm_index, target_qpos)
+                self._zero_arm_velocity(arm_index)
+                self._sync_manual_state_to_sim()
             action = self._manual_action(arm_index, active_qpos=target_qpos, inactive_qpos=inactive_qpos)
             result, success = self._manual_step_and_record(action, recorder, active_arm_index=arm_index)
             self._lock_guarded_arm_for_manual_step(arm_index)
@@ -864,6 +939,8 @@ class PolicyManualInterventionCollector:
         inactive_qpos = self._manual_hold_target(1 - int(arm_index))
         current_arm_qpos = self.solver.ctrl.current_qpos(arm_index)
         initial_box_pose = np.asarray(self.solver._box_pose(), dtype=np.float64)
+        rollback_state = self._manual_scene_state_snapshot()
+        rollback_recorder_state = self._manual_recorder_state_snapshot(recorder)
         executed_steps = 0
         skipped_steps = 0
         max_steps = self._manual_auto_align_plan_steps(arm_index)
@@ -933,8 +1010,19 @@ class PolicyManualInterventionCollector:
                 box_displacement > box_move_reject
                 or box_z_drop > box_z_drop_reject
             ):
-                self.solver.ctrl.last_plan_debug["guard_reason"] = "auto_align_box_collision"
+                active_pose_after = np.asarray(self.solver.ctrl.current_gripper_pose(arm_index), dtype=np.float64)
+                active_box_distance_after = float(np.linalg.norm(active_pose_after[:3] - box_pose_after[:3]))
+                self.solver.ctrl.last_plan_debug["active_box_distance_after"] = round(active_box_distance_after, 4)
+                if (
+                    int(arm_index) == 1
+                    and active_box_distance_after > self.POLICY_GRIP_GUARD_TAKEOVER_DISTANCE
+                ):
+                    self.solver.ctrl.last_plan_debug["guard_reason"] = "held_box_slip_before_right_contact"
+                else:
+                    self.solver.ctrl.last_plan_debug["guard_reason"] = "auto_align_box_collision"
                 self.solver.ctrl.last_status = "manual_move_rejected"
+                self._restore_manual_scene_state(rollback_state)
+                self._restore_manual_recorder_state(recorder, rollback_recorder_state)
                 return None
 
             current_arm_qpos = target_arm_qpos
@@ -965,7 +1053,7 @@ class PolicyManualInterventionCollector:
     def _print_manual_help(self) -> None:
         print(
             "[manual] commands: "
-            "viewer: up/down or w/s=table +Y/-Y  left/right or a/d=table -X/+X  u/j or r/f=up/down  "
+            "viewer: up/down=table +Y/-Y  left/right=table -X/+X  u/j or r/f=up/down  "
             "g=auto-align  1=left  2=right  o=open  c=close  p=status  h=help  n=resume  q=abort | "
             "terminal fallback: w/s=table +Y/-Y  a/d=table -X/+X  r/f=up/down  "
             "g=auto-align  1/2=left/right  o=open  c=close  u=lift  p=status  h/help/?  n/resume  q/abort  "
@@ -995,13 +1083,15 @@ class PolicyManualInterventionCollector:
             return "status"
         if window.key_press("g"):
             return "g"
-        if window.key_press("up") or window.key_press("w"):
+        # In the SAPIEN viewer, WASD controls camera/navigation.  Keep robot
+        # manual motion on arrow keys to avoid moving the view and robot at once.
+        if window.key_press("up"):
             return "w"
-        if window.key_press("down") or window.key_press("s"):
+        if window.key_press("down"):
             return "s"
-        if window.key_press("left") or window.key_press("a"):
+        if window.key_press("left"):
             return "a"
-        if window.key_press("right") or window.key_press("d"):
+        if window.key_press("right"):
             return "d"
         if window.key_press("u") or window.key_press("r"):
             return "r"
@@ -1137,7 +1227,10 @@ class PolicyManualInterventionCollector:
             scaled_delta = world_delta * float(scale)
             target_gripper_pose = current_gripper_pose.copy()
             target_gripper_pose[:3] += scaled_delta
-            if force_table_horizontal or (int(arm_index) == 1 and self.MANUAL_RIGHT_HORIZONTAL_GRASP):
+            # Delta commands should be pure translations from the current pose.
+            # Recomputing the right-arm horizontal orientation here can turn an
+            # arrow-key move into a visible yaw/rotation during handover repair.
+            if force_table_horizontal:
                 target_gripper_pose = self._table_horizontal_pose(target_gripper_pose)
             target_pose = self.solver.ctrl.gripper_pose_to_planner_pose(arm_index, target_gripper_pose)
 
@@ -1205,7 +1298,7 @@ class PolicyManualInterventionCollector:
             requested_z = float(scaled_delta[2])
             actual_z = float(actual_delta[2])
             vertical_guard_command = command in ("r", "f", "u", "handover_holder_lift")
-            if self.debug and vertical_guard_command:
+            if self.debug and command in ("w", "s", "a", "d", "r", "f", "u", "handover_holder_lift"):
                 print(
                     "[manual] command "
                     f"`{command}` requested_delta={np.asarray(scaled_delta, dtype=np.float64).round(4).tolist()} "
@@ -1339,7 +1432,15 @@ class PolicyManualInterventionCollector:
                     }
                 )
                 reason = self.solver.ctrl.last_plan_debug.get("guard_reason", "manual_move_rejected")
-                print(f"[manual] command `g` rejected: {reason}")
+                if reason in ("auto_align_box_collision", "held_box_slip_before_right_contact"):
+                    print(
+                        f"[manual] command `g` rejected: {reason} "
+                        f"box_move={self.solver.ctrl.last_plan_debug.get('box_displacement', '?')} "
+                        f"z_drop={self.solver.ctrl.last_plan_debug.get('box_z_drop', '?')} "
+                        f"active_dist={self.solver.ctrl.last_plan_debug.get('active_box_distance_after', '?')}"
+                    )
+                else:
+                    print(f"[manual] command `g` rejected: {reason}")
                 self.solver.ctrl.last_status = "running"
                 self.solver.ctrl.last_plan_debug = {}
                 return None

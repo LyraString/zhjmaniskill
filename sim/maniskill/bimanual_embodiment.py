@@ -123,6 +123,13 @@ class BimanualEmbodimentSpec:
         loader = scene.create_urdf_loader()
         loader.name = name
         loader.fix_root_link = True
+        material = self._config(arm_index).get("material")
+        if isinstance(material, dict):
+            loader.set_material(
+                float(material.get("static_friction", 0.3)),
+                float(material.get("dynamic_friction", 0.3)),
+                float(material.get("restitution", 0.0)),
+            )
 
         urdf_path = self.urdf_path(arm_index)
         if not scene.can_render():

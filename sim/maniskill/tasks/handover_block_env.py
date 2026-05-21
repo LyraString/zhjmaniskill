@@ -17,7 +17,9 @@ BOX_SETTLE_LINEAR_EPS = 0.05
 BOX_SETTLE_ANGULAR_EPS = 0.50
 RIGHT_GRIPPER_RELEASE_THRESHOLD = 0.95
 RIGHT_EE_CLEAR_DISTANCE = 0.14
-BLOCK_MIDDLE_POSE = [0.0, 0.1, 0.9, 0.0, 1.0, 0.0, 0.0]
+BLOCK_MIDDLE_POSE = [0.0, 0.1, 0.95, 0.0, 1.0, 0.0, 0.0]
+BOX_STATIC_FRICTION = 2.0
+BOX_DYNAMIC_FRICTION = 2.0
 BOX_CENTER_Z = 0.842
 TARGET_CENTER_Z = 0.741
 BOX_BASE_QUAT = [0.981, 0.0, 0.0, 0.195]
@@ -59,8 +61,16 @@ class HandoverBlockEnv(DualUR5WSGEnv):
     def _load_scene(self, options: dict):
         super()._load_scene(options)
 
+        box_physical_material = sapien.physx.PhysxMaterial(
+            static_friction=BOX_STATIC_FRICTION,
+            dynamic_friction=BOX_DYNAMIC_FRICTION,
+            restitution=0.0,
+        )
         box_builder = self.scene.create_actor_builder()
-        box_builder.add_box_collision(half_size=BOX_HALF_SIZE.tolist())
+        box_builder.add_box_collision(
+            half_size=BOX_HALF_SIZE.tolist(),
+            material=box_physical_material,
+        )
         if self.scene.can_render():
             box_builder.add_box_visual(
                 half_size=BOX_HALF_SIZE.tolist(),
