@@ -376,6 +376,14 @@ class BaseBimanualEnv(BaseEnv):
                 drive_gripper_val,
                 torch.full_like(drive_gripper_val, float(override)),
             )
+        closed_drive_value, closed_drive_threshold = self.embodiment_spec.gripper_closed_drive_params(arm_index)
+        if closed_drive_value is not None:
+            closed_drive_tensor = torch.full_like(drive_gripper_val, float(closed_drive_value))
+            drive_gripper_val = torch.where(
+                gripper_val <= float(closed_drive_threshold),
+                torch.minimum(drive_gripper_val, closed_drive_tensor),
+                drive_gripper_val,
+            )
         gripper_scale = self.embodiment_spec.gripper_scale(arm_index)
         real_gripper_val = gripper_scale[0] + drive_gripper_val * (gripper_scale[1] - gripper_scale[0])
 
@@ -466,9 +474,7 @@ class BaseBimanualEnv(BaseEnv):
 
         self._before_control_step()
         for _ in range(self._sim_steps_per_control):
-            self._before_simulation_step()
             self.scene.step()
-            self._after_simulation_step()
         self._after_control_step()
         if self.gpu_sim_enabled:
             self.scene._gpu_fetch_all()

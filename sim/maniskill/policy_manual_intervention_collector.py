@@ -41,7 +41,7 @@ class PolicyManualInterventionCollector:
     MANUAL_SETTLE_STEPS = 1
     MANUAL_ENTRY_FREEZE_STEPS = 0
     MANUAL_GRIPPER_CLOSED_HOLD_THRESHOLD = 0.2
-    MANUAL_GRIPPER_CLOSED_DRIVE_VALUE = -0.2
+    MANUAL_GRIPPER_CLOSED_DRIVE_VALUE = 0.0
     POLICY_GRIP_GUARD_TAKEOVER_DISTANCE = 0.16
     POLICY_POSE_GUARD_APPROACH_DISTANCE = 0.28
     MANUAL_AUTO_ALIGN_STEP = 0.035
@@ -61,14 +61,14 @@ class PolicyManualInterventionCollector:
     MANUAL_VERTICAL_MIN_PROGRESS = 0.006
     MANUAL_VERTICAL_PROGRESS_RATIO = 0.25
     MANUAL_HANDOVER_HOLDER_MIN_LIFT = 0.035
-    MANUAL_GUARDED_BOX_HOLD = True
+    MANUAL_GUARDED_BOX_HOLD = False
     MANUAL_MAX_SHOULDER_PAN_DELTA = 0.45
     MANUAL_RIGHT_MAX_SHOULDER_PAN_DELTA = 0.7
     MANUAL_MAX_JOINT_MOTION = 1.2
     MANUAL_RIGHT_MAX_JOINT_MOTION = 1.8
     MANUAL_JOINT_LIMIT_CLIP_TOL = 1e-3
     MANUAL_TRIGGER_KEY = "m"
-    MANUAL_DIRECT_QPOS_SERVO = True
+    MANUAL_DIRECT_QPOS_SERVO = False
     MANUAL_RIGHT_HORIZONTAL_GRASP = True
     MANUAL_RIGHT_HORIZONTAL_YAW_VARIANTS = (-0.16, -0.08, 0.0, 0.08, 0.16)
     MANUAL_HANDOVER_HOLDER_LIFT = 0.0
@@ -309,7 +309,7 @@ class PolicyManualInterventionCollector:
         guarded_arm_index = self._policy_grip_guard_arm_index
         if guarded_arm_index is None:
             return action
-        if self._opposite_gripper_has_taken_over(guarded_arm_index):
+        if int(guarded_arm_index) == 0 and self._opposite_gripper_has_taken_over(guarded_arm_index):
             if self.debug:
                 print(f"[manual] policy grip guard released: {self._arm_name(guarded_arm_index)}")
             self._disable_policy_grip_guard()
@@ -332,8 +332,6 @@ class PolicyManualInterventionCollector:
             else:
                 guarded_action[7:13] = guarded_qpos.astype(np.float32, copy=False)
             self.solver.ctrl.commanded_arm_qpos[guarded_arm_index] = guarded_qpos.copy()
-            self._freeze_arm_qpos(guarded_arm_index, guarded_qpos)
-            self._zero_arm_velocity(guarded_arm_index)
         return guarded_action
 
     def _restore_policy_grip_guard_state(self) -> None:
@@ -341,15 +339,13 @@ class PolicyManualInterventionCollector:
         if guarded_arm_index is None:
             return
         guarded_arm_index = int(guarded_arm_index)
-        if self._opposite_gripper_has_taken_over(guarded_arm_index):
+        if guarded_arm_index == 0 and self._opposite_gripper_has_taken_over(guarded_arm_index):
             return
         self.solver.ctrl.commanded_gripper[guarded_arm_index] = 0.0
         self._set_manual_gripper_drive_override(guarded_arm_index, 0.0)
         if self._ensure_policy_pose_guard_if_needed(guarded_arm_index):
             guarded_qpos = self._manual_hold_target(guarded_arm_index)
             self.solver.ctrl.commanded_arm_qpos[guarded_arm_index] = guarded_qpos.copy()
-            self._freeze_arm_qpos(guarded_arm_index, guarded_qpos)
-            self._zero_arm_velocity(guarded_arm_index)
 
     @staticmethod
     def _manual_terminal_status(result, default_status: str) -> str | None:
@@ -423,17 +419,17 @@ class PolicyManualInterventionCollector:
 
     def _lock_guarded_arm_for_manual_step(self, active_arm_index: int) -> None:
         guarded_arm_index = self._policy_grip_guard_arm_index
-        if guarded_arm_index is None or int(guarded_arm_index) == int(active_arm_index):
+        if guarded_arm_index is None:
+            return
+        if int(guarded_arm_index) == int(active_arm_index):
             return
         guarded_arm_index = int(guarded_arm_index)
         guarded_qpos = self._manual_hold_target(guarded_arm_index)
         self.solver.ctrl.commanded_arm_qpos[guarded_arm_index] = guarded_qpos.copy()
         self.solver.ctrl.commanded_gripper[guarded_arm_index] = 0.0
         self._set_manual_gripper_drive_override(guarded_arm_index, 0.0)
-        self._freeze_arm_qpos(guarded_arm_index, guarded_qpos)
         # Keep the holder arm fixed, but leave its gripper under close-drive
         # control so it can keep clamping instead of replaying an old opening.
-        self._zero_arm_velocity(guarded_arm_index)
 
     def _set_box_pose_and_zero_velocity(self, pose: np.ndarray) -> None:
         pose = np.asarray(pose, dtype=np.float64).reshape(7)
@@ -538,9 +534,14 @@ class PolicyManualInterventionCollector:
         ):
             self._manual_guarded_box_relative_anchor = None
             return
-        if self._opposite_gripper_has_taken_over(guarded_arm_index):
+        if guarded_arm_index == 0 and self._opposite_gripper_has_taken_over(guarded_arm_index):
             self._manual_guarded_box_relative_anchor = None
             return
+        # `_lock_guarded_arm_for_manual_step` may have just set the holder qpos.
+        # Fetch/apply before reading link poses, otherwise the box anchor can be
+        # computed from a stale post-physics pose and drift downward one step at
+        # a time while the other arm is being controlled.
+        self._sync_manual_state_to_sim()
         guarded_pose = np.asarray(self.solver.ctrl.current_gripper_pose(guarded_arm_index), dtype=np.float64)
         guarded_matrix = pose_to_matrix(guarded_pose)
         if self._manual_guarded_box_relative_anchor is None:
@@ -572,13 +573,15 @@ class PolicyManualInterventionCollector:
 
         self._lock_guarded_arm_for_manual_step(active_arm_index)
         self._apply_manual_guarded_box_hold(active_arm_index)
-        self._sync_manual_state_to_sim()
+        if self.MANUAL_GUARDED_BOX_HOLD:
+            self._sync_manual_state_to_sim()
 
         result = self.backend.step(ActionSpec.from_value(action))
 
         self._lock_guarded_arm_for_manual_step(active_arm_index)
         self._apply_manual_guarded_box_hold(active_arm_index)
-        self._sync_manual_state_to_sim()
+        if self.MANUAL_GUARDED_BOX_HOLD:
+            self._sync_manual_state_to_sim()
 
         recorder.append_step(action, dict(result.observation.data))
         self.solver.ctrl.steps_taken += 1
@@ -636,8 +639,6 @@ class PolicyManualInterventionCollector:
         target_qpos = np.asarray(target_qpos, dtype=np.float64).reshape(start_qpos.shape)
         trajectory = np.linspace(start_qpos, target_qpos, num=int(steps)).astype(np.float64, copy=False)
         for qpos in trajectory:
-            self._freeze_arm_qpos(1 - int(arm_index), inactive_qpos)
-            self._zero_arm_velocity(1 - int(arm_index))
             self._lock_guarded_arm_for_manual_step(arm_index)
             if self.MANUAL_DIRECT_QPOS_SERVO:
                 self._freeze_arm_qpos(arm_index, qpos)
@@ -654,8 +655,6 @@ class PolicyManualInterventionCollector:
                 self.solver.ctrl.last_status = terminal_status
                 return False
         for _ in range(int(settle_steps)):
-            self._freeze_arm_qpos(1 - int(arm_index), inactive_qpos)
-            self._zero_arm_velocity(1 - int(arm_index))
             self._lock_guarded_arm_for_manual_step(arm_index)
             if self.MANUAL_DIRECT_QPOS_SERVO:
                 self._freeze_arm_qpos(arm_index, target_qpos)
@@ -694,10 +693,6 @@ class PolicyManualInterventionCollector:
         active_qpos = self.solver.ctrl.current_qpos(active_arm_index)
         inactive_qpos = self._manual_hold_target(1 - int(active_arm_index))
         for _ in range(int(steps)):
-            self._freeze_arm_qpos(active_arm_index, active_qpos)
-            self._freeze_arm_qpos(1 - int(active_arm_index), inactive_qpos)
-            self._zero_arm_velocity(active_arm_index)
-            self._zero_arm_velocity(1 - int(active_arm_index))
             self._lock_guarded_arm_for_manual_step(active_arm_index)
             action = self._manual_action(
                 active_arm_index,
@@ -920,142 +915,152 @@ class PolicyManualInterventionCollector:
 
     def _servo_manual_candidate(self, arm_index: int, recorder, candidate) -> str | None:
         self._sync_manual_arm_targets()
-
-        current_pose = np.asarray(self.solver.ctrl.current_gripper_pose(arm_index), dtype=np.float64)
-        pre_pose = np.asarray(candidate.pre_pose, dtype=np.float64)
-        grasp_pose = np.asarray(candidate.grasp_pose, dtype=np.float64)
-        pre_distance = float(np.linalg.norm(pre_pose[:3] - current_pose[:3]))
-        target_phase = "grasp" if pre_distance <= self.MANUAL_AUTO_ALIGN_GRASP_SWITCH_DISTANCE else "pre"
-        target_pose = grasp_pose if target_phase == "grasp" else pre_pose
-        plan = candidate.grasp_plan if target_phase == "grasp" else candidate.pre_plan
-        plan_positions = np.asarray(plan.get("position", []), dtype=np.float64)
-        if plan_positions.ndim != 2 or len(plan_positions) == 0:
-            self.solver.ctrl.last_plan_debug = {
-                "arm_index": int(arm_index),
-                "target_phase": target_phase,
-                "current_gripper_pose": current_pose.round(4).tolist(),
-                "target_gripper_pose": target_pose.round(4).tolist(),
-                "guard_reason": "empty_plan",
-            }
-            self.solver.ctrl.last_status = "manual_auto_align_failed"
-            return None
-
-        shoulder_pan_limit = self._manual_shoulder_pan_limit(arm_index)
-        joint_motion_limit = self._manual_joint_motion_limit(arm_index)
-
-        inactive_qpos = self._manual_hold_target(1 - int(arm_index))
-        current_arm_qpos = self.solver.ctrl.current_qpos(arm_index)
-        initial_box_pose = np.asarray(self.solver._box_pose(), dtype=np.float64)
-        rollback_state = self._manual_scene_state_snapshot()
-        rollback_recorder_state = self._manual_recorder_state_snapshot(recorder)
-        executed_steps = 0
-        skipped_steps = 0
-        max_steps = self._manual_auto_align_plan_steps(arm_index)
-        box_move_reject = self._manual_auto_align_box_move_reject(arm_index)
-        box_z_drop_reject = self._manual_auto_align_box_z_drop_reject(arm_index)
-
-        for waypoint in plan_positions:
-            target_arm_qpos = self.solver.ctrl._arm_qpos_from_plan(waypoint)
-            joint_delta = target_arm_qpos - current_arm_qpos
-            shoulder_pan_delta = float(np.abs(joint_delta[0]))
-            joint_motion = float(np.linalg.norm(joint_delta))
-            if joint_motion < 1e-4:
-                skipped_steps += 1
-                continue
-
-            self.solver.ctrl.last_plan_debug = {
-                "arm_index": int(arm_index),
-                "target_phase": target_phase,
-                "path_source": "planner_waypoints",
-                "current_gripper_pose": current_pose.round(4).tolist(),
-                "target_gripper_pose": target_pose.round(4).tolist(),
-                "target_arm_qpos": np.asarray(target_arm_qpos, dtype=np.float64).round(4).tolist(),
-                "shoulder_pan_delta": round(shoulder_pan_delta, 4),
-                "joint_motion": round(joint_motion, 4),
-                "shoulder_pan_limit": round(float(shoulder_pan_limit), 4),
-                "joint_motion_limit": round(float(joint_motion_limit), 4),
-                "plan_len": int(len(plan_positions)),
-                "executed_steps": int(executed_steps),
-                "skipped_steps": int(skipped_steps),
-            }
-            if shoulder_pan_delta > shoulder_pan_limit or joint_motion > joint_motion_limit:
-                self.solver.ctrl.last_plan_debug["guard_reason"] = "large_rotation"
-                self.solver.ctrl.last_status = "manual_move_rejected"
-                return None
-            if self._manual_joint_limit_reject(arm_index, target_arm_qpos, self.solver.ctrl.last_plan_debug):
-                self.solver.ctrl.last_status = "manual_move_rejected"
-                return None
-
-            self._freeze_arm_qpos(1 - int(arm_index), inactive_qpos)
-            self._zero_arm_velocity(1 - int(arm_index))
-            self._lock_guarded_arm_for_manual_step(arm_index)
-            action = self._manual_action(
-                arm_index,
-                active_qpos=target_arm_qpos,
-                inactive_qpos=inactive_qpos,
+        previous_active_guarded_box_hold = self._manual_active_guarded_box_hold
+        self._manual_active_guarded_box_hold = (
+            previous_active_guarded_box_hold
+            or (
+                self.MANUAL_GUARDED_BOX_HOLD
+                and self._policy_grip_guard_arm_index is not None
+                and int(self._policy_grip_guard_arm_index) == int(arm_index)
             )
-            result, success = self._manual_step_and_record(action, recorder, active_arm_index=arm_index)
-            self._lock_guarded_arm_for_manual_step(arm_index)
-            if success or self.solver.ctrl.current_success():
-                self.solver.ctrl.last_status = "success"
-                return self.solver.ctrl.last_status
-            terminal_status = self._manual_terminal_status(result, "terminated_during_qpos_move")
-            if terminal_status is not None:
-                self.solver.ctrl.last_status = terminal_status
-                return self.solver.ctrl.last_status
+        )
 
-            box_pose_after = np.asarray(self.solver._box_pose(), dtype=np.float64)
-            box_displacement = float(np.linalg.norm(box_pose_after[:3] - initial_box_pose[:3]))
-            box_z_drop = float(initial_box_pose[2] - box_pose_after[2])
-            self.solver.ctrl.last_plan_debug["box_pose_before"] = initial_box_pose.round(4).tolist()
-            self.solver.ctrl.last_plan_debug["box_pose_after"] = box_pose_after.round(4).tolist()
-            self.solver.ctrl.last_plan_debug["box_displacement"] = round(box_displacement, 4)
-            self.solver.ctrl.last_plan_debug["box_z_drop"] = round(box_z_drop, 4)
-            self.solver.ctrl.last_plan_debug["box_move_reject"] = round(float(box_move_reject), 4)
-            self.solver.ctrl.last_plan_debug["box_z_drop_reject"] = round(float(box_z_drop_reject), 4)
-            if (
-                box_displacement > box_move_reject
-                or box_z_drop > box_z_drop_reject
-            ):
-                active_pose_after = np.asarray(self.solver.ctrl.current_gripper_pose(arm_index), dtype=np.float64)
-                active_box_distance_after = float(np.linalg.norm(active_pose_after[:3] - box_pose_after[:3]))
-                self.solver.ctrl.last_plan_debug["active_box_distance_after"] = round(active_box_distance_after, 4)
-                if (
-                    int(arm_index) == 1
-                    and active_box_distance_after > self.POLICY_GRIP_GUARD_TAKEOVER_DISTANCE
-                ):
-                    self.solver.ctrl.last_plan_debug["guard_reason"] = "held_box_slip_before_right_contact"
-                else:
-                    self.solver.ctrl.last_plan_debug["guard_reason"] = "auto_align_box_collision"
-                self.solver.ctrl.last_status = "manual_move_rejected"
-                self._restore_manual_scene_state(rollback_state)
-                self._restore_manual_recorder_state(recorder, rollback_recorder_state)
+        try:
+            current_pose = np.asarray(self.solver.ctrl.current_gripper_pose(arm_index), dtype=np.float64)
+            pre_pose = np.asarray(candidate.pre_pose, dtype=np.float64)
+            grasp_pose = np.asarray(candidate.grasp_pose, dtype=np.float64)
+            pre_distance = float(np.linalg.norm(pre_pose[:3] - current_pose[:3]))
+            target_phase = "grasp" if pre_distance <= self.MANUAL_AUTO_ALIGN_GRASP_SWITCH_DISTANCE else "pre"
+            target_pose = grasp_pose if target_phase == "grasp" else pre_pose
+            plan = candidate.grasp_plan if target_phase == "grasp" else candidate.pre_plan
+            plan_positions = np.asarray(plan.get("position", []), dtype=np.float64)
+            if plan_positions.ndim != 2 or len(plan_positions) == 0:
+                self.solver.ctrl.last_plan_debug = {
+                    "arm_index": int(arm_index),
+                    "target_phase": target_phase,
+                    "current_gripper_pose": current_pose.round(4).tolist(),
+                    "target_gripper_pose": target_pose.round(4).tolist(),
+                    "guard_reason": "empty_plan",
+                }
+                self.solver.ctrl.last_status = "manual_auto_align_failed"
                 return None
 
-            current_arm_qpos = target_arm_qpos
-            executed_steps += 1
-            if executed_steps >= max_steps:
-                break
+            shoulder_pan_limit = self._manual_shoulder_pan_limit(arm_index)
+            joint_motion_limit = self._manual_joint_motion_limit(arm_index)
 
-        if executed_steps == 0:
-            self.solver.ctrl.last_plan_debug = {
-                "arm_index": int(arm_index),
-                "target_phase": target_phase,
-                "path_source": "planner_waypoints",
-                "current_gripper_pose": current_pose.round(4).tolist(),
-                "target_gripper_pose": target_pose.round(4).tolist(),
-                "plan_len": int(len(plan_positions)),
-                "skipped_steps": int(skipped_steps),
-                "guard_reason": "no_progress",
-            }
-            self.solver.ctrl.last_status = "manual_auto_align_failed"
+            inactive_qpos = self._manual_hold_target(1 - int(arm_index))
+            current_arm_qpos = self.solver.ctrl.current_qpos(arm_index)
+            initial_box_pose = np.asarray(self.solver._box_pose(), dtype=np.float64)
+            rollback_state = self._manual_scene_state_snapshot()
+            rollback_recorder_state = self._manual_recorder_state_snapshot(recorder)
+            executed_steps = 0
+            skipped_steps = 0
+            max_steps = self._manual_auto_align_plan_steps(arm_index)
+            box_move_reject = self._manual_auto_align_box_move_reject(arm_index)
+            box_z_drop_reject = self._manual_auto_align_box_z_drop_reject(arm_index)
+
+            for waypoint in plan_positions:
+                target_arm_qpos = self.solver.ctrl._arm_qpos_from_plan(waypoint)
+                joint_delta = target_arm_qpos - current_arm_qpos
+                shoulder_pan_delta = float(np.abs(joint_delta[0]))
+                joint_motion = float(np.linalg.norm(joint_delta))
+                if joint_motion < 1e-4:
+                    skipped_steps += 1
+                    continue
+
+                self.solver.ctrl.last_plan_debug = {
+                    "arm_index": int(arm_index),
+                    "target_phase": target_phase,
+                    "path_source": "planner_waypoints",
+                    "current_gripper_pose": current_pose.round(4).tolist(),
+                    "target_gripper_pose": target_pose.round(4).tolist(),
+                    "target_arm_qpos": np.asarray(target_arm_qpos, dtype=np.float64).round(4).tolist(),
+                    "shoulder_pan_delta": round(shoulder_pan_delta, 4),
+                    "joint_motion": round(joint_motion, 4),
+                    "shoulder_pan_limit": round(float(shoulder_pan_limit), 4),
+                    "joint_motion_limit": round(float(joint_motion_limit), 4),
+                    "plan_len": int(len(plan_positions)),
+                    "executed_steps": int(executed_steps),
+                    "skipped_steps": int(skipped_steps),
+                }
+                if shoulder_pan_delta > shoulder_pan_limit or joint_motion > joint_motion_limit:
+                    self.solver.ctrl.last_plan_debug["guard_reason"] = "large_rotation"
+                    self.solver.ctrl.last_status = "manual_move_rejected"
+                    return None
+                if self._manual_joint_limit_reject(arm_index, target_arm_qpos, self.solver.ctrl.last_plan_debug):
+                    self.solver.ctrl.last_status = "manual_move_rejected"
+                    return None
+
+                self._lock_guarded_arm_for_manual_step(arm_index)
+                action = self._manual_action(
+                    arm_index,
+                    active_qpos=target_arm_qpos,
+                    inactive_qpos=inactive_qpos,
+                )
+                result, success = self._manual_step_and_record(action, recorder, active_arm_index=arm_index)
+                self._lock_guarded_arm_for_manual_step(arm_index)
+                if success or self.solver.ctrl.current_success():
+                    self.solver.ctrl.last_status = "success"
+                    return self.solver.ctrl.last_status
+                terminal_status = self._manual_terminal_status(result, "terminated_during_qpos_move")
+                if terminal_status is not None:
+                    self.solver.ctrl.last_status = terminal_status
+                    return self.solver.ctrl.last_status
+
+                box_pose_after = np.asarray(self.solver._box_pose(), dtype=np.float64)
+                box_displacement = float(np.linalg.norm(box_pose_after[:3] - initial_box_pose[:3]))
+                box_z_drop = float(initial_box_pose[2] - box_pose_after[2])
+                self.solver.ctrl.last_plan_debug["box_pose_before"] = initial_box_pose.round(4).tolist()
+                self.solver.ctrl.last_plan_debug["box_pose_after"] = box_pose_after.round(4).tolist()
+                self.solver.ctrl.last_plan_debug["box_displacement"] = round(box_displacement, 4)
+                self.solver.ctrl.last_plan_debug["box_z_drop"] = round(box_z_drop, 4)
+                self.solver.ctrl.last_plan_debug["box_move_reject"] = round(float(box_move_reject), 4)
+                self.solver.ctrl.last_plan_debug["box_z_drop_reject"] = round(float(box_z_drop_reject), 4)
+                if (
+                    box_displacement > box_move_reject
+                    or box_z_drop > box_z_drop_reject
+                ):
+                    active_pose_after = np.asarray(self.solver.ctrl.current_gripper_pose(arm_index), dtype=np.float64)
+                    active_box_distance_after = float(np.linalg.norm(active_pose_after[:3] - box_pose_after[:3]))
+                    self.solver.ctrl.last_plan_debug["active_box_distance_after"] = round(active_box_distance_after, 4)
+                    if (
+                        int(arm_index) == 1
+                        and active_box_distance_after > self.POLICY_GRIP_GUARD_TAKEOVER_DISTANCE
+                    ):
+                        self.solver.ctrl.last_plan_debug["guard_reason"] = "held_box_slip_before_right_contact"
+                    else:
+                        self.solver.ctrl.last_plan_debug["guard_reason"] = "auto_align_box_collision"
+                    self.solver.ctrl.last_status = "manual_move_rejected"
+                    self._restore_manual_scene_state(rollback_state)
+                    self._restore_manual_recorder_state(recorder, rollback_recorder_state)
+                    return None
+
+                current_arm_qpos = target_arm_qpos
+                executed_steps += 1
+                if executed_steps >= max_steps:
+                    break
+
+            if executed_steps == 0:
+                self.solver.ctrl.last_plan_debug = {
+                    "arm_index": int(arm_index),
+                    "target_phase": target_phase,
+                    "path_source": "planner_waypoints",
+                    "current_gripper_pose": current_pose.round(4).tolist(),
+                    "target_gripper_pose": target_pose.round(4).tolist(),
+                    "plan_len": int(len(plan_positions)),
+                    "skipped_steps": int(skipped_steps),
+                    "guard_reason": "no_progress",
+                }
+                self.solver.ctrl.last_status = "manual_auto_align_failed"
+                return None
+
+            self.solver.ctrl.last_plan_debug["executed_steps"] = int(executed_steps)
+            self.solver.ctrl.last_plan_debug["max_steps"] = int(max_steps)
+            self._sync_manual_arm_targets()
+            self._remember_manual_hold_target(arm_index, current_arm_qpos)
             return None
-
-        self.solver.ctrl.last_plan_debug["executed_steps"] = int(executed_steps)
-        self.solver.ctrl.last_plan_debug["max_steps"] = int(max_steps)
-        self._sync_manual_arm_targets()
-        self._remember_manual_hold_target(arm_index, current_arm_qpos)
-        return None
+        finally:
+            self._manual_active_guarded_box_hold = previous_active_guarded_box_hold
 
     def _print_manual_help(self) -> None:
         print(
@@ -1937,7 +1942,6 @@ class PolicyManualInterventionCollector:
                     ActionSpec.from_value(action, action_type=self.action_type)
                 )
                 self._restore_policy_grip_guard_state()
-                self._sync_manual_state_to_sim()
                 tracking.append_step(action, dict(result.observation.data))
                 self._maybe_render()
                 encoded_obs = self.adapter.encode_obs(dict(result.observation.data))

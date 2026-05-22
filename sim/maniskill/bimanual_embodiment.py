@@ -119,6 +119,16 @@ class BimanualEmbodimentSpec:
             float(config.get("gripper_damping", 200.0)),
         )
 
+    def gripper_closed_drive_params(self, arm_index: int):
+        config = self._config(arm_index)
+        closed_drive_value = config.get("gripper_closed_drive_value")
+        if closed_drive_value is None:
+            return None, None
+        return (
+            float(closed_drive_value),
+            float(config.get("gripper_closed_drive_threshold", 0.2)),
+        )
+
     def build_robot(self, scene, *, arm_index: int, name: str):
         loader = scene.create_urdf_loader()
         loader.name = name

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import imageio.v2 as imageio
 import numpy as np
+import torch
 import zarr
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -79,6 +80,111 @@ def _to_bool_scalar(value) -> bool:
     if isinstance(value, np.ndarray):
         return bool(np.asarray(value).reshape(-1)[0])
     return bool(value)
+
+
+def _to_numpy(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "numpy"):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _raw_recorder(recorder):
+    return getattr(recorder, "_recorder", recorder)
+
+
+def _recorder_actions(recorder) -> np.ndarray:
+    actions = getattr(_raw_recorder(recorder), "_actions", None)
+    if actions is None:
+        return np.empty((0,), dtype=np.float32)
+    return np.asarray(actions, dtype=np.float32)
+
+
+def _validate_action_replay(
+    *,
+    task_name: str,
+    resolved_runtime: dict,
+    seed: int,
+    actions: np.ndarray,
+    max_episode_steps: int,
+) -> tuple[bool, dict]:
+    replay_runtime = dict(resolved_runtime)
+    replay_runtime["render_mode"] = None
+    replay_runtime["obs_mode"] = "state_dict"
+    replay_env = ManiSkillTaskFactory().create_env(
+        task_name=task_name,
+        **replay_runtime,
+    )
+    try:
+        replay_env.reset(seed=int(seed))
+        steps = 0
+        terminated = False
+        truncated = False
+        success = False
+        for action in np.asarray(actions, dtype=np.float32)[: int(max_episode_steps)]:
+            result = replay_env.step(
+                ActionSpec.from_value(action, action_type=replay_runtime.get("action_type"))
+            )
+            steps += 1
+            success = _to_bool_scalar(result.info.get("success", False))
+            if success:
+                break
+            terminated = bool(result.terminated)
+            truncated = bool(result.truncated)
+            if terminated or truncated:
+                break
+
+        eval_info = {}
+        evaluator = getattr(replay_env.env.unwrapped, "evaluate", None)
+        if callable(evaluator):
+            raw_eval = evaluator()
+            eval_info = {
+                key: _to_bool_scalar(value)
+                for key, value in raw_eval.items()
+                if key
+                in {
+                    "success",
+                    "spatial_success",
+                    "right_gripper_open",
+                    "right_ee_clear",
+                    "box_static",
+                    "xy_aligned",
+                    "z_aligned",
+                }
+            }
+            success = bool(eval_info.get("success", success))
+
+        debug: dict[str, object] = {
+            "seed": int(seed),
+            "steps": int(steps),
+            "success": int(success),
+            "terminated": int(terminated),
+            "truncated": int(truncated),
+            **eval_info,
+        }
+
+        base_env = replay_env.env.unwrapped
+        if hasattr(base_env, "box") and hasattr(base_env, "target_box"):
+            box = _to_numpy(base_env.box.pose.p).reshape(-1, 3)[0]
+            target = _to_numpy(base_env.target_box.pose.p).reshape(-1, 3)[0]
+            bottom_minus_top = (box - np.asarray([0.0, 0.0, 0.1])) - (
+                target + np.asarray([0.0, 0.0, 0.005])
+            )
+            debug["bottom_minus_target_top"] = [
+                round(float(value), 4) for value in bottom_minus_top
+            ]
+        return bool(success), debug
+    finally:
+        replay_env.close()
+
+
+def _write_episode_metadata(out_path: Path, metadata: dict) -> None:
+    metadata_path = out_path.with_suffix(".json")
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
 
 
 def _maybe_capture_frame(env_backend, frames: list[np.ndarray]) -> None:
@@ -381,13 +487,48 @@ def run_collection(args) -> None:
                     seed=reset_seed,
                     max_episode_steps=args.max_episode_steps,
                 )
-                if success or not args.save_only_success:
+                replay_debug = None
+                replay_success = None
+                if episode_length > 0 and success:
+                    try:
+                        replay_success, replay_debug = _validate_action_replay(
+                            task_name=runtime_task_name,
+                            resolved_runtime=resolved_runtime,
+                            seed=reset_seed,
+                            actions=_recorder_actions(recorder),
+                            max_episode_steps=args.max_episode_steps,
+                        )
+                    except Exception as exc:
+                        replay_success = False
+                        replay_debug = {
+                            "seed": int(reset_seed),
+                            "success": 0,
+                            "error": repr(exc),
+                        }
+                    if not replay_success:
+                        status = f"{status}|action_replay_failed"
+
+                should_save = (success and (replay_success is not False)) or not args.save_only_success
+                if should_save:
                     if episode_length > 0:
                         out_path = recorder.save_episode(saved_episode_idx)
+                        metadata = {
+                            "collector": "policy_manual_intervention",
+                            "seed": int(reset_seed),
+                            "length": int(episode_length),
+                            "success": bool(success),
+                            "replay_success": None if replay_success is None else bool(replay_success),
+                            "status": str(status),
+                            "action_replay": replay_debug,
+                            "debug": getattr(collector, "last_debug_info", None),
+                        }
+                        _write_episode_metadata(out_path, metadata)
                         print(
                             f"saved {out_path} "
                             f"(seed={reset_seed}, length={episode_length}, "
-                            f"success={int(success)}, status={status})"
+                            f"success={int(success)}, "
+                            f"replay_success={int(replay_success) if replay_success is not None else 'n/a'}, "
+                            f"status={status})"
                         )
                         saved_episode_idx += 1
                     else:
@@ -403,8 +544,15 @@ def run_collection(args) -> None:
                 else:
                     print(
                         f"skipped policy_manual_intervention attempt={attempted_episode_idx} "
-                        f"(seed={reset_seed}, length={episode_length}, success=0, status={status})"
+                        f"(seed={reset_seed}, length={episode_length}, success={int(success)}, "
+                        f"replay_success={int(replay_success) if replay_success is not None else 'n/a'}, "
+                        f"status={status})"
                     )
+                    if replay_debug is not None:
+                        print(
+                            "policy_manual_intervention_replay_debug="
+                            + json.dumps(replay_debug, ensure_ascii=False)
+                        )
                     if args.debug_policy_manual_intervention and getattr(collector, "last_debug_info", None):
                         print(
                             "policy_manual_intervention_debug="
