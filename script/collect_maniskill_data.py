@@ -59,6 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-kind", choices=("flowmatching", "fpo"), default="flowmatching")
     parser.add_argument("--ckpt-path", type=str, default=None)
     parser.add_argument("--save-only-success", action="store_true")
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=None,
+        help="Optional cap for seed attempts before stopping an attempt-based collector.",
+    )
     parser.add_argument("--debug-scripted-expert", action="store_true")
     parser.add_argument("--debug-policy-intervention", action="store_true")
     parser.add_argument("--debug-policy-manual-intervention", action="store_true")
@@ -365,7 +371,9 @@ def run_collection(args) -> None:
             solver = HandoverBlockSolver(env)
             saved_episode_idx = 0
             attempted_episode_idx = 0
-            while saved_episode_idx < args.episode_num:
+            while saved_episode_idx < args.episode_num and (
+                args.max_attempts is None or attempted_episode_idx < int(args.max_attempts)
+            ):
                 reset_seed = args.seed + attempted_episode_idx
                 obs = env.reset(seed=reset_seed)
                 recorder.start_episode(dict(obs.data))
@@ -375,13 +383,49 @@ def run_collection(args) -> None:
                     max_episode_steps=args.max_episode_steps,
                 )
 
-                if success or not args.save_only_success:
+                replay_debug = None
+                replay_success = None
+                if episode_length > 0 and success:
+                    try:
+                        replay_success, replay_debug = _validate_action_replay(
+                            task_name=runtime_task_name,
+                            resolved_runtime=resolved_runtime,
+                            seed=reset_seed,
+                            actions=_recorder_actions(recorder),
+                            max_episode_steps=args.max_episode_steps,
+                        )
+                    except Exception as exc:
+                        replay_success = False
+                        replay_debug = {
+                            "seed": int(reset_seed),
+                            "success": 0,
+                            "error": repr(exc),
+                        }
+                    if not replay_success:
+                        status = f"{status}|action_replay_failed"
+
+                should_save = (success and (replay_success is not False)) or not args.save_only_success
+                if should_save:
                     if episode_length > 0:
                         out_path = recorder.save_episode(saved_episode_idx)
+                        metadata = {
+                            "collector": "scripted_expert",
+                            "seed": int(reset_seed),
+                            "length": int(episode_length),
+                            "success": bool(success),
+                            "replay_success": None if replay_success is None else bool(replay_success),
+                            "status": str(status),
+                            "action_replay": replay_debug,
+                            "first_pick_debug": getattr(solver, "first_pick_debug", None),
+                            "debug": getattr(solver, "last_debug_info", None),
+                        }
+                        _write_episode_metadata(out_path, metadata)
                         print(
                             f"saved {out_path} "
                             f"(seed={reset_seed}, length={episode_length}, "
-                            f"success={int(success)}, status={status})"
+                            f"success={int(success)}, "
+                            f"replay_success={int(replay_success) if replay_success is not None else 'n/a'}, "
+                            f"status={status})"
                         )
                         saved_episode_idx += 1
                     else:
@@ -393,18 +437,28 @@ def run_collection(args) -> None:
                         print("scripted_expert_pick_debug=" + json.dumps(solver.first_pick_debug, ensure_ascii=False))
                     if args.debug_scripted_expert and getattr(solver, "last_debug_info", None):
                         print("scripted_expert_debug=" + json.dumps(solver.last_debug_info, ensure_ascii=False))
-                    if (not success) and (not args.debug_scripted_expert) and getattr(solver, "last_debug_info", None):
-                        print("scripted_expert_debug=" + json.dumps(solver.last_debug_info, ensure_ascii=False))
                 else:
                     print(
                         f"skipped scripted_expert attempt={attempted_episode_idx} "
-                        f"(seed={reset_seed}, length={episode_length}, success=0, status={status})"
+                        f"(seed={reset_seed}, length={episode_length}, success={int(success)}, "
+                        f"replay_success={int(replay_success) if replay_success is not None else 'n/a'}, "
+                        f"status={status})"
                     )
+                    if replay_debug is not None:
+                        print(
+                            "scripted_expert_replay_debug="
+                            + json.dumps(replay_debug, ensure_ascii=False)
+                        )
                     if args.debug_scripted_expert and getattr(solver, "first_pick_debug", None):
                         print("scripted_expert_pick_debug=" + json.dumps(solver.first_pick_debug, ensure_ascii=False))
-                    if getattr(solver, "last_debug_info", None):
+                    if args.debug_scripted_expert and getattr(solver, "last_debug_info", None):
                         print("scripted_expert_debug=" + json.dumps(solver.last_debug_info, ensure_ascii=False))
                 attempted_episode_idx += 1
+            if saved_episode_idx < args.episode_num and args.max_attempts is not None:
+                print(
+                    f"warning: requested {args.episode_num} episodes but only saved {saved_episode_idx} "
+                    f"after {attempted_episode_idx} scripted_expert attempts"
+                )
             return
 
         if args.collector == "policy_intervention":

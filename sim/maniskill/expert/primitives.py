@@ -1187,7 +1187,10 @@ class FixedRateMotionPrimitives:
                 return candidate, True
             pre_close_settle_steps = 0
         if freeze_current_qpos_before_close:
-            self.commanded_arm_qpos[arm_index] = self.current_qpos(arm_index).copy()
+            # Stop arm drift while the fingers close. If the hand is still too
+            # far from contact, the task-level grasp validation should reject
+            # the sample instead of letting the arm push the object around.
+            self.commanded_arm_qpos[int(arm_index)] = self.current_qpos(int(arm_index)).copy()
             for paired_arm_index in (pre_close_paired_gripper_arm_index, paired_close_gripper_arm_index):
                 if paired_arm_index is not None:
                     self.commanded_arm_qpos[int(paired_arm_index)] = self.current_qpos(int(paired_arm_index)).copy()
