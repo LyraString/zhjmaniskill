@@ -99,6 +99,20 @@ MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
             "seed_path": "data/handover_block/demo_clean/seed.txt",
         },
     },
+    "handover_block_ur5_v2_smoke": {
+        "env_id": "HandoverBlockUR5-v2",
+        **DEFAULT_MANISKILL_RUNTIME,
+        "action_type": "continuous",
+        "robot_uids": "none",
+        "shape_meta": {
+            "point_cloud": [512, 3],
+            "agent_pos": [14],
+            "action": [14],
+        },
+        "dataset": {
+            "zarr_path": "data/HandoverBlockUR5-v2-smoke_npz-1.zarr",
+        },
+    },
 }
 
 

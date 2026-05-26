@@ -189,6 +189,12 @@ class HandoverBlockSolver:
         self.base_env.success_gate_enabled = bool(enabled)
         return previous
 
+    def _handover_target_pose(self) -> np.ndarray:
+        return np.asarray(
+            getattr(self.base_env, "block_middle_pose", BLOCK_MIDDLE_POSE),
+            dtype=np.float64,
+        )
+
     @property
     def last_status(self) -> str:
         return self.ctrl.last_status
@@ -2137,7 +2143,7 @@ class HandoverBlockSolver:
             right_handover_preposition_debug = None
             if self.PREPOSITION_RIGHT_FOR_HANDOVER:
                 preposition_handover_box_pose = self._solve_box_pose_from_functional_target(
-                    np.asarray(BLOCK_MIDDLE_POSE, dtype=np.float64),
+                    self._handover_target_pose(),
                     functional_id=0,
                 )
                 (
@@ -2505,13 +2511,13 @@ class HandoverBlockSolver:
                 return False, self.ctrl.steps_taken, self.ctrl.last_status
 
             planned_handover_box_pose = self._solve_box_pose_from_functional_target(
-                np.asarray(BLOCK_MIDDLE_POSE, dtype=np.float64),
+                self._handover_target_pose(),
                 functional_id=0,
             )
             handover_box_pose = planned_handover_box_pose
             left_handover_pose = self._place_pose_from_current_grasp(
                 arm_index=0,
-                target_pose=np.asarray(BLOCK_MIDDLE_POSE, dtype=np.float64),
+                target_pose=self._handover_target_pose(),
                 functional_id=0,
                 pre_dis=0.0,
                 pre_dis_axis="grasp",
