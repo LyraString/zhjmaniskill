@@ -997,7 +997,26 @@ class FixedRateMotionPrimitives:
                         }
                     )
                     continue
-                next_qpos = np.asarray(pre_plan["position"][-1], dtype=np.float64)
+                pre_positions = np.asarray(pre_plan.get("position", []), dtype=np.float64)
+                if len(pre_positions) == 0:
+                    attempts.append(
+                        {
+                            "contact_id": int(contact_id),
+                            "variant_index": int(variant_index),
+                            "pre_pose": pose_list(pre_pose),
+                            "planner_pre_pose": pose_list(planner_pre_pose),
+                            "grasp_pose": pose_list(grasp_pose),
+                            "planner_grasp_pose": pose_list(planner_grasp_pose),
+                            "desired_pose": pose_list(desired_pose),
+                            "current_ee_pose": pose_list(current_ee_pose),
+                            "current_gripper_pose": pose_list(current_gripper_pose),
+                            "planner_base_pose": pose_list(planner_base_pose),
+                            "pre_reason": "empty_pre_plan",
+                            "grasp_reason": None,
+                        }
+                    )
+                    continue
+                next_qpos = np.asarray(pre_positions[-1], dtype=np.float64)
                 grasp_plan, grasp_reason = self.plan_screw_to_pose_debug(
                     arm_index,
                     planner_grasp_pose,
@@ -1014,12 +1033,18 @@ class FixedRateMotionPrimitives:
                         f"{len(grasp_plan['position'])}>{int(max_grasp_plan_length)}"
                     )
                     grasp_plan = None
+                if grasp_plan is not None and len(np.asarray(grasp_plan.get("position", []))) == 0:
+                    grasp_reason = "empty_screw_grasp_plan"
+                    grasp_plan = None
                 if grasp_plan is None:
                     grasp_plan, grasp_reason = self.plan_to_pose_debug(
                         arm_index,
                         planner_grasp_pose,
                         start_qpos=next_qpos,
                     )
+                    if grasp_plan is not None and len(np.asarray(grasp_plan.get("position", []))) == 0:
+                        grasp_reason = "empty_pose_grasp_plan"
+                        grasp_plan = None
                     if grasp_plan is not None:
                         grasp_plan_source = "pose_fallback"
                         if (
@@ -1153,6 +1178,7 @@ class FixedRateMotionPrimitives:
         paired_close_gripper_pos: float | None = None,
         paired_close_gripper_release_after_smooth: bool = False,
         freeze_current_qpos_before_close: bool = False,
+        approach_gripper_pos: float | None = None,
         pre_pose_candidates_builder: Callable[[np.ndarray, int, float, int], list[np.ndarray]] | None = None,
         selection_mode: str = "auto",
     ) -> tuple[GraspCandidate | None, bool]:
@@ -1171,10 +1197,26 @@ class FixedRateMotionPrimitives:
         if candidate is None:
             self.last_status = fail_status
             return None, False
-        success = self._execute_plan(arm_index, candidate.pre_plan, recorder)
+        if approach_gripper_pos is None:
+            success = self._execute_plan(arm_index, candidate.pre_plan, recorder)
+        else:
+            success = self.execute_plan_with_gripper(
+                arm_index,
+                candidate.pre_plan,
+                recorder,
+                gripper=float(approach_gripper_pos),
+            )
         if success:
             return candidate, True
-        success = self._execute_plan(arm_index, candidate.grasp_plan, recorder)
+        if approach_gripper_pos is None:
+            success = self._execute_plan(arm_index, candidate.grasp_plan, recorder)
+        else:
+            success = self.execute_plan_with_gripper(
+                arm_index,
+                candidate.grasp_plan,
+                recorder,
+                gripper=float(approach_gripper_pos),
+            )
         if success:
             return candidate, True
         if freeze_current_qpos_before_close and pre_close_settle_steps > 0:

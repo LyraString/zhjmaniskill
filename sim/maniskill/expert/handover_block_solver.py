@@ -16,6 +16,7 @@ from sim.maniskill.expert.primitives import (
 from sim.maniskill.tasks.handover_block_env import (
     BLOCK_MIDDLE_POSE,
     BOX_HALF_SIZE,
+    REWARD_GRIPPER_CLOSED_THRESHOLD,
     TARGET_HALF_SIZE,
 )
 
@@ -153,6 +154,10 @@ class HandoverBlockSolver:
     RIGHT_HANDOVER_POST_CLOSE_HOLD_STEPS = 20
     RIGHT_HANDOVER_MAX_BOX_GRIPPER_DISTANCE = 0.20
     RIGHT_HANDOVER_MAX_BOX_PLANNED_DISTANCE = 0.22
+    RIGHT_HANDOVER_APPROACH_GRIPPER_POS = 1.0
+    RIGHT_HANDOVER_OPEN_BEFORE_APPROACH_STEPS = 6
+    RIGHT_HANDOVER_STATIC_RECEIVER = False
+    RIGHT_HANDOVER_STATIC_RECEIVER_SETTLE_STEPS = 6
     RIGHT_HANDOVER_GRIPPER_HOLD_POS = 0.0
     PREPOSITION_RIGHT_FOR_HANDOVER = True
     LEFT_PRERELEASE_BEFORE_RIGHT_HANDOVER_CLOSE = 0.0
@@ -172,6 +177,15 @@ class HandoverBlockSolver:
     LEFT_RELEASE_CLEAR_LIFT_MAX_ATTEMPTS = 2
     FINAL_RELEASE_SETTLE_STEPS = 4
     FINAL_SETTLE_STEPS = 12
+    LEFT_FIRST_GRASP_PROBE_MIN_BOX_Z_GAIN = 0.04
+    LEFT_FIRST_GRASP_PROBE_MIN_FOLLOW_RATIO = 0.35
+    LEFT_FIRST_GRASP_PROBE_MAX_BOX_GRIPPER_DISTANCE = 0.22
+    LEFT_HANDOVER_PROBE_MAX_BOX_PLANNED_DISTANCE = 0.12
+    LEFT_HANDOVER_PROBE_MAX_BOX_GRIPPER_DISTANCE = 0.22
+    LEFT_HANDOVER_PROBE_MAX_Z_DROP_FROM_LIFT = 0.08
+    LEFT_LIFT_FALLBACK_STEPS = 16
+    LEFT_LIFT_FALLBACK_SETTLE_STEPS = 4
+    LEFT_LIFT_FALLBACK_IK_THRESHOLD = 5e-2
 
     def __init__(self, env_backend):
         self.backend = env_backend
@@ -194,6 +208,180 @@ class HandoverBlockSolver:
             getattr(self.base_env, "block_middle_pose", BLOCK_MIDDLE_POSE),
             dtype=np.float64,
         )
+
+    def _first_pick_pose_from_debug(self, *keys: str) -> np.ndarray | None:
+        for key in keys:
+            value = self.first_pick_debug.get(key)
+            if value is not None:
+                return np.asarray(value, dtype=np.float64).reshape(7)
+        return None
+
+    def _left_first_grasp_probe_debug(self, pick_candidate: GraspCandidate) -> dict[str, object]:
+        initial_box_pose = self._first_pick_pose_from_debug("box_pose")
+        lift_start_box_pose = self._first_pick_pose_from_debug("post_close_box_pose", "post_grasp_box_pose")
+        lift_start_gripper_pose = self._first_pick_pose_from_debug(
+            "post_close_left_gripper_pose",
+            "post_grasp_left_gripper_pose",
+        )
+        post_lift_box_pose = np.asarray(self._box_pose(), dtype=np.float64)
+        post_lift_gripper_pose = np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64)
+
+        if initial_box_pose is None:
+            initial_box_pose = post_lift_box_pose.copy()
+        if lift_start_box_pose is None:
+            lift_start_box_pose = initial_box_pose.copy()
+        if lift_start_gripper_pose is None:
+            lift_start_gripper_pose = post_lift_gripper_pose.copy()
+
+        box_z_gain_from_start = float(post_lift_box_pose[2] - lift_start_box_pose[2])
+        box_z_gain_from_initial = float(post_lift_box_pose[2] - initial_box_pose[2])
+        gripper_z_gain_from_start = float(post_lift_gripper_pose[2] - lift_start_gripper_pose[2])
+        follow_ratio = box_z_gain_from_start / max(abs(gripper_z_gain_from_start), 1e-6)
+        box_gripper_distance = float(np.linalg.norm(post_lift_box_pose[:3] - post_lift_gripper_pose[:3]))
+        gripper_closed = float(self.ctrl.current_gripper_value(0)) <= REWARD_GRIPPER_CLOSED_THRESHOLD
+
+        passed = (
+            box_z_gain_from_start >= self.LEFT_FIRST_GRASP_PROBE_MIN_BOX_Z_GAIN
+            and follow_ratio >= self.LEFT_FIRST_GRASP_PROBE_MIN_FOLLOW_RATIO
+            and box_gripper_distance <= self.LEFT_FIRST_GRASP_PROBE_MAX_BOX_GRIPPER_DISTANCE
+            and gripper_closed
+        )
+        return {
+            "stage": "left_first_grasp_probe",
+            "passed": bool(passed),
+            "selected_contact_id": int(pick_candidate.contact_id),
+            "selected_grasp_plan_source": str(pick_candidate.grasp_plan_source),
+            "steps_taken": int(self.ctrl.steps_taken),
+            "thresholds": {
+                "min_box_z_gain": float(self.LEFT_FIRST_GRASP_PROBE_MIN_BOX_Z_GAIN),
+                "min_follow_ratio": float(self.LEFT_FIRST_GRASP_PROBE_MIN_FOLLOW_RATIO),
+                "max_box_gripper_distance": float(self.LEFT_FIRST_GRASP_PROBE_MAX_BOX_GRIPPER_DISTANCE),
+                "closed_gripper_threshold": float(REWARD_GRIPPER_CLOSED_THRESHOLD),
+            },
+            "metrics": {
+                "box_z_gain_from_lift_start": round(box_z_gain_from_start, 5),
+                "box_z_gain_from_initial": round(box_z_gain_from_initial, 5),
+                "gripper_z_gain_from_lift_start": round(gripper_z_gain_from_start, 5),
+                "follow_ratio": round(float(follow_ratio), 5),
+                "box_gripper_distance": round(box_gripper_distance, 5),
+                "left_gripper_value": round(float(self.ctrl.current_gripper_value(0)), 5),
+            },
+            "initial_box_pose": initial_box_pose.round(4).tolist(),
+            "lift_start_box_pose": lift_start_box_pose.round(4).tolist(),
+            "post_lift_box_pose": post_lift_box_pose.round(4).tolist(),
+            "lift_start_gripper_pose": lift_start_gripper_pose.round(4).tolist(),
+            "post_lift_gripper_pose": post_lift_gripper_pose.round(4).tolist(),
+            "post_lift_alignment": self._box_gripper_alignment_debug(
+                arm_index=0,
+                planned_gripper_pose=pick_candidate.grasp_pose,
+            ),
+        }
+
+    def _left_handover_probe_debug(
+        self,
+        *,
+        planned_handover_box_pose: np.ndarray,
+        actual_handover_box_pose: np.ndarray,
+        left_handover_pose: np.ndarray,
+    ) -> dict[str, object]:
+        post_left_lift_box_pose = self._first_pick_pose_from_debug("post_left_lift_box_pose")
+        current_left_gripper_pose = np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64)
+        actual_handover_box_pose = np.asarray(actual_handover_box_pose, dtype=np.float64)
+        planned_handover_box_pose = np.asarray(planned_handover_box_pose, dtype=np.float64)
+        box_to_planned = actual_handover_box_pose[:3] - planned_handover_box_pose[:3]
+        box_planned_distance = float(np.linalg.norm(box_to_planned))
+        box_gripper_distance = float(np.linalg.norm(actual_handover_box_pose[:3] - current_left_gripper_pose[:3]))
+        left_gripper_value = float(self.ctrl.current_gripper_value(0))
+        z_drop_from_lift = 0.0
+        if post_left_lift_box_pose is not None:
+            z_drop_from_lift = float(post_left_lift_box_pose[2] - actual_handover_box_pose[2])
+        gripper_closed = left_gripper_value <= REWARD_GRIPPER_CLOSED_THRESHOLD
+        passed = (
+            gripper_closed
+            and box_planned_distance <= float(self.LEFT_HANDOVER_PROBE_MAX_BOX_PLANNED_DISTANCE)
+            and box_gripper_distance <= float(self.LEFT_HANDOVER_PROBE_MAX_BOX_GRIPPER_DISTANCE)
+            and z_drop_from_lift <= float(self.LEFT_HANDOVER_PROBE_MAX_Z_DROP_FROM_LIFT)
+        )
+        return {
+            "stage": "left_handover_probe",
+            "passed": bool(passed),
+            "steps_taken": int(self.ctrl.steps_taken),
+            "thresholds": {
+                "max_box_planned_distance": float(self.LEFT_HANDOVER_PROBE_MAX_BOX_PLANNED_DISTANCE),
+                "max_box_gripper_distance": float(self.LEFT_HANDOVER_PROBE_MAX_BOX_GRIPPER_DISTANCE),
+                "max_z_drop_from_lift": float(self.LEFT_HANDOVER_PROBE_MAX_Z_DROP_FROM_LIFT),
+                "closed_gripper_threshold": float(REWARD_GRIPPER_CLOSED_THRESHOLD),
+            },
+            "metrics": {
+                "box_planned_distance": round(box_planned_distance, 5),
+                "box_planned_xyz_error": box_to_planned.round(5).tolist(),
+                "box_gripper_distance": round(box_gripper_distance, 5),
+                "z_drop_from_lift": round(z_drop_from_lift, 5),
+                "left_gripper_value": round(left_gripper_value, 5),
+            },
+            "post_left_lift_box_pose": None
+            if post_left_lift_box_pose is None
+            else post_left_lift_box_pose.round(4).tolist(),
+            "planned_handover_box_pose": planned_handover_box_pose.round(4).tolist(),
+            "actual_handover_box_pose": actual_handover_box_pose.round(4).tolist(),
+            "left_handover_pose": np.asarray(left_handover_pose, dtype=np.float64).round(4).tolist(),
+            "left_gripper_pose": current_left_gripper_pose.round(4).tolist(),
+            "left_ee_pose": np.asarray(self.ctrl.current_ee_pose(0), dtype=np.float64).round(4).tolist(),
+            "post_left_handover_alignment": self.first_pick_debug.get("post_left_handover_alignment"),
+        }
+
+    def _right_handover_probe_debug(
+        self,
+        *,
+        handover_box_pose: np.ndarray,
+        handover_candidate: GraspCandidate,
+        right_handover_alignment: dict[str, object],
+        right_handover_close_trace: list[dict[str, object]],
+        right_handover_selection_debug: list[dict[str, object]],
+        right_handover_selection_reason: str,
+    ) -> dict[str, object]:
+        current_box_pose = np.asarray(self._box_pose(), dtype=np.float64)
+        current_right_gripper_pose = np.asarray(self.ctrl.current_gripper_pose(1), dtype=np.float64)
+        current_left_gripper_pose = np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64)
+        right_gripper_value = float(self.ctrl.current_gripper_value(1))
+        left_gripper_value = float(self.ctrl.current_gripper_value(0))
+        box_gripper_distance = float(right_handover_alignment.get("box_gripper_distance", np.inf))
+        box_planned_distance = float(right_handover_alignment.get("box_planned_distance", np.inf))
+        right_gripper_closed = right_gripper_value <= REWARD_GRIPPER_CLOSED_THRESHOLD
+        left_gripper_closed = left_gripper_value <= REWARD_GRIPPER_CLOSED_THRESHOLD
+        passed = (
+            right_gripper_closed
+            and left_gripper_closed
+            and box_gripper_distance <= float(self.RIGHT_HANDOVER_MAX_BOX_GRIPPER_DISTANCE)
+            and box_planned_distance <= float(self.RIGHT_HANDOVER_MAX_BOX_PLANNED_DISTANCE)
+        )
+        return {
+            "stage": "right_handover_probe",
+            "passed": bool(passed),
+            "selected_contact_id": int(handover_candidate.contact_id),
+            "selection_reason": right_handover_selection_reason,
+            "selection_debug": right_handover_selection_debug,
+            "steps_taken": int(self.ctrl.steps_taken),
+            "thresholds": {
+                "max_box_gripper_distance": float(self.RIGHT_HANDOVER_MAX_BOX_GRIPPER_DISTANCE),
+                "max_box_planned_distance": float(self.RIGHT_HANDOVER_MAX_BOX_PLANNED_DISTANCE),
+                "closed_gripper_threshold": float(REWARD_GRIPPER_CLOSED_THRESHOLD),
+            },
+            "metrics": {
+                "box_gripper_distance": round(box_gripper_distance, 5),
+                "box_planned_distance": round(box_planned_distance, 5),
+                "right_gripper_value": round(right_gripper_value, 5),
+                "left_gripper_value": round(left_gripper_value, 5),
+            },
+            "handover_box_pose": np.asarray(handover_box_pose, dtype=np.float64).round(4).tolist(),
+            "box_pose": current_box_pose.round(4).tolist(),
+            "right_gripper_pose": current_right_gripper_pose.round(4).tolist(),
+            "left_gripper_pose": current_left_gripper_pose.round(4).tolist(),
+            "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
+            "left_ee_pose": np.asarray(self.ctrl.current_ee_pose(0), dtype=np.float64).round(4).tolist(),
+            "right_handover_alignment": right_handover_alignment,
+            "right_handover_close_trace": right_handover_close_trace,
+        }
 
     @property
     def last_status(self) -> str:
@@ -982,29 +1170,9 @@ class HandoverBlockSolver:
         selected_place_candidate: dict[str, object] | None,
         right_handover_selection_debug: list[dict[str, object]],
         right_handover_selection_reason: str,
+        stop_after_right_handover: bool = False,
+        static_receiver: bool = False,
     ) -> tuple[bool, int, str]:
-        approach_pose = self.ctrl.gripper_pose_to_planner_pose(
-            1,
-            self._get_handover_approach_pose(handover_candidate.pre_pose),
-        )
-        if self.ctrl.move_to_pose(1, approach_pose, recorder, fail_status="right_handover_approach_failed"):
-            return True, self.ctrl.steps_taken, self.ctrl.last_status
-        if self.ctrl.last_status != "running":
-            self.last_debug_info = {
-                "stage": "right_handover_approach",
-                "handover_box_pose": np.asarray(handover_box_pose, dtype=np.float64).round(4).tolist(),
-                "selection_reason": right_handover_selection_reason,
-                "selection_debug": right_handover_selection_debug,
-                "selected_contact_id": int(handover_candidate.contact_id),
-                "approach_pose": np.asarray(approach_pose, dtype=np.float64).round(4).tolist(),
-                "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
-                "right_gripper_pose": np.asarray(self.ctrl.current_gripper_pose(1), dtype=np.float64).round(4).tolist(),
-                "right_qpos": np.asarray(self.ctrl.current_qpos(1), dtype=np.float64).round(4).tolist(),
-                "right_full_qpos": np.asarray(self.ctrl.current_full_qpos(1), dtype=np.float64).round(4).tolist(),
-                "plan_debug": dict(self.ctrl.last_plan_debug),
-            }
-            return False, self.ctrl.steps_taken, self.ctrl.last_status
-
         right_handover_close_trace: list[dict[str, object]] = []
 
         def record_right_handover_close_step(event: dict[str, object]) -> None:
@@ -1032,29 +1200,106 @@ class HandoverBlockSolver:
                 }
             )
 
-        handover_candidate, success = self.ctrl.grasp_actor(
-            desired_pose=handover_box_pose,
-            arm_index=1,
-            contact_ids=(handover_candidate.contact_id,),
-            pre_grasp_dis=self.HANDOVER_PRE_GRASP_DISTANCE,
-            grasp_dis=self.RIGHT_HANDOVER_GRASP_DISTANCE,
-            pose_builder=self._grasp_pose_from_box_pose,
-            preferred_quat=self._preferred_grasp_quat(1),
-            preferred_top_down_quat=TOP_DOWN_PREFERRED_GRASP_QUATS[1],
-            pre_pose_candidates_builder=self._right_end_grasp_pre_pose_candidates_from_box_pose,
-            recorder=recorder,
-            fail_status="right_handover_plan_failed",
-            selection_mode="auto",
-            gripper_pos=self.RIGHT_HANDOVER_GRIPPER_HOLD_POS,
-            pre_close_settle_steps=self.RIGHT_HANDOVER_PRE_CLOSE_SETTLE_STEPS,
-            pre_close_paired_gripper_arm_index=0,
-            pre_close_paired_gripper_pos=self.LEFT_PRERELEASE_BEFORE_RIGHT_HANDOVER_CLOSE,
-            pre_close_paired_gripper_steps=self.LEFT_PRERELEASE_BEFORE_RIGHT_HANDOVER_CLOSE_STEPS,
-            close_smooth_steps=self.RIGHT_HANDOVER_CLOSE_SMOOTH_STEPS,
-            close_settle_steps=self.RIGHT_HANDOVER_CLOSE_SETTLE_STEPS,
-            close_step_callback=record_right_handover_close_step,
-            freeze_current_qpos_before_close=True,
-        )
+        if static_receiver:
+            if self.RIGHT_HANDOVER_STATIC_RECEIVER_SETTLE_STEPS > 0:
+                if self.ctrl.hold_pose(
+                    recorder,
+                    steps=int(self.RIGHT_HANDOVER_STATIC_RECEIVER_SETTLE_STEPS),
+                    left_gripper=0.0,
+                    right_gripper=self.RIGHT_HANDOVER_APPROACH_GRIPPER_POS,
+                    allow_success_early=False,
+                ):
+                    return True, self.ctrl.steps_taken, self.ctrl.last_status
+                if self.ctrl.last_status != "running":
+                    self.last_debug_info = {
+                        "stage": "right_handover_static_receiver_settle",
+                        "handover_box_pose": np.asarray(handover_box_pose, dtype=np.float64).round(4).tolist(),
+                        "selection_reason": right_handover_selection_reason,
+                        "selection_debug": right_handover_selection_debug,
+                        "selected_contact_id": int(handover_candidate.contact_id),
+                        "right_gripper_pose": np.asarray(
+                            self.ctrl.current_gripper_pose(1),
+                            dtype=np.float64,
+                        ).round(4).tolist(),
+                        "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                    }
+                    return False, self.ctrl.steps_taken, self.ctrl.last_status
+            success = self.ctrl.close_gripper(
+                1,
+                recorder,
+                pos=self.RIGHT_HANDOVER_GRIPPER_HOLD_POS,
+                smooth_steps=self.RIGHT_HANDOVER_CLOSE_SMOOTH_STEPS,
+                settle_steps=self.RIGHT_HANDOVER_CLOSE_SETTLE_STEPS,
+                step_callback=record_right_handover_close_step,
+            )
+        else:
+            if self.RIGHT_HANDOVER_OPEN_BEFORE_APPROACH_STEPS > 0:
+                if self.ctrl.hold_pose(
+                    recorder,
+                    steps=int(self.RIGHT_HANDOVER_OPEN_BEFORE_APPROACH_STEPS),
+                    right_gripper=self.RIGHT_HANDOVER_APPROACH_GRIPPER_POS,
+                    allow_success_early=False,
+                ):
+                    return True, self.ctrl.steps_taken, self.ctrl.last_status
+                if self.ctrl.last_status != "running":
+                    self.last_debug_info = {
+                        "stage": "right_handover_open_before_approach",
+                        "handover_box_pose": np.asarray(handover_box_pose, dtype=np.float64).round(4).tolist(),
+                        "selection_reason": right_handover_selection_reason,
+                        "selection_debug": right_handover_selection_debug,
+                        "selected_contact_id": int(handover_candidate.contact_id),
+                        "right_gripper_value": float(self.ctrl.current_gripper_value(1)),
+                        "right_gripper_pose": np.asarray(self.ctrl.current_gripper_pose(1), dtype=np.float64).round(4).tolist(),
+                        "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                    }
+                    return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+            approach_pose = self.ctrl.gripper_pose_to_planner_pose(
+                1,
+                self._get_handover_approach_pose(handover_candidate.pre_pose),
+            )
+            if self.ctrl.move_to_pose(1, approach_pose, recorder, fail_status="right_handover_approach_failed"):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                self.last_debug_info = {
+                    "stage": "right_handover_approach",
+                    "handover_box_pose": np.asarray(handover_box_pose, dtype=np.float64).round(4).tolist(),
+                    "selection_reason": right_handover_selection_reason,
+                    "selection_debug": right_handover_selection_debug,
+                    "selected_contact_id": int(handover_candidate.contact_id),
+                    "approach_pose": np.asarray(approach_pose, dtype=np.float64).round(4).tolist(),
+                    "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
+                    "right_gripper_pose": np.asarray(self.ctrl.current_gripper_pose(1), dtype=np.float64).round(4).tolist(),
+                    "right_qpos": np.asarray(self.ctrl.current_qpos(1), dtype=np.float64).round(4).tolist(),
+                    "right_full_qpos": np.asarray(self.ctrl.current_full_qpos(1), dtype=np.float64).round(4).tolist(),
+                    "plan_debug": dict(self.ctrl.last_plan_debug),
+                }
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+            handover_candidate, success = self.ctrl.grasp_actor(
+                desired_pose=handover_box_pose,
+                arm_index=1,
+                contact_ids=(handover_candidate.contact_id,),
+                pre_grasp_dis=self.HANDOVER_PRE_GRASP_DISTANCE,
+                grasp_dis=self.RIGHT_HANDOVER_GRASP_DISTANCE,
+                pose_builder=self._grasp_pose_from_box_pose,
+                preferred_quat=self._preferred_grasp_quat(1),
+                preferred_top_down_quat=TOP_DOWN_PREFERRED_GRASP_QUATS[1],
+                pre_pose_candidates_builder=self._right_end_grasp_pre_pose_candidates_from_box_pose,
+                recorder=recorder,
+                fail_status="right_handover_plan_failed",
+                selection_mode="auto",
+                gripper_pos=self.RIGHT_HANDOVER_GRIPPER_HOLD_POS,
+                pre_close_settle_steps=self.RIGHT_HANDOVER_PRE_CLOSE_SETTLE_STEPS,
+                pre_close_paired_gripper_arm_index=0,
+                pre_close_paired_gripper_pos=self.LEFT_PRERELEASE_BEFORE_RIGHT_HANDOVER_CLOSE,
+                pre_close_paired_gripper_steps=self.LEFT_PRERELEASE_BEFORE_RIGHT_HANDOVER_CLOSE_STEPS,
+                close_smooth_steps=self.RIGHT_HANDOVER_CLOSE_SMOOTH_STEPS,
+                close_settle_steps=self.RIGHT_HANDOVER_CLOSE_SETTLE_STEPS,
+                close_step_callback=record_right_handover_close_step,
+                freeze_current_qpos_before_close=True,
+                approach_gripper_pos=self.RIGHT_HANDOVER_APPROACH_GRIPPER_POS,
+            )
         if handover_candidate is None:
             self.last_debug_info = {
                 "stage": "right_handover_grasp",
@@ -1155,6 +1400,21 @@ class HandoverBlockSolver:
                 "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
             }
             self.ctrl.last_status = "right_handover_grasp_unstable"
+            return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+        if stop_after_right_handover:
+            self.last_debug_info = self._right_handover_probe_debug(
+                handover_box_pose=handover_box_pose,
+                handover_candidate=handover_candidate,
+                right_handover_alignment=right_handover_alignment,
+                right_handover_close_trace=right_handover_close_trace,
+                right_handover_selection_debug=right_handover_selection_debug,
+                right_handover_selection_reason=right_handover_selection_reason,
+            )
+            if bool(self.last_debug_info["passed"]):
+                self.ctrl.last_status = "right_handover_probe_success"
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            self.ctrl.last_status = "right_handover_probe_failed"
             return False, self.ctrl.steps_taken, self.ctrl.last_status
 
         if self.ctrl.close_gripper(
@@ -2112,7 +2372,16 @@ class HandoverBlockSolver:
         self.ctrl.last_status = "final_success_check_failed"
         return False, self.ctrl.steps_taken, self.ctrl.last_status
 
-    def solve_episode(self, *, recorder, max_episode_steps: int) -> tuple[bool, int, str]:
+    def solve_episode(
+        self,
+        *,
+        recorder,
+        max_episode_steps: int,
+        stop_after_left_lift: bool = False,
+        stop_after_left_handover: bool = False,
+        stop_after_left_handover_hold_steps: int = 0,
+        stop_after_right_handover: bool = False,
+    ) -> tuple[bool, int, str]:
         self.ctrl.reset_episode(max_episode_steps)
         self.last_debug_info = {}
         self.first_pick_debug = {}
@@ -2141,7 +2410,9 @@ class HandoverBlockSolver:
                 return False, self.ctrl.steps_taken, self.ctrl.last_status
 
             right_handover_preposition_debug = None
-            if self.PREPOSITION_RIGHT_FOR_HANDOVER:
+            right_handover_preposition_candidate = None
+            right_handover_preposition_place_candidate = None
+            if self.PREPOSITION_RIGHT_FOR_HANDOVER and not self.RIGHT_HANDOVER_STATIC_RECEIVER:
                 preposition_handover_box_pose = self._solve_box_pose_from_functional_target(
                     self._handover_target_pose(),
                     functional_id=0,
@@ -2160,14 +2431,20 @@ class HandoverBlockSolver:
                     "selection_debug": preposition_selection_debug,
                 }
                 if preposition_candidate is not None:
-                    preposition_approach_pose = self.ctrl.gripper_pose_to_planner_pose(
-                        1,
-                        self._get_handover_approach_pose(preposition_candidate.pre_pose),
+                    right_handover_preposition_candidate = preposition_candidate
+                    right_handover_preposition_place_candidate = _preposition_place_candidate
+                    preposition_gripper_pose = (
+                        preposition_candidate.grasp_pose
+                        if self.RIGHT_HANDOVER_STATIC_RECEIVER
+                        else self._get_handover_approach_pose(preposition_candidate.pre_pose)
                     )
+                    preposition_approach_pose = self.ctrl.gripper_pose_to_planner_pose(1, preposition_gripper_pose)
                     right_handover_preposition_debug.update(
                         {
                             "used": True,
+                            "static_receiver": bool(self.RIGHT_HANDOVER_STATIC_RECEIVER),
                             "selected_contact_id": int(preposition_candidate.contact_id),
+                            "gripper_pose": np.asarray(preposition_gripper_pose, dtype=np.float64).round(4).tolist(),
                             "approach_pose": np.asarray(preposition_approach_pose, dtype=np.float64).round(4).tolist(),
                             "start_right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
                             "start_right_qpos": np.asarray(self.ctrl.current_qpos(1), dtype=np.float64).round(4).tolist(),
@@ -2493,13 +2770,58 @@ class HandoverBlockSolver:
                 planned_gripper_pose=pick_candidate.grasp_pose,
             )
 
+            left_lift_remaining = self.LEFT_LIFT_DISTANCE - clamp_lift_distance
             if self.ctrl.move_by_displacement(
                 0,
                 recorder,
-                z=self.LEFT_LIFT_DISTANCE - clamp_lift_distance,
+                z=left_lift_remaining,
                 fail_status="left_lift_failed",
             ):
                 return True, self.ctrl.steps_taken, self.ctrl.last_status
+            if self.ctrl.last_status != "running":
+                left_lift_primary_debug = dict(self.ctrl.last_plan_debug)
+                left_lift_fallback_debug = None
+                if self.ctrl.last_status == "left_lift_failed":
+                    self.ctrl.last_status = "running"
+                    fallback_start_pose = np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64)
+                    fallback_success = self.ctrl.move_gripper_by_displacement_via_ik(
+                        0,
+                        recorder,
+                        z=left_lift_remaining,
+                        steps=self.LEFT_LIFT_FALLBACK_STEPS,
+                        settle_steps=self.LEFT_LIFT_FALLBACK_SETTLE_STEPS,
+                        fail_status="left_lift_fallback_failed",
+                        ik_threshold=self.LEFT_LIFT_FALLBACK_IK_THRESHOLD,
+                    )
+                    fallback_end_pose = np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64)
+                    left_lift_fallback_debug = {
+                        "status": str(self.ctrl.last_status),
+                        "success_early": bool(fallback_success),
+                        "command_z": round(float(left_lift_remaining), 4),
+                        "start_pose": fallback_start_pose.round(4).tolist(),
+                        "end_pose": fallback_end_pose.round(4).tolist(),
+                        "actual_delta": (fallback_end_pose[:3] - fallback_start_pose[:3])
+                        .round(4)
+                        .tolist(),
+                        "plan_debug": dict(self.ctrl.last_plan_debug),
+                    }
+                    self.first_pick_debug["left_lift_primary_debug"] = left_lift_primary_debug
+                    self.first_pick_debug["left_lift_fallback_debug"] = left_lift_fallback_debug
+                    if fallback_success:
+                        return True, self.ctrl.steps_taken, self.ctrl.last_status
+                if self.ctrl.last_status == "running":
+                    self.first_pick_debug["left_lift_primary_debug"] = left_lift_primary_debug
+                    self.first_pick_debug["left_lift_fallback_debug"] = left_lift_fallback_debug
+                else:
+                    self.last_debug_info = {
+                        "stage": "left_lift",
+                        "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                        "left_ee_pose": np.asarray(self.ctrl.current_ee_pose(0), dtype=np.float64).round(4).tolist(),
+                        "left_qpos": np.asarray(self.ctrl.current_qpos(0), dtype=np.float64).round(4).tolist(),
+                        "plan_debug": left_lift_primary_debug,
+                        "fallback_debug": left_lift_fallback_debug,
+                    }
+                    return False, self.ctrl.steps_taken, self.ctrl.last_status
             if self.ctrl.last_status != "running":
                 self.last_debug_info = {
                     "stage": "left_lift",
@@ -2509,11 +2831,102 @@ class HandoverBlockSolver:
                     "plan_debug": dict(self.ctrl.last_plan_debug),
                 }
                 return False, self.ctrl.steps_taken, self.ctrl.last_status
+            self.first_pick_debug["post_left_lift_box_pose"] = np.asarray(
+                self._box_pose(),
+                dtype=np.float64,
+            ).round(4).tolist()
+            self.first_pick_debug["post_left_lift_left_ee_pose"] = np.asarray(
+                self.ctrl.current_ee_pose(0),
+                dtype=np.float64,
+            ).round(4).tolist()
+            self.first_pick_debug["post_left_lift_left_gripper_pose"] = np.asarray(
+                self.ctrl.current_gripper_pose(0),
+                dtype=np.float64,
+            ).round(4).tolist()
+            self.first_pick_debug["post_left_lift_alignment"] = self._box_gripper_alignment_debug(
+                arm_index=0,
+                planned_gripper_pose=pick_candidate.grasp_pose,
+            )
+            if stop_after_left_lift:
+                self.last_debug_info = self._left_first_grasp_probe_debug(pick_candidate)
+                if bool(self.last_debug_info["passed"]):
+                    self.ctrl.last_status = "left_first_grasp_probe_success"
+                    return True, self.ctrl.steps_taken, self.ctrl.last_status
+                self.ctrl.last_status = "left_first_grasp_probe_failed"
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
 
             planned_handover_box_pose = self._solve_box_pose_from_functional_target(
                 self._handover_target_pose(),
                 functional_id=0,
             )
+            if self.RIGHT_HANDOVER_STATIC_RECEIVER:
+                (
+                    preposition_candidate,
+                    _preposition_place_candidate,
+                    preposition_selection_debug,
+                    preposition_selection_reason,
+                    _preposition_options,
+                ) = self._select_right_handover_candidate(planned_handover_box_pose)
+                right_handover_preposition_debug = {
+                    "used": False,
+                    "static_receiver": True,
+                    "stage": "after_left_lift",
+                    "planned_handover_box_pose": planned_handover_box_pose.round(4).tolist(),
+                    "selection_reason": preposition_selection_reason,
+                    "selection_debug": preposition_selection_debug,
+                }
+                if preposition_candidate is None:
+                    self.ctrl.last_status = "right_static_receiver_plan_failed"
+                    self.last_debug_info = {
+                        "stage": "right_static_receiver_preposition",
+                        **right_handover_preposition_debug,
+                        "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                        "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
+                        "right_qpos": np.asarray(self.ctrl.current_qpos(1), dtype=np.float64).round(4).tolist(),
+                    }
+                    return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+                right_handover_preposition_candidate = preposition_candidate
+                right_handover_preposition_place_candidate = _preposition_place_candidate
+                preposition_gripper_pose = preposition_candidate.grasp_pose
+                preposition_pose = self.ctrl.gripper_pose_to_planner_pose(1, preposition_gripper_pose)
+                right_handover_preposition_debug.update(
+                    {
+                        "used": True,
+                        "selected_contact_id": int(preposition_candidate.contact_id),
+                        "gripper_pose": np.asarray(preposition_gripper_pose, dtype=np.float64).round(4).tolist(),
+                        "target_pose": np.asarray(preposition_pose, dtype=np.float64).round(4).tolist(),
+                        "start_right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
+                        "start_right_qpos": np.asarray(self.ctrl.current_qpos(1), dtype=np.float64).round(4).tolist(),
+                    }
+                )
+                if self.ctrl.move_to_pose(
+                    1,
+                    preposition_pose,
+                    recorder,
+                    fail_status="right_static_receiver_preposition_failed",
+                ):
+                    return True, self.ctrl.steps_taken, self.ctrl.last_status
+                right_handover_preposition_debug.update(
+                    {
+                        "status": str(self.ctrl.last_status),
+                        "end_right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
+                        "end_right_gripper_pose": np.asarray(
+                            self.ctrl.current_gripper_pose(1),
+                            dtype=np.float64,
+                        ).round(4).tolist(),
+                        "end_right_qpos": np.asarray(self.ctrl.current_qpos(1), dtype=np.float64).round(4).tolist(),
+                        "plan_debug": dict(self.ctrl.last_plan_debug),
+                    }
+                )
+                if self.ctrl.last_status != "running":
+                    self.last_debug_info = {
+                        "stage": "right_static_receiver_preposition",
+                        **right_handover_preposition_debug,
+                        "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                    }
+                    return False, self.ctrl.steps_taken, self.ctrl.last_status
+
             handover_box_pose = planned_handover_box_pose
             left_handover_pose = self._place_pose_from_current_grasp(
                 arm_index=0,
@@ -2555,14 +2968,72 @@ class HandoverBlockSolver:
                     actual_handover_box_pose[:3] - planned_handover_box_pose[:3]
                 ).round(4).tolist(),
             }
+            if stop_after_left_handover:
+                if int(stop_after_left_handover_hold_steps) > 0:
+                    if self.ctrl.hold_pose(
+                        recorder,
+                        steps=int(stop_after_left_handover_hold_steps),
+                        left_gripper=0.0,
+                        right_gripper=1.0,
+                        allow_success_early=False,
+                    ):
+                        return True, self.ctrl.steps_taken, self.ctrl.last_status
+                    if self.ctrl.last_status != "running":
+                        self.last_debug_info = {
+                            "stage": "left_handover_hold",
+                            "hold_steps": int(stop_after_left_handover_hold_steps),
+                            "planned_handover_box_pose": planned_handover_box_pose.round(4).tolist(),
+                            "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
+                            "left_gripper_pose": np.asarray(
+                                self.ctrl.current_gripper_pose(0),
+                                dtype=np.float64,
+                            ).round(4).tolist(),
+                            "left_ee_pose": np.asarray(
+                                self.ctrl.current_ee_pose(0),
+                                dtype=np.float64,
+                            ).round(4).tolist(),
+                            "left_gripper_value": round(float(self.ctrl.current_gripper_value(0)), 5),
+                            "right_gripper_value": round(float(self.ctrl.current_gripper_value(1)), 5),
+                        }
+                        return False, self.ctrl.steps_taken, self.ctrl.last_status
+                    actual_handover_box_pose = np.asarray(self._box_pose(), dtype=np.float64).copy()
+                self.last_debug_info = self._left_handover_probe_debug(
+                    planned_handover_box_pose=planned_handover_box_pose,
+                    actual_handover_box_pose=actual_handover_box_pose,
+                    left_handover_pose=left_handover_pose,
+                )
+                self.last_debug_info["hold_steps"] = int(stop_after_left_handover_hold_steps)
+                if bool(self.last_debug_info["passed"]):
+                    self.ctrl.last_status = "left_handover_probe_success"
+                    return True, self.ctrl.steps_taken, self.ctrl.last_status
+                self.ctrl.last_status = "left_handover_probe_failed"
+                return False, self.ctrl.steps_taken, self.ctrl.last_status
 
-            (
-                handover_candidate,
-                selected_place_candidate,
-                right_handover_selection_debug,
-                right_handover_selection_reason,
-                right_handover_options,
-            ) = self._select_right_handover_candidate(handover_box_pose)
+            use_static_receiver = (
+                self.RIGHT_HANDOVER_STATIC_RECEIVER
+                and right_handover_preposition_candidate is not None
+            )
+            if use_static_receiver:
+                handover_candidate = right_handover_preposition_candidate
+                selected_place_candidate = right_handover_preposition_place_candidate
+                right_handover_selection_debug = []
+                if right_handover_preposition_debug is not None:
+                    right_handover_selection_debug = [
+                        {
+                            "stage": "static_receiver_preposition",
+                            **right_handover_preposition_debug,
+                        }
+                    ]
+                right_handover_selection_reason = "static_receiver_preposition"
+                right_handover_options = []
+            else:
+                (
+                    handover_candidate,
+                    selected_place_candidate,
+                    right_handover_selection_debug,
+                    right_handover_selection_reason,
+                    right_handover_options,
+                ) = self._select_right_handover_candidate(handover_box_pose)
             if handover_candidate is None:
                 self.ctrl.last_status = "right_handover_plan_failed"
                 self.last_debug_info = {
@@ -2652,6 +3123,7 @@ class HandoverBlockSolver:
                             selected_place_candidate=option["future_place_candidate"],
                             right_handover_selection_debug=right_handover_selection_debug,
                             right_handover_selection_reason=right_handover_selection_reason,
+                            stop_after_right_handover=False,
                         )
                     finally:
                         self.ctrl.success_detection_enabled = previous_success_detection
@@ -2726,6 +3198,8 @@ class HandoverBlockSolver:
                 selected_place_candidate=selected_place_candidate,
                 right_handover_selection_debug=right_handover_selection_debug,
                 right_handover_selection_reason=right_handover_selection_reason,
+                stop_after_right_handover=stop_after_right_handover,
+                static_receiver=use_static_receiver,
             )
         except EpisodeLimitReached:
             self.ctrl.last_status = "max_episode_steps_exceeded"

@@ -8,15 +8,15 @@ from sim.maniskill.tasks.handover_block_env import (
     BLOCK_MIDDLE_POSE,
     BOX_BASE_QUAT,
     BOX_CENTER_Z,
-    BOX_YAW_LIMIT,
     TARGET_CENTER_Z,
     HandoverBlockEnv,
     _quat_multiply,
 )
 
 
-V2_BOX_X_RANGE = (-0.12, -0.04)
-V2_BOX_Y_RANGE = (0.04, 0.11)
+V2_BOX_X_RANGE = (-0.12, -0.09)
+V2_BOX_Y_RANGE = (0.07, 0.11)
+V2_BOX_YAW_LIMIT = 0.05
 V2_TARGET_X_RANGE = (0.08, 0.16)
 V2_TARGET_Y_RANGE = (0.11, 0.19)
 V2_BLOCK_MIDDLE_POSE = [0.02, 0.11, 0.92, *BLOCK_MIDDLE_POSE[3:]]
@@ -53,7 +53,7 @@ class HandoverBlockUR5V2Env(HandoverBlockEnv):
                 dtype=torch.float32,
             ).reshape(b)
             yaw = torch.as_tensor(
-                episode_rng.uniform(-BOX_YAW_LIMIT, BOX_YAW_LIMIT),
+                episode_rng.uniform(-V2_BOX_YAW_LIMIT, V2_BOX_YAW_LIMIT),
                 device=self.device,
                 dtype=torch.float32,
             ).reshape(b)
