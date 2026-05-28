@@ -37,6 +37,7 @@ third_party/
 
 # Agents
 AGENTS.md
+CLAUDE.md
 
 tmp/
 

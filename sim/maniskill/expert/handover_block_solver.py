@@ -159,6 +159,14 @@ class HandoverBlockSolver:
     RIGHT_HANDOVER_STATIC_RECEIVER = False
     RIGHT_HANDOVER_STATIC_RECEIVER_SETTLE_STEPS = 6
     RIGHT_HANDOVER_GRIPPER_HOLD_POS = 0.0
+    RIGHT_CARRY_PROBE_SEGMENTS = ((0.015, 0.0, 0.0), (0.0, 0.015, 0.0), (0.0, 0.0, 0.015))
+    RIGHT_CARRY_PROBE_MOVE_STEPS = 8
+    RIGHT_CARRY_PROBE_SETTLE_STEPS = 2
+    RIGHT_CARRY_PROBE_IK_THRESHOLD = 6e-2
+    RIGHT_CARRY_PROBE_MOVE_MODE = "ik"
+    RIGHT_CARRY_PROBE_MAX_BOX_GRIPPER_DISTANCE = 0.24
+    RIGHT_CARRY_PROBE_MAX_BOX_DROP = 0.06
+    RIGHT_CARRY_PROBE_MIN_FOLLOW_RATIO = 0.25
     PREPOSITION_RIGHT_FOR_HANDOVER = True
     LEFT_PRERELEASE_BEFORE_RIGHT_HANDOVER_CLOSE = 0.0
     LEFT_PRERELEASE_BEFORE_RIGHT_HANDOVER_CLOSE_STEPS = 0
@@ -381,6 +389,99 @@ class HandoverBlockSolver:
             "left_ee_pose": np.asarray(self.ctrl.current_ee_pose(0), dtype=np.float64).round(4).tolist(),
             "right_handover_alignment": right_handover_alignment,
             "right_handover_close_trace": right_handover_close_trace,
+        }
+
+    def _right_carry_probe_debug(
+        self,
+        *,
+        handover_box_pose: np.ndarray,
+        post_release_box_pose: np.ndarray,
+        post_release_right_gripper_pose: np.ndarray,
+        handover_candidate: GraspCandidate,
+        right_handover_alignment: dict[str, object],
+        right_handover_close_trace: list[dict[str, object]],
+        right_handover_selection_debug: list[dict[str, object]],
+        right_handover_selection_reason: str,
+        left_release_clear_debug: dict[str, object],
+        carry_trace: list[dict[str, object]],
+        failed_stage: str | None = None,
+    ) -> dict[str, object]:
+        current_box_pose = np.asarray(self._box_pose(), dtype=np.float64)
+        current_right_gripper_pose = np.asarray(self.ctrl.current_gripper_pose(1), dtype=np.float64)
+        post_release_box_pose = np.asarray(post_release_box_pose, dtype=np.float64)
+        post_release_right_gripper_pose = np.asarray(post_release_right_gripper_pose, dtype=np.float64)
+        box_to_right_gripper = current_box_pose[:3] - current_right_gripper_pose[:3]
+        box_gripper_distance = float(np.linalg.norm(box_to_right_gripper))
+        box_drop_from_handover = float(np.asarray(handover_box_pose, dtype=np.float64)[2] - current_box_pose[2])
+        box_drop_from_post_release = float(post_release_box_pose[2] - current_box_pose[2])
+
+        right_gripper_path_length = 0.0
+        box_path_length = 0.0
+        requested_path_length = 0.0
+        for event in carry_trace:
+            requested_path_length += float(np.linalg.norm(np.asarray(event.get("requested_delta", [0, 0, 0]))))
+            right_gripper_path_length += float(
+                np.linalg.norm(np.asarray(event.get("actual_gripper_delta", [0, 0, 0])))
+            )
+            box_path_length += float(np.linalg.norm(np.asarray(event.get("actual_box_delta", [0, 0, 0]))))
+
+        net_gripper_delta = current_right_gripper_pose[:3] - post_release_right_gripper_pose[:3]
+        net_box_delta = current_box_pose[:3] - post_release_box_pose[:3]
+        follow_ratio = box_path_length / max(right_gripper_path_length, 1e-8)
+        projected_follow_ratio = float(np.dot(net_box_delta, net_gripper_delta)) / max(
+            float(np.dot(net_gripper_delta, net_gripper_delta)),
+            1e-8,
+        )
+        movement_required = right_gripper_path_length > 1e-6
+        passed = (
+            failed_stage is None
+            and box_gripper_distance <= float(self.RIGHT_CARRY_PROBE_MAX_BOX_GRIPPER_DISTANCE)
+            and box_drop_from_handover <= float(self.RIGHT_CARRY_PROBE_MAX_BOX_DROP)
+            and (
+                not movement_required
+                or follow_ratio >= float(self.RIGHT_CARRY_PROBE_MIN_FOLLOW_RATIO)
+                or projected_follow_ratio >= float(self.RIGHT_CARRY_PROBE_MIN_FOLLOW_RATIO)
+            )
+        )
+        return {
+            "stage": "right_carry_probe",
+            "passed": bool(passed),
+            "failed_stage": failed_stage,
+            "selected_contact_id": int(handover_candidate.contact_id),
+            "selection_reason": right_handover_selection_reason,
+            "selection_debug": right_handover_selection_debug,
+            "steps_taken": int(self.ctrl.steps_taken),
+            "thresholds": {
+                "max_box_gripper_distance": float(self.RIGHT_CARRY_PROBE_MAX_BOX_GRIPPER_DISTANCE),
+                "max_box_drop": float(self.RIGHT_CARRY_PROBE_MAX_BOX_DROP),
+                "min_follow_ratio": float(self.RIGHT_CARRY_PROBE_MIN_FOLLOW_RATIO),
+            },
+            "metrics": {
+                "box_gripper_distance": round(box_gripper_distance, 5),
+                "box_to_right_gripper_xyz": box_to_right_gripper.round(5).tolist(),
+                "box_drop_from_handover": round(box_drop_from_handover, 5),
+                "box_drop_from_post_release": round(box_drop_from_post_release, 5),
+                "requested_path_length": round(requested_path_length, 5),
+                "right_gripper_path_length": round(right_gripper_path_length, 5),
+                "box_path_length": round(box_path_length, 5),
+                "follow_ratio": round(float(follow_ratio), 5),
+                "projected_follow_ratio": round(projected_follow_ratio, 5),
+                "right_gripper_value": round(float(self.ctrl.current_gripper_value(1)), 5),
+                "left_gripper_value": round(float(self.ctrl.current_gripper_value(0)), 5),
+            },
+            **left_release_clear_debug,
+            "handover_box_pose": np.asarray(handover_box_pose, dtype=np.float64).round(4).tolist(),
+            "post_release_box_pose": post_release_box_pose.round(4).tolist(),
+            "post_release_right_gripper_pose": post_release_right_gripper_pose.round(4).tolist(),
+            "box_pose": current_box_pose.round(4).tolist(),
+            "right_gripper_pose": current_right_gripper_pose.round(4).tolist(),
+            "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
+            "left_gripper_pose": np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64).round(4).tolist(),
+            "left_ee_pose": np.asarray(self.ctrl.current_ee_pose(0), dtype=np.float64).round(4).tolist(),
+            "right_handover_alignment": right_handover_alignment,
+            "right_handover_close_trace": right_handover_close_trace,
+            "carry_trace": carry_trace,
+            "plan_debug": dict(self.ctrl.last_plan_debug),
         }
 
     @property
@@ -1171,6 +1272,8 @@ class HandoverBlockSolver:
         right_handover_selection_debug: list[dict[str, object]],
         right_handover_selection_reason: str,
         stop_after_right_handover: bool = False,
+        stop_after_right_carry_probe: bool = False,
+        right_carry_probe_segments: tuple[tuple[float, float, float], ...] | None = None,
         static_receiver: bool = False,
     ) -> tuple[bool, int, str]:
         right_handover_close_trace: list[dict[str, object]] = []
@@ -1560,6 +1663,91 @@ class HandoverBlockSolver:
                 return True, self.ctrl.steps_taken, self.ctrl.last_status
             if self.ctrl.last_status != "running":
                 return False, self.ctrl.steps_taken, self.ctrl.last_status
+
+        if stop_after_right_carry_probe:
+            carry_segments = (
+                self.RIGHT_CARRY_PROBE_SEGMENTS
+                if right_carry_probe_segments is None
+                else right_carry_probe_segments
+            )
+            post_release_box_pose = np.asarray(self._box_pose(), dtype=np.float64)
+            post_release_right_gripper_pose = np.asarray(self.ctrl.current_gripper_pose(1), dtype=np.float64)
+            carry_trace: list[dict[str, object]] = []
+            failed_stage: str | None = None
+            for segment_index, segment in enumerate(carry_segments):
+                requested_delta = np.asarray(segment, dtype=np.float64).reshape(3)
+                if float(np.linalg.norm(requested_delta)) <= 1e-8:
+                    continue
+                start_box_pose = np.asarray(self._box_pose(), dtype=np.float64)
+                start_gripper_pose = np.asarray(self.ctrl.current_gripper_pose(1), dtype=np.float64)
+                move_mode = str(self.RIGHT_CARRY_PROBE_MOVE_MODE)
+                if move_mode == "planner":
+                    target_gripper_pose = start_gripper_pose.copy()
+                    target_gripper_pose[:3] += requested_delta
+                    target_pose = self.ctrl.gripper_pose_to_planner_pose(1, target_gripper_pose)
+                    success = self.ctrl.move_to_pose(
+                        1,
+                        target_pose,
+                        recorder,
+                        fail_status="right_carry_probe_move_failed",
+                    )
+                else:
+                    success = self.ctrl.move_gripper_by_displacement_via_ik(
+                        1,
+                        recorder,
+                        x=float(requested_delta[0]),
+                        y=float(requested_delta[1]),
+                        z=float(requested_delta[2]),
+                        move_axis="world",
+                        steps=int(self.RIGHT_CARRY_PROBE_MOVE_STEPS),
+                        settle_steps=int(self.RIGHT_CARRY_PROBE_SETTLE_STEPS),
+                        fail_status="right_carry_probe_move_failed",
+                        ik_threshold=float(self.RIGHT_CARRY_PROBE_IK_THRESHOLD),
+                    )
+                end_box_pose = np.asarray(self._box_pose(), dtype=np.float64)
+                end_gripper_pose = np.asarray(self.ctrl.current_gripper_pose(1), dtype=np.float64)
+                carry_trace.append(
+                    {
+                        "segment_index": int(segment_index),
+                        "move_mode": move_mode,
+                        "requested_delta": requested_delta.round(4).tolist(),
+                        "status": str(self.ctrl.last_status),
+                        "success_early": bool(success),
+                        "start_box_pose": start_box_pose.round(4).tolist(),
+                        "end_box_pose": end_box_pose.round(4).tolist(),
+                        "actual_box_delta": (end_box_pose[:3] - start_box_pose[:3]).round(4).tolist(),
+                        "start_gripper_pose": start_gripper_pose.round(4).tolist(),
+                        "end_gripper_pose": end_gripper_pose.round(4).tolist(),
+                        "actual_gripper_delta": (end_gripper_pose[:3] - start_gripper_pose[:3])
+                        .round(4)
+                        .tolist(),
+                        "plan_debug": dict(self.ctrl.last_plan_debug),
+                    }
+                )
+                if success:
+                    return True, self.ctrl.steps_taken, self.ctrl.last_status
+                if self.ctrl.last_status != "running":
+                    failed_stage = "right_carry_probe_move"
+                    break
+
+            self.last_debug_info = self._right_carry_probe_debug(
+                handover_box_pose=handover_box_pose,
+                post_release_box_pose=post_release_box_pose,
+                post_release_right_gripper_pose=post_release_right_gripper_pose,
+                handover_candidate=handover_candidate,
+                right_handover_alignment=right_handover_alignment,
+                right_handover_close_trace=right_handover_close_trace,
+                right_handover_selection_debug=right_handover_selection_debug,
+                right_handover_selection_reason=right_handover_selection_reason,
+                left_release_clear_debug=left_release_clear_debug,
+                carry_trace=carry_trace,
+                failed_stage=failed_stage,
+            )
+            if bool(self.last_debug_info["passed"]):
+                self.ctrl.last_status = "right_carry_probe_success"
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
+            self.ctrl.last_status = "right_carry_probe_failed"
+            return False, self.ctrl.steps_taken, self.ctrl.last_status
 
         current_right_qpos = self.ctrl.current_qpos(1)
         right_home_qpos = self.base_env.get_arm_home_joint_positions(1)
@@ -2381,6 +2569,8 @@ class HandoverBlockSolver:
         stop_after_left_handover: bool = False,
         stop_after_left_handover_hold_steps: int = 0,
         stop_after_right_handover: bool = False,
+        stop_after_right_carry_probe: bool = False,
+        right_carry_probe_segments: tuple[tuple[float, float, float], ...] | None = None,
     ) -> tuple[bool, int, str]:
         self.ctrl.reset_episode(max_episode_steps)
         self.last_debug_info = {}
@@ -3199,6 +3389,8 @@ class HandoverBlockSolver:
                 right_handover_selection_debug=right_handover_selection_debug,
                 right_handover_selection_reason=right_handover_selection_reason,
                 stop_after_right_handover=stop_after_right_handover,
+                stop_after_right_carry_probe=stop_after_right_carry_probe,
+                right_carry_probe_segments=right_carry_probe_segments,
                 static_receiver=use_static_receiver,
             )
         except EpisodeLimitReached:
