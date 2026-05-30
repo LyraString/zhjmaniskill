@@ -1,233 +1,181 @@
-# RoboTwin ManiSkill Mainline
+# ManiSkill Bimanual Manipulation Mainline
 
-This branch is the ManiSkill-based training line for RoboTwin-style bimanual
-manipulation. The current task is `HandoverBlock-v1`, a dual-arm handover task
-used for demonstration collection, Flow Matching pretraining, policy evaluation,
-and FPO fine-tuning.
+This repository contains a ManiSkill-based training pipeline for bimanual robotic
+manipulation built on the [RoboTwin 2.0](https://robotwin-platform.github.io/)
+platform. We target fixed-frequency joint-position control with Flow Matching
+pretraining and FPO online fine-tuning. The primary task is **HandoverBlock**, a
+dual-arm handover task where the left arm grasps a block from the table, transfers
+it to the right arm at a designated handover pose, and the right arm places it on
+a target.
 
-The upstream RoboTwin README is still available in [README.md](README.md). This
-document is the recommended entry point for the current ManiSkill workflow.
-
-## Status
-
-- Main environment: `HandoverBlock-v1`
-- Main task profile: `handover_block_native_smoke`
-- Observation used by policies: point cloud `[512, 3]` plus robot state `[14]`
-- Action space: continuous joint/gripper action `[14]`
-- Current data strategy: old clean demos plus a small number of successful
-  manual-intervention ManiSkill demos
-- FPO fine-tuning is experimental. Always evaluate checkpoints early because an
-  unstable FPO run can diverge within tens of iterations.
-
-## Repository Map
-
-| Path | Purpose |
-| --- | --- |
-| [sim/maniskill/](sim/maniskill) | ManiSkill runtime, task profiles, obs/action adapters |
-| [sim/maniskill/tasks/](sim/maniskill/tasks) | Custom ManiSkill environments |
-| [sim/maniskill/policy_manual_intervention_collector.py](sim/maniskill/policy_manual_intervention_collector.py) | Human correction collector |
-| [script/collect_maniskill_data.py](script/collect_maniskill_data.py) | ManiSkill data collection CLI |
-| [script/eval_maniskill_policy.py](script/eval_maniskill_policy.py) | Direct FM/FPO ManiSkill evaluator |
-| [script/merge_handover_pretrain_zarr.py](script/merge_handover_pretrain_zarr.py) | Merge old HandoverBlock demos with manual demos |
-| [script/check_maniskill_dataset.py](script/check_maniskill_dataset.py) | Zarr validation and replay checks |
-| [policy/FlowMatching/](policy/FlowMatching) | Flow Matching training/eval code |
-| [policy/FPO/](policy/FPO) | FPO fine-tuning/eval code |
-| [policy/fm_diffusion/](policy/fm_diffusion) | Shared policy/workspace implementation used by FM and FPO |
-| [data/HandoverBlock-v1/](data/HandoverBlock-v1) | Raw ManiSkill `.npz` episodes |
-| [policy/FlowMatching/data/](policy/FlowMatching/data) | Flow Matching zarr datasets |
-| [policy/FPO/data/](policy/FPO/data) | FPO zarr datasets and FPO outputs |
-
-## Environment Assumptions
-
-The commands below assume:
-
-```bash
-REPO=/home/idiot/zhj/RoboTwin
-PY=/home/idiot/anaconda3/envs/zhjrl/bin/python3.10
-```
-
-Activate the `zhjrl` environment before running scripts:
+## Setup
 
 ```bash
 conda activate zhjrl
 cd /home/idiot/zhj/RoboTwin
 ```
 
-GPU notes:
+The environment uses `CUDA_VISIBLE_DEVICES` for GPU assignment. Physics and
+rendering backends must target the same device.
 
-- For direct Python commands, either expose one GPU with `CUDA_VISIBLE_DEVICES=1`
-  and pass `physx_cuda` / `sapien_cuda`, or pass explicit matching device ids
-  such as `physx_cuda:3` / `sapien_cuda:3`.
-- Do not mix physics and render devices, e.g. `physx_cuda:1` with
-  `sapien_cuda:3`.
-- The training wrappers take a physical GPU id as their second positional
-  argument and internally set `CUDA_VISIBLE_DEVICES=<gpu_id>`. Inside the Python
-  process this GPU becomes `cuda:0`.
+## Repository Structure
 
-## Data
-
-### Raw Manual-Intervention Episodes
-
-Successful manual-intervention episodes are stored as one episode per directory:
-
-```text
-data/HandoverBlock-v1/policy_manual_intervention_collect/data/episode0.npz
-data/HandoverBlock-v1/policy_manual_intervention_collect_001/data/episode0.npz
-...
-```
-
-Each `.npz` stores:
-
-- `point_cloud`
-- `agent_pos`
-- `actions`
-
-Keep the terminal log and video for each accepted episode. The environment
-success flag does not guarantee the trajectory is smooth enough for training.
-
-### Old Plus Manual Pretraining Zarr
-
-The current pretraining dataset combines:
-
-- 50 old clean demos:
-  `policy/FlowMatching/data/handover_block-demo_clean-50.zarr`
-- 10 manual-intervention ManiSkill demos under:
-  `data/HandoverBlock-v1/policy_manual_intervention_collect*`
-
-Build the merged zarr:
-
-```bash
-cd /home/idiot/zhj/RoboTwin
-
-/home/idiot/anaconda3/envs/zhjrl/bin/python3.10 script/merge_handover_pretrain_zarr.py \
-  --old-zarr-path /home/idiot/zhj/RoboTwin/policy/FlowMatching/data/handover_block-demo_clean-50.zarr \
-  --manual-root /home/idiot/zhj/RoboTwin/data/HandoverBlock-v1 \
-  --manual-pattern 'policy_manual_intervention_collect*' \
-  --output-zarr-path /home/idiot/zhj/RoboTwin/policy/FlowMatching/data/handover_block-old50_manual10.zarr \
-  --overwrite
-```
-
-The default output is:
-
-```text
-policy/FlowMatching/data/handover_block-old50_manual10.zarr
-```
-
-## Collect Manual-Intervention Data
-
-Use this when a learned policy can roughly do the task but needs human
-correction.
-
-```bash
-cd /home/idiot/zhj/RoboTwin
-
-CUDA_VISIBLE_DEVICES=3 /home/idiot/anaconda3/envs/zhjrl/bin/python3.10 script/collect_maniskill_data.py \
-  HandoverBlock-v1 policy_manual_intervention_collect_010 1 \
-  --task-profile handover_block_native_smoke \
-  --collector policy_manual_intervention \
-  --policy-kind flowmatching \
-  --ckpt-path /ABS/PATH/TO/FLOWMATCHING.ckpt \
-  --seed 56 \
-  --max-episode-steps 1200 \
-  --render-mode human \
-  --sim-backend physx_cuda \
-  --render-backend sapien_cuda \
-  --debug-policy-manual-intervention
-```
-
-To save a video instead of opening the viewer:
-
-```bash
-CUDA_VISIBLE_DEVICES=1 /home/idiot/anaconda3/envs/zhjrl/bin/python3.10 script/collect_maniskill_data.py \
-  HandoverBlock-v1 policy_manual_intervention_collect_010 1 \
-  --task-profile handover_block_native_smoke \
-  --collector policy_manual_intervention \
-  --policy-kind flowmatching \
-  --ckpt-path /ABS/PATH/TO/FLOWMATCHING.ckpt \
-  --seed 56 \
-  --max-episode-steps 1200 \
-  --sim-backend physx_cuda \
-  --render-backend sapien_cuda \
-  --save-video-dir /home/idiot/zhj/RoboTwin/tmp/manual_collect_videos \
-  --video-fps 10 \
-  --debug-policy-manual-intervention
-```
-
-Important controls:
-
-| Key | Action |
+| Path | Description |
 | --- | --- |
-| `m` | enter manual mode |
-| `1` / `2` | select left / right arm |
-| arrow keys or `w/a/s/d` | planar motion |
-| `u/j` or `r/f` | up / down |
-| `g` | auto-align selected gripper to the current target |
-| `o` / `c` | open / close gripper |
-| `p` | print status |
-| `n` | return to policy control |
-| `q` | abort episode |
+| `sim/maniskill/tasks/` | ManiSkill task environments (`HandoverBlock-v1`, `HandoverBlockUR5-v2`) |
+| `sim/maniskill/expert/` | Scripted expert solver and motion primitives |
+| `sim/maniskill/task_profiles.py` | Centralized runtime defaults per task profile |
+| `script/collect_maniskill_data.py` | Data collection CLI (scripted expert, manual intervention, legacy replay) |
+| `script/eval_maniskill_policy.py` | Policy evaluation CLI |
+| `script/check_maniskill_dataset.py` | Zarr validation and replay diagnostics |
+| `script/handover/` | Stage-wise diagnostic probes for the handover task |
+| `policy/FlowMatching/` | Flow Matching pretraining |
+| `policy/FPO/` | FPO online fine-tuning |
+| `policy/fm_diffusion/` | Shared policy and workspace modules |
+| `runners/` | CUDA batched rollout runners for multi-environment training |
+| `core/` | Abstract interfaces (action/observation schemas, env backends) |
+| `legacy/robotwin/` | RoboTwin legacy runtime compatibility adapters |
+| `data/` | Raw `.npz` episode directories |
+| `policy/FlowMatching/data/` | Processed Flow Matching `.zarr` datasets |
+| `policy/FPO/data/` | FPO datasets and outputs |
 
-Use a new `task_config` directory for each one-episode collection run. Reusing
-the same directory with `episode_num=1` overwrites `episode0.npz`.
+## Task Environments
 
-## Process Raw `.npz` Episodes to Zarr
+### HandoverBlock-v1
 
-For a normal ManiSkill dataset directory:
+The original ManiSkill port of the RoboTwin handover block task with Dual UR5-WSG
+arms. Box spawns on the left side of the table; the target is on the right.
+
+- Action space: 14-D absolute joint positions (6-D left arm + 1-D left gripper + 6-D right arm + 1-D right gripper)
+- Observation: point cloud `[512, 3]` + robot state `[14]`
+- Control frequency: 20 Hz
+- Task profile: `handover_block_native_smoke`
+
+### HandoverBlockUR5-v2
+
+A narrower spawn/goal region variant optimized for UR5 workspace reachability.
+Otherwise identical interface to HandoverBlock-v1.
+
+- Task profile: `handover_block_ur5_v2_smoke`
+- Box spawn range: x ∈ [-0.12, -0.09], y ∈ [0.07, 0.11]
+- Target range: x ∈ [0.08, 0.16], y ∈ [0.11, 0.19]
+- Handover pose: [0.02, 0.11, 0.92]
+
+## Data Collection
+
+### Scripted Expert
+
+The scripted expert uses a multi-stage planner-based solver that executes:
+
+1. Left arm first grasp and lift
+2. Left arm move to handover pose
+3. Right arm static-receiver handover grasp
+4. Right arm carry to target and place
 
 ```bash
-cd /home/idiot/zhj/RoboTwin
+CUDA_VISIBLE_DEVICES=0 python script/collect_maniskill_data.py \
+  HandoverBlockUR5-v2 handover_block_ur5_v2_collect 50 \
+  --task-profile handover_block_ur5_v2_smoke \
+  --collector scripted_expert \
+  --seed 108 \
+  --max-attempts 200 \
+  --max-episode-steps 900 \
+  --sim-backend physx_cuda:0 \
+  --save-only-success
+```
 
-/home/idiot/anaconda3/envs/zhjrl/bin/python3.10 policy/FlowMatching/process_data.py \
+**Positional arguments:**
+
+| Arg | Description |
+| --- | --- |
+| `HandoverBlockUR5-v2` | ManiSkill environment ID |
+| `handover_block_ur5_v2_collect` | Output subdirectory under `data/HandoverBlockUR5-v2/` |
+| `50` | Number of successful episodes to collect |
+
+**Key options:**
+
+| Option | Description |
+| --- | --- |
+| `--task-profile` | Pre-registered profile with default obs/action/reward settings |
+| `--collector` | Collection strategy: `scripted_expert`, `policy_manual_intervention`, `legacy_replay`, `random` |
+| `--seed` | Base reset seed; each attempt increments by 1 |
+| `--max-attempts` | Cap on total episodes (including failures) before giving up |
+| `--max-episode-steps` | Max steps per episode before automatic truncation |
+| `--sim-backend` | `physx_cpu` or `physx_cuda[:<device_id>]` |
+| `--save-only-success` | Skip saving failed episodes; successful ones are also action-replay-validated |
+| `--debug-scripted-expert` | Print solver debug info (grasp candidate selection, placement decisions) |
+| `--save-video-dir` | If set, save an `.mp4` video per episode alongside the `.npz` |
+| `--video-fps` | Frame rate for saved videos (default 10) |
+
+Successful episodes are automatically action-replay-validated before saving. Each
+episode produces an `episode<N>.npz` and `episode<N>.json` metadata file under
+`data/HandoverBlockUR5-v2/<task_config>/data/`.
+
+## Data Processing
+
+Convert raw `.npz` episodes to Flow Matching zarr format:
+
+```bash
+python policy/FlowMatching/process_data.py \
   --backend maniskill \
-  HandoverBlock-v1 policy_manual_intervention_clean 10
+  HandoverBlockUR5-v2 handover_block_ur5_v2_collect 50
 ```
 
-Output:
+**Positional arguments:**
 
-```text
-policy/FlowMatching/data/HandoverBlock-v1-policy_manual_intervention_clean-10.zarr
-```
+| Arg | Description |
+| --- | --- |
+| `HandoverBlockUR5-v2` | Environment ID matching the data directory under `data/` |
+| `handover_block_ur5_v2_collect` | Subdirectory name under `data/<env_id>/` |
+| `50` | Expected number of episodes (validates that the directory has at least this many) |
 
-The FPO data processor has the same interface:
+**Key options:**
+
+| Option | Description |
+| --- | --- |
+| `--backend` | `maniskill` for this pipeline (`legacy` for old RoboTwin HDF5 data) |
+| `--filter-static` | Remove near-static frames (gripper unchanged, action/state below eps) |
+| `--static-action-eps` | Action change threshold for static-frame detection (default 0.05) |
+| `--static-state-eps` | State change threshold for static-frame detection (default 0.05) |
+| `--static-gripper-eps` | Gripper change threshold for static-frame detection (default 1e-3) |
+| `--static-keep-boundary` | Frames to keep before/after each transition to avoid over-trimming |
+| `--output-suffix` | Appended to the output zarr name (e.g., `clean` produces `...-clean.zarr`) |
+
+Output: `policy/FlowMatching/data/HandoverBlockUR5-v2-handover_block_ur5_v2_collect-50.zarr`
+
+Validate a zarr dataset:
 
 ```bash
-/home/idiot/anaconda3/envs/zhjrl/bin/python3.10 policy/FPO/process_data.py \
-  --backend maniskill \
-  HandoverBlock-v1 policy_manual_intervention_clean 10
+python script/check_maniskill_dataset.py \
+  /path/to/dataset.zarr \
+  --task-profile handover_block_ur5_v2_smoke \
+  --smoke-replay --replay-episodes 3 --replay-steps 1000 \
+  --sim-backend physx_cuda:0 --render-backend sapien_cuda:0 \
+  --save-video-dir /tmp/replay_videos
 ```
 
-Optional static-segment compression:
+| Option | Description |
+| --- | --- |
+| `--smoke-replay` | Replay saved actions in the environment to check validity |
+| `--replay-episodes` | Number of episodes to replay (default 3) |
+| `--replay-steps` | Max steps per replay episode |
+| `--save-video-dir` | Save replay videos for visual inspection |
+
+## Training
+
+### Flow Matching Pretraining
 
 ```bash
-/home/idiot/anaconda3/envs/zhjrl/bin/python3.10 policy/FlowMatching/process_data.py \
-  --backend maniskill \
-  --filter-static \
-  --static-action-eps 0.05 \
-  --static-state-eps 0.05 \
-  --static-gripper-eps 1e-3 \
-  --static-keep-boundary 2 \
-  --output-suffix clean \
-  HandoverBlock-v1 policy_manual_intervention_clean 10
-```
+cd policy/FlowMatching
 
-## Train Flow Matching
-
-Use `train_fm.sh` from `policy/FlowMatching`. The first positional argument is
-the seed, and the second is the physical GPU id.
-
-### From Scratch on the Merged Old50+Manual10 Dataset
-
-```bash
-cd /home/idiot/zhj/RoboTwin/policy/FlowMatching
-
-bash train_fm.sh 114514 1 \
+bash train_fm.sh 42 0 \
   --backend maniskill \
   --config-name maniskill_fm_handover_native_teacher \
   -- \
-  task.dataset.zarr_path=/home/idiot/zhj/RoboTwin/policy/FlowMatching/data/handover_block-old50_manual10.zarr \
-  exp_name=handover_block_old50_manual10_scratch_fm \
+  task.dataset.zarr_path=/path/to/dataset.zarr \
+  exp_name=handover_block_ur5_v2_50_fm \
   training.resume=False \
-  training.checkpoint_run_name=handover_block-old50_manual10_scratch-114514 \
+  training.checkpoint_run_name=handover_block_ur5_v2_50-42 \
   training.num_epochs=3000 \
   training.checkpoint_every=100 \
   training.rollout_every=50 \
@@ -235,78 +183,45 @@ bash train_fm.sh 114514 1 \
   logging.mode=offline
 ```
 
-### Continue Training From an Existing FM Checkpoint
+**Script arguments:**
+
+| Arg | Description |
+| --- | --- |
+| `42` | Random seed for training |
+| `0` | Physical GPU ID (sets `CUDA_VISIBLE_DEVICES` internally) |
+
+**Key options (passed after `--`):**
+
+| Option | Description |
+| --- | --- |
+| `task.dataset.zarr_path` | Path to the processed `.zarr` training dataset |
+| `exp_name` | Experiment name used in log directory naming |
+| `training.resume` | `True` to continue from an existing checkpoint, `False` for fresh training |
+| `training.checkpoint_run_name` | Subdirectory under `checkpoints/` for this run |
+| `training.num_epochs` | Total training epochs |
+| `training.checkpoint_every` | Save a checkpoint every N epochs |
+| `training.rollout_every` | Run an evaluation rollout every N epochs |
+| `training.sample_every` | Log sample predictions every N epochs |
+| `logging.mode` | `offline` for disk-only logging, `online` for W&B or similar |
+
+Checkpoints are saved under `policy/FlowMatching/checkpoints/<run_name>/<epoch>.ckpt`.
+Monitor training with:
 
 ```bash
-cd /home/idiot/zhj/RoboTwin/policy/FlowMatching
+tensorboard --logdir policy/FlowMatching/data/outputs --port 16006
+```
 
-bash train_fm.sh 114514 1 \
-  /home/idiot/zhj/RoboTwin/policy/FlowMatching/checkpoints/HandoverBlock-v1-legacy_replay_native_dp3-50-clean-114514/2000.ckpt \
+### FPO Online Fine-Tuning
+
+Start from a converged Flow Matching checkpoint:
+
+```bash
+cd policy/FPO
+
+bash train_fpo.sh 42 0 \
+  /path/to/pretrained_fm.ckpt \
   --backend maniskill \
-  --config-name maniskill_fm_handover_native_teacher \
-  -- \
-  task.dataset.zarr_path=/home/idiot/zhj/RoboTwin/policy/FlowMatching/data/handover_block-old50_manual10.zarr \
-  exp_name=handover_block_old50_manual10_resume_fm \
-  training.resume=True \
-  training.checkpoint_run_name=handover_block-old50_manual10-114514 \
-  training.num_epochs=5000 \
-  training.checkpoint_every=100 \
-  training.rollout_every=50 \
-  training.sample_every=50 \
-  logging.mode=offline
-```
-
-Checkpoints are saved under:
-
-```text
-policy/FlowMatching/checkpoints/<training.checkpoint_run_name>/<epoch>.ckpt
-```
-
-Training logs are under:
-
-```text
-policy/FlowMatching/data/outputs/<date>/<time>_<config>_<task>/
-```
-
-## Evaluate Flow Matching
-
-Direct evaluator:
-
-```bash
-cd /home/idiot/zhj/RoboTwin
-
-CUDA_VISIBLE_DEVICES=1 /home/idiot/anaconda3/envs/zhjrl/bin/python3.10 script/eval_maniskill_policy.py \
-  flowmatching \
-  /ABS/PATH/TO/FLOWMATCHING.ckpt \
-  HandoverBlock-v1 \
-  --task-profile handover_block_native_smoke \
-  --episodes 50 \
-  --seed 0 \
-  --max-episode-steps 1000 \
-  --sim-backend physx_cuda \
-  --render-backend sapien_cuda \
-  --save-video-dir /home/idiot/zhj/RoboTwin/tmp/eval_fm_videos \
-  --video-fps 10
-```
-
-The printed `success_rate` is the main metric. Save videos for failed and
-successful episodes when changing data or checkpoints.
-
-## Fine-Tune With FPO
-
-FPO should start from a Flow Matching checkpoint that already produces a
-reasonable policy. Fine-tuning directly from a weak or unstable checkpoint tends
-to collapse.
-
-Use `train_fpo.sh` from `policy/FPO`:
-
-```bash
-cd /home/idiot/zhj/RoboTwin/policy/FPO
-
-bash train_fpo.sh 114514 1 \
-  /home/idiot/zhj/RoboTwin/policy/FlowMatching/checkpoints/handover_block-old50_manual10-114514/4900.ckpt \
-  --backend maniskill \
-  --task-profile handover_block_native_smoke \
+  --task-profile handover_block_ur5_v2_smoke \
   --config-name maniskill_fpo_handover_native \
   -- \
   training.resume=True \
@@ -329,199 +244,117 @@ bash train_fpo.sh 114514 1 \
   training.point_cloud_sampling=fast
 ```
 
-Parameter interpretation:
+**Script arguments:**
 
-```text
-steps/env = training.timesteps_per_batch / training.num_envs
-```
-
-For the command above:
-
-```text
-73728 / 96 = 768 steps/env
-```
-
-Key FPO stability checks:
-
-| Log field | Expected use |
+| Arg | Description |
 | --- | --- |
-| `clipped_ratio_frac` | If it quickly approaches `1.0`, the actor update is too aggressive. |
-| `rho_mean` | Large spikes indicate policy ratio instability. |
-| `rollout_action_abs_max` | If it jumps from about `1-2` to `5+`, the policy is likely diverging. |
-| `rollout_reward_stage_mean` | Shows which task stage the rollout reaches. |
-| `rollout_reward_stage_frac_*` | Stage distribution during rollout. |
+| `42` | Random seed |
+| `0` | Physical GPU ID |
+| `/path/to/pretrained_fm.ckpt` | Path to the Flow Matching checkpoint to initialize from |
 
-If FPO diverges early, reduce update strength before increasing data size:
+**Key training options (passed after `--`):**
 
-```text
-training.n_updates_per_iteration=1
-training.clip_coef=0.01
-training.clamp_logratio=0.2
-training.rho_max=2.0
-training.max_grad_norm=0.5
-```
+| Option | Description |
+| --- | --- |
+| `training.num_envs` | Number of parallel simulation environments |
+| `training.timesteps_per_batch` | Total environment steps collected per batch; steps/env = `timesteps_per_batch / num_envs` |
+| `training.num_fpo_samples` | Number of online samples per policy call (higher = more exploration) |
+| `training.n_updates_per_iteration` | Number of PPO-style updates per collected batch |
+| `training.num_minibatches` | Minibatch count for actor/critic updates (increase if OOM) |
+| `training.gamma` / `training.lmbda` | Discount factor and GAE lambda |
+| `training.clip_coef` | PPO clipping epsilon — lower = more conservative update |
+| `training.clamp_logratio` | Cap on the log-ratio between new and old policy |
+| `training.rho_max` | Max importance sampling ratio before clipping |
+| `training.max_grad_norm` | Global gradient norm clipping |
+| `training.max_timesteps_per_episode` | Max steps per rollout episode before truncation |
+| `training.point_cloud_sampling` | `fast` (GPU FPS) or `random` — point cloud downsampling method |
 
-FPO checkpoints are saved under:
+Key stability indicators in TensorBoard:
 
-```text
-policy/FPO/checkpoints/online_fpo-pretrain_ep<pretrain_epoch>-<seed>/<pretrain_epoch>-<online_iter>.ckpt
-```
+| Metric | Warning Sign |
+| --- | --- |
+| `clipped_ratio_frac` | Approaching 1.0: actor update too aggressive |
+| `rollout_action_abs_max` | Jumping from ~1-2 to 5+: policy likely diverging |
+| `rho_mean` | Large spikes: ratio instability |
 
-Warning: repeated runs with the same pretrain epoch and seed can overwrite the
-same checkpoint filenames. Rename or move useful checkpoints before launching a
-new run.
+If FPO diverges early, reduce `clip_coef`, `clamp_logratio`, and `rho_max`
+before increasing data volume.
 
-## Evaluate FPO
+## Evaluation
 
 ```bash
-cd /home/idiot/zhj/RoboTwin
-
-CUDA_VISIBLE_DEVICES=3 /home/idiot/anaconda3/envs/zhjrl/bin/python3.10 script/eval_maniskill_policy.py \
-  fpo \
-  /ABS/PATH/TO/FPO.ckpt \
-  HandoverBlock-v1 \
-  --task-profile handover_block_native_smoke \
+CUDA_VISIBLE_DEVICES=0 python script/eval_maniskill_policy.py \
+  flowmatching \
+  /path/to/checkpoint.ckpt \
+  HandoverBlockUR5-v2 \
+  --task-profile handover_block_ur5_v2_smoke \
   --episodes 50 \
   --seed 0 \
   --max-episode-steps 1000 \
   --sim-backend physx_cuda \
   --render-backend sapien_cuda \
-  --save-video-dir /home/idiot/zhj/RoboTwin/tmp/eval_fpo_videos \
+  --save-video-dir /tmp/eval_videos \
   --video-fps 10
 ```
 
-Do not only trust the scalar success rate. Watch several videos, especially
-after FPO fine-tuning, because unstable policies may satisfy isolated reward
-signals while producing physically poor behavior.
+**Positional arguments:**
 
-## TensorBoard
+| Arg | Description |
+| --- | --- |
+| `flowmatching` | Policy kind: `flowmatching` or `fpo` |
+| `/path/to/checkpoint.ckpt` | Path to the checkpoint to evaluate |
+| `HandoverBlockUR5-v2` | Environment ID |
 
-Flow Matching:
+**Key options:**
 
-```bash
-cd /home/idiot/zhj/RoboTwin/policy/FlowMatching
-tensorboard --logdir data/outputs --port 16006 --host 127.0.0.1
-```
+| Option | Description |
+| --- | --- |
+| `--episodes` | Number of evaluation episodes |
+| `--seed` | Starting seed (incremented per episode) |
+| `--max-episode-steps` | Max steps per episode |
+| `--save-video-dir` | Save rollout videos for visual inspection (strongly recommended) |
+| `--video-fps` | Frame rate of saved videos |
 
-FPO:
-
-```bash
-cd /home/idiot/zhj/RoboTwin/policy/FPO
-tensorboard --logdir data/outputs --port 16006 --host 127.0.0.1
-```
-
-FPO logs include `online/actor_loss`, `online/critic_loss`,
-`online/rho_mean`, `online/clipped_ratio_frac`, and rollout diagnostics such as
-`online/rollout_action_abs_max` and `online/rollout_reward_stage_mean`.
-
-## Dataset Validation and Replay
-
-Validate a generated zarr:
-
-```bash
-cd /home/idiot/zhj/RoboTwin
-
-/home/idiot/anaconda3/envs/zhjrl/bin/python3.10 script/check_maniskill_dataset.py \
-  /ABS/PATH/TO/DATASET.zarr \
-  --task-profile handover_block_native_smoke
-```
-
-Replay a few episodes:
-
-```bash
-/home/idiot/anaconda3/envs/zhjrl/bin/python3.10 script/check_maniskill_dataset.py \
-  /ABS/PATH/TO/DATASET.zarr \
-  --task-profile handover_block_native_smoke \
-  --smoke-replay \
-  --replay-episodes 3 \
-  --replay-steps 1000 \
-  --sim-backend physx_cuda:3 \
-  --render-backend sapien_cuda:3 \
-  --save-video-dir /home/idiot/zhj/RoboTwin/tmp/replay_videos
-```
-
-## Legacy Replay
-
-Old RoboTwin demonstrations can be replayed for diagnostics:
-
-```bash
-cd /home/idiot/zhj/RoboTwin
-
-/home/idiot/anaconda3/envs/zhjrl/bin/python3.10 script/collect_maniskill_data.py \
-  HandoverBlock-v1 legacy_replay_check 1 \
-  --task-profile handover_block_native_legacy_rng_smoke \
-  --collector legacy_replay \
-  --teacher-zarr-path /home/idiot/zhj/RoboTwin/policy/FlowMatching/data/handover_block-demo_clean-50.zarr \
-  --teacher-seed-path /home/idiot/zhj/RoboTwin/data/handover_block/demo_clean/seed.txt \
-  --max-episode-steps 800 \
-  --render-mode human \
-  --sim-backend physx_cuda:3 \
-  --render-backend sapien_cuda:3
-```
-
-This is not a guarantee that old actions are valid in the current environment.
-Controller, contact, and geometry differences can make old trajectories diverge.
-
-## Common Failure Modes
-
-### Renderer Cannot Create a Window
-
-Human rendering may only work on display-capable GPUs. For headless video,
-remove `--render-mode human` and use `--save-video-dir`.
-
-### Simulation and Rendering Device Mismatch
-
-Use matching backends:
-
-```bash
---sim-backend physx_cuda:3 --render-backend sapien_cuda:3
-```
-
-or expose one GPU:
-
-```bash
-CUDA_VISIBLE_DEVICES=1 ... --sim-backend physx_cuda --render-backend sapien_cuda
-```
-
-### FPO Checkpoint Produces Random Motion
-
-Inspect the training log before evaluating more checkpoints. If the run shows
-`rollout_action_abs_max` jumping to `5+` and `clipped_ratio_frac` near `1.0`,
-the checkpoint is already diverged.
-
-### FPO OOM After Rollout
-
-This usually happens during actor update, not simulation. Increase
-`training.num_minibatches` or reduce `training.num_fpo_samples` /
-`training.n_updates_per_iteration`.
-
-### Old Data Replays Fail
-
-Expected for some old demonstrations. Use old data for pretraining if it helps
-the policy learn coarse behavior, but do not assume old action replay is a valid
-success check in the current ManiSkill environment.
+For FPO checkpoints, replace `flowmatching` with `fpo`. Always inspect rollout
+videos alongside scalar success rates; unstable policies may satisfy isolated
+reward signals while producing poor physical behavior.
 
 ## Reproducibility Checklist
 
-For every experiment, record:
+For each experiment, record:
 
-- dataset zarr path and generation command
-- raw accepted `.npz` paths
-- base checkpoint path
-- exact train/eval command
-- seed and GPU id
-- TensorBoard or `logs.json.txt` directory
-- evaluation videos
-- success rate and qualitative notes
-
-Recommended minimum evaluation:
-
-- FM checkpoints: at least 50 episodes with saved videos
-- FPO checkpoints: evaluate early checkpoints first, e.g. 10-50 online
-  iterations, before running long fine-tuning
+- Dataset zarr path and generation command
+- Raw `.npz` source directories
+- Base checkpoint path (for FPO)
+- Exact train/eval commands with seeds and GPU assignments
+- TensorBoard log directory
+- Evaluation videos
+- Success rate and qualitative observations
 
 ## Citation
 
-If you use upstream RoboTwin components, cite the original RoboTwin project
-according to [README.md](README.md). Add the project-specific citation here when
-the paper is finalized.
+If you use upstream RoboTwin components, cite the original works:
+
+```bibtex
+@article{chen2025robotwin,
+  title={RoboTwin 2.0: A Scalable Data Generator and Benchmark with Strong
+         Domain Randomization for Robust Bimanual Robotic Manipulation},
+  author={Chen, Tianxing and Chen, Zanxin and Chen, Baijun and Cai, Zijian and
+          Liu, Yibin and Li, Zixuan and Liang, Qiwei and Lin, Xianliang and
+          Ge, Yiheng and Gu, Zhenyu and others},
+  journal={arXiv preprint arXiv:2506.18088},
+  year={2025}
+}
+
+@InProceedings{Mu_2025_CVPR,
+  author    = {Mu, Yao and Chen, Tianxing and Chen, Zanxin and Peng, Shijia and
+               Lan, Zhiqian and Gao, Zeyu and Liang, Zhixuan and Yu, Qiaojun and
+               Zou, Yude and Xu, Mingkun and Lin, Lunkai and Xie, Zhiqiang and
+               Ding, Mingyu and Luo, Ping},
+  title     = {RoboTwin: Dual-Arm Robot Benchmark with Generative Digital Twins},
+  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and
+               Pattern Recognition (CVPR)},
+  year      = {2025},
+  pages     = {27649-27660}
+}
+```
