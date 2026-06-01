@@ -84,6 +84,9 @@ ONLINE_ROLLOUT_DIAG_KEYS = (
     "rollout_reward_box_to_target_mean",
     "rollout_reward_left_holding_frac",
     "rollout_reward_right_holding_frac",
+    "rollout_chunk_steps_mean",
+    "rollout_policy_calls",
+    "rollout_env_steps",
 )
 
 
@@ -762,28 +765,44 @@ class RobotWorkspace(BaseWorkspace):
 
     def collect_rollout_maniskill_cuda_vector(self, env, device, num_envs):
         cfg_t = self.cfg.training
-        show_rollout_tqdm = bool(getattr(cfg_t, "show_rollout_tqdm", True))
-        rollout_tqdm_interval = float(getattr(cfg_t, "rollout_tqdm_interval_sec", 1.0))
         target_steps = int(cfg_t.timesteps_per_batch)
         max_ep_steps = int(cfg_t.max_timesteps_per_episode)
-        n_obs_steps = int(self.cfg.n_obs_steps)
+        n_obs_steps = int(self.model.n_obs_steps)
+        chunk_steps = max(1, int(self.model.n_action_steps))
+        reward_scaling = float(getattr(cfg_t, "reward_scaling", 1.0))
         base_num_fpo_samples = int(cfg_t.num_fpo_samples)
         max_total_fpo_samples = int(getattr(cfg_t, "max_total_fpo_samples_per_call", 0))
-        reward_scaling = float(getattr(cfg_t, "reward_scaling", 1.0))
+        show_rollout_tqdm = bool(getattr(cfg_t, "show_rollout_tqdm", True))
+        rollout_tqdm_interval = float(getattr(cfg_t, "rollout_tqdm_interval_sec", 1.0))
 
         obs, _ = env.reset()
         obs_hist = self._init_batched_obs_history(obs, n_obs_steps)
-
         ep_steps = [0 for _ in range(num_envs)]
+
+        reward_steps = []
+        value_steps = []
+        trunc_steps = []
+        discount_steps = []
+        boundary_steps = []
+        bootstrap_steps = []
         ep_len_totals = []
 
-        reward_steps, value_steps = [], []
-        trunc_steps, discount_steps, boundary_steps, bootstrap_steps = [], [], [], []
-        flat_critic_obs, flat_naction_target = [], []
-        flat_loss_eps, flat_loss_t, flat_init_cfm_loss = [], [], []
-        flat_cond_data, flat_cond_mask, flat_global_cond = [], [], []
-        action_abs_max_steps, action_abs_mean_steps = [], []
-        action_mean_steps, action_std_steps = [], []
+        flat_critic_obs = []
+        flat_actor_critic_obs = []
+        flat_actor_naction_target = []
+        flat_actor_loss_eps = []
+        flat_actor_loss_t = []
+        flat_actor_init_cfm_loss = []
+        flat_actor_cond_data = []
+        flat_actor_cond_mask = []
+        flat_actor_global_cond = []
+        actor_start_step_indices = []
+        chunk_step_counts = []
+
+        action_abs_max_steps = []
+        action_abs_mean_steps = []
+        action_mean_steps = []
+        action_std_steps = []
         info_metric_keys = (
             "reward_stage",
             "reward_left_to_box",
@@ -807,6 +826,28 @@ class RobotWorkspace(BaseWorkspace):
                 tensor = torch.as_tensor(value, device=device, dtype=torch.float32).reshape(-1)
             if tensor.numel() > 0:
                 info_metric_steps[key].append(tensor)
+
+        def scalar_mean(values):
+            if not values:
+                return 0.0
+            return float(torch.stack(values).mean().detach().cpu().item())
+
+        def scalar_max(values):
+            if not values:
+                return 0.0
+            return float(torch.stack(values).max().detach().cpu().item())
+
+        def metric_values(key):
+            values = info_metric_steps.get(key, [])
+            if not values:
+                return None
+            return torch.cat(values, dim=0)
+
+        def metric_mean(key):
+            values = metric_values(key)
+            if values is None or values.numel() == 0:
+                return 0.0
+            return float(values.mean().detach().cpu().item())
 
         steps = 0
         rollout_pbar = None
@@ -832,82 +873,153 @@ class RobotWorkspace(BaseWorkspace):
                         obs_hist,
                         num_fpo_samples=num_fpo_samples,
                     )
-                    critic_in = out["global_cond"]
-                    v = self.critic(critic_in).squeeze(-1)
 
-                actions = out["action"][:, 0].detach()
-                action_stats = actions.detach().to(device=device, dtype=torch.float32)
-                action_abs_max_steps.append(action_stats.abs().amax())
-                action_abs_mean_steps.append(action_stats.abs().mean())
-                action_mean_steps.append(action_stats.mean())
-                action_std_steps.append(action_stats.std(unbiased=False))
+                action_chunk = out["action"].detach()
+                chunk_limit = min(chunk_steps, int(action_chunk.shape[1]))
+                executed_actions = []
+                chunk_start_step = len(reward_steps)
 
-                next_obs, rew, terminated, truncated, info = env.step(actions)
-                for info_metric_key in info_metric_keys:
-                    append_info_metric(info, info_metric_key)
-                done_tensor = torch.logical_or(terminated, truncated)
-                next_obs_hist = self._append_batched_obs_history(obs_hist, next_obs)
+                for chunk_i in range(chunk_limit):
+                    if steps >= target_steps:
+                        break
 
-                reward_steps.append((rew.detach().to(device=device, dtype=torch.float32) * reward_scaling))
-                value_steps.append(v.detach().to(device=device, dtype=torch.float32))
-                trunc_steps.append(truncated.detach().to(device=device, dtype=torch.float32))
-                discount_steps.append((~terminated).detach().to(device=device, dtype=torch.float32))
-
-                finished_env_ids = []
-                done_env_ids = done_tensor.nonzero(as_tuple=False).flatten().detach().cpu().tolist()
-                done_env_id_set = set(done_env_ids)
-                reached_max_env_ids = []
-                for env_id in range(num_envs):
-                    ep_steps[env_id] += 1
-                    if ep_steps[env_id] >= max_ep_steps and env_id not in done_env_id_set:
-                        reached_max_env_ids.append(env_id)
-
-                finished_env_ids = sorted(set(done_env_ids + reached_max_env_ids))
-                boundary = torch.zeros(num_envs, device=device, dtype=torch.float32)
-                if finished_env_ids:
-                    boundary[torch.as_tensor(finished_env_ids, device=device, dtype=torch.long)] = 1.0
-                boundary_steps.append(boundary)
-
-                if finished_env_ids:
                     with torch.inference_mode():
-                        last_v_all = self.critic(
-                            self._build_critic_input_from_obs(next_obs_hist)
-                        ).squeeze(-1)
-                    bootstrap_steps.append(last_v_all.detach().to(device=device, dtype=torch.float32))
+                        if chunk_i == 0:
+                            critic_in = out["global_cond"]
+                        else:
+                            critic_in = self._build_critic_input_from_obs(obs_hist)
+                        v = self.critic(critic_in).squeeze(-1)
 
-                    for env_id in finished_env_ids:
-                        ep_len_totals.append(ep_steps[env_id])
-                        ep_steps[env_id] = 0
-                else:
-                    bootstrap_steps.append(torch.zeros(num_envs, device=device, dtype=torch.float32))
+                    actions = action_chunk[:, chunk_i].detach()
+                    action_stats = actions.detach().to(device=device, dtype=torch.float32)
+                    action_abs_max_steps.append(action_stats.abs().amax())
+                    action_abs_mean_steps.append(action_stats.abs().mean())
+                    action_mean_steps.append(action_stats.mean())
+                    action_std_steps.append(action_stats.std(unbiased=False))
 
-                if done_env_ids:
-                    reset_obs = None
-                    for env_id in done_env_ids:
-                        reset_obs, _ = env.reset_at([env_id])
-                    if reset_obs is not None:
-                        self._reset_batched_obs_history_envs(next_obs_hist, reset_obs, done_env_ids)
+                    next_obs, rew, terminated, truncated, info = env.step(actions)
+                    for info_metric_key in info_metric_keys:
+                        append_info_metric(info, info_metric_key)
+                    done_tensor = torch.logical_or(terminated, truncated)
+                    next_obs_hist = self._append_batched_obs_history(obs_hist, next_obs)
 
-                if reached_max_env_ids:
-                    self._reset_batched_obs_history_envs(
-                        next_obs_hist,
-                        next_obs,
-                        reached_max_env_ids,
+                    reward_steps.append((rew.detach().to(device=device, dtype=torch.float32) * reward_scaling))
+                    value_steps.append(v.detach().to(device=device, dtype=torch.float32))
+                    trunc_steps.append(truncated.detach().to(device=device, dtype=torch.float32))
+                    discount_steps.append((~terminated).detach().to(device=device, dtype=torch.float32))
+                    flat_critic_obs.append(critic_in.detach())
+                    executed_actions.append(actions)
+
+                    done_env_ids = done_tensor.nonzero(as_tuple=False).flatten().detach().cpu().tolist()
+                    done_env_id_set = set(done_env_ids)
+                    reached_max_env_ids = []
+                    for env_id in range(num_envs):
+                        ep_steps[env_id] += 1
+                        if ep_steps[env_id] >= max_ep_steps and env_id not in done_env_id_set:
+                            reached_max_env_ids.append(env_id)
+
+                    finished_env_ids = sorted(set(done_env_ids + reached_max_env_ids))
+                    boundary = torch.zeros(num_envs, device=device, dtype=torch.float32)
+                    if finished_env_ids:
+                        boundary[torch.as_tensor(finished_env_ids, device=device, dtype=torch.long)] = 1.0
+                    boundary_steps.append(boundary)
+
+                    if finished_env_ids:
+                        with torch.inference_mode():
+                            last_v_all = self.critic(
+                                self._build_critic_input_from_obs(next_obs_hist)
+                            ).squeeze(-1)
+                        bootstrap_steps.append(last_v_all.detach().to(device=device, dtype=torch.float32))
+                        for env_id in finished_env_ids:
+                            ep_len_totals.append(ep_steps[env_id])
+                            ep_steps[env_id] = 0
+                    else:
+                        bootstrap_steps.append(torch.zeros(num_envs, device=device, dtype=torch.float32))
+
+                    if done_env_ids:
+                        reset_obs = None
+                        for env_id in done_env_ids:
+                            reset_obs, _ = env.reset_at([env_id])
+                        if reset_obs is not None:
+                            self._reset_batched_obs_history_envs(next_obs_hist, reset_obs, done_env_ids)
+
+                    if reached_max_env_ids:
+                        self._reset_batched_obs_history_envs(
+                            next_obs_hist,
+                            next_obs,
+                            reached_max_env_ids,
+                        )
+
+                    obs_hist = next_obs_hist
+                    steps += num_envs
+                    if rollout_pbar is not None:
+                        rollout_pbar.update(num_envs)
+
+                    if finished_env_ids:
+                        break
+
+                executed_len = len(executed_actions)
+                if executed_len == 0:
+                    continue
+
+                executed_chunk = torch.stack(executed_actions, dim=1)
+                normalized_chunk = self.model.normalizer["action"].normalize(executed_chunk)
+
+                B, N, T, Da = out["loss_eps"].shape
+                action_start = max(0, min(int(self.model.n_obs_steps) - 1, T))
+                valid_len = min(executed_len, max(0, T - action_start))
+                if valid_len <= 0:
+                    raise RuntimeError(
+                        f"Invalid FPO chunk alignment: executed_len={executed_len}, "
+                        f"n_obs_steps={self.model.n_obs_steps}, horizon={T}"
                     )
 
-                flat_critic_obs.append(critic_in.detach())
-                flat_naction_target.append(out["naction_pred"].detach())
-                flat_loss_eps.append(out["loss_eps"].detach())
-                flat_loss_t.append(out["loss_t"].detach())
-                flat_init_cfm_loss.append(out["initial_cfm_loss"].detach())
-                flat_cond_data.append(out["cond_data"].detach())
-                flat_cond_mask.append(out["cond_mask"].detach())
-                flat_global_cond.append(out["global_cond"].detach())
+                actor_target = torch.zeros((num_envs, T, Da), device=device, dtype=normalized_chunk.dtype)
+                actor_target[:, action_start:action_start + valid_len] = normalized_chunk[:, :valid_len]
 
-                obs_hist = next_obs_hist
-                steps += num_envs
-                if rollout_pbar is not None:
-                    rollout_pbar.update(num_envs)
+                # The policy network still expects the full prediction horizon.
+                # Only the actually executed slice contributes to FPO loss; the
+                # unexecuted timesteps are masked out and filled with the old
+                # policy sample so the temporal UNet sees a plausible context.
+                actor_cond_data = out["naction_pred"].detach().clone()
+                actor_cond_mask = torch.ones_like(actor_cond_data, dtype=torch.bool)
+                base_cond_mask = out["cond_mask"].detach().to(dtype=torch.bool)
+                actor_cond_mask[:, action_start:action_start + valid_len] = base_cond_mask[:, action_start:action_start + valid_len]
+
+                flat_target = actor_target.unsqueeze(1).expand(B, N, T, Da).reshape(B * N, T, Da)
+                flat_eps = out["loss_eps"].detach().reshape(B * N, T, Da)
+                flat_t = out["loss_t"].detach().reshape(B * N)
+                flat_cond_data = actor_cond_data.unsqueeze(1).expand(B, N, T, Da).reshape(B * N, T, Da)
+                flat_cond_mask = actor_cond_mask.unsqueeze(1).expand(B, N, T, Da).reshape(B * N, T, Da)
+                flat_global = out["global_cond"].detach().unsqueeze(1).expand(
+                    B, N, out["global_cond"].shape[-1]
+                ).reshape(B * N, out["global_cond"].shape[-1])
+                postdict = {
+                    "cond_data": flat_cond_data,
+                    "cond_mask": flat_cond_mask,
+                    "local_cond": None,
+                    "global_cond": flat_global,
+                }
+                with torch.inference_mode():
+                    initial_cfm_loss = self.model.compute_cfm_loss_with_fixed_noise_t(
+                        postdict,
+                        flat_target,
+                        flat_eps,
+                        flat_t,
+                        return_per_sample=True,
+                        postdict=True,
+                    ).reshape(B, N)
+
+                flat_actor_critic_obs.append(out["global_cond"].detach())
+                flat_actor_naction_target.append(actor_target.detach())
+                flat_actor_loss_eps.append(out["loss_eps"].detach())
+                flat_actor_loss_t.append(out["loss_t"].detach())
+                flat_actor_init_cfm_loss.append(initial_cfm_loss.detach())
+                flat_actor_cond_data.append(actor_cond_data.detach())
+                flat_actor_cond_mask.append(actor_cond_mask.detach())
+                flat_actor_global_cond.append(out["global_cond"].detach())
+                actor_start_step_indices.append(chunk_start_step)
+                chunk_step_counts.append(valid_len)
 
             if any(ep_step > 0 for ep_step in ep_steps):
                 with torch.inference_mode():
@@ -939,31 +1051,14 @@ class RobotWorkspace(BaseWorkspace):
             boundaries,
             bootstrap_values,
         )
+        advantages_2d = advantages.reshape(rewards.shape[0], num_envs)
+        actor_advantages = torch.stack(
+            [advantages_2d[start_idx] for start_idx in actor_start_step_indices],
+            dim=0,
+        ).reshape(-1)
 
         reward_mean = float(rewards.mean().detach().cpu().item()) if rewards.numel() > 0 else 0.0
         ep_len_mean = float(np.mean(ep_len_totals)) if len(ep_len_totals) > 0 else 0.0
-
-        def scalar_mean(values):
-            if not values:
-                return 0.0
-            return float(torch.stack(values).mean().detach().cpu().item())
-
-        def scalar_max(values):
-            if not values:
-                return 0.0
-            return float(torch.stack(values).max().detach().cpu().item())
-
-        def metric_values(key):
-            values = info_metric_steps.get(key, [])
-            if not values:
-                return None
-            return torch.cat(values, dim=0)
-
-        def metric_mean(key):
-            values = metric_values(key)
-            if values is None or values.numel() == 0:
-                return 0.0
-            return float(values.mean().detach().cpu().item())
 
         stage_values = metric_values("reward_stage")
         stage_mean = 0.0
@@ -979,15 +1074,21 @@ class RobotWorkspace(BaseWorkspace):
                 )
 
         rollout = {
+            "chunked_fpo": True,
             "critic_obs": torch.cat(flat_critic_obs, dim=0),
-            "naction_target": torch.cat(flat_naction_target, dim=0),
-            "cond_data": torch.cat(flat_cond_data, dim=0),
-            "cond_mask": torch.cat(flat_cond_mask, dim=0),
-            "global_cond": torch.cat(flat_global_cond, dim=0),
+            "returns": returns,
+            "advantages": advantages,
+            "actor_advantages": actor_advantages,
+            "actor_critic_obs": torch.cat(flat_actor_critic_obs, dim=0),
+            "naction_target": torch.cat(flat_actor_naction_target, dim=0),
+            "cond_data": torch.cat(flat_actor_cond_data, dim=0),
+            "cond_mask": torch.cat(flat_actor_cond_mask, dim=0),
+            "global_cond": torch.cat(flat_actor_global_cond, dim=0),
+            "loss_eps": torch.cat(flat_actor_loss_eps, dim=0),
+            "loss_t": torch.cat(flat_actor_loss_t, dim=0),
+            "initial_cfm_loss": torch.cat(flat_actor_init_cfm_loss, dim=0),
             "reward_mean": reward_mean,
             "ep_len_mean": ep_len_mean,
-            "advantages": advantages,
-            "returns": returns,
             "rollout_action_abs_max": scalar_max(action_abs_max_steps),
             "rollout_action_abs_mean": scalar_mean(action_abs_mean_steps),
             "rollout_action_mean": scalar_mean(action_mean_steps),
@@ -1005,14 +1106,24 @@ class RobotWorkspace(BaseWorkspace):
             "rollout_reward_box_to_target_mean": metric_mean("reward_box_to_target"),
             "rollout_reward_left_holding_frac": metric_mean("reward_left_holding"),
             "rollout_reward_right_holding_frac": metric_mean("reward_right_holding"),
+            "rollout_chunk_steps_mean": float(np.mean(chunk_step_counts)) if chunk_step_counts else 0.0,
+            "rollout_policy_calls": float(len(actor_start_step_indices)),
+            "rollout_env_steps": float(rewards.numel()),
         }
 
-        rollout["loss_eps"] = torch.cat(flat_loss_eps, dim=0)
-        rollout["loss_t"] = torch.cat(flat_loss_t, dim=0)
-        rollout["initial_cfm_loss"] = torch.cat(flat_init_cfm_loss, dim=0)
+        if rollout["critic_obs"].shape[0] != rollout["returns"].shape[0]:
+            raise RuntimeError(
+                "Chunked FPO rollout produced mismatched critic data: "
+                f"critic_obs={rollout['critic_obs'].shape[0]}, returns={rollout['returns'].shape[0]}"
+            )
+        if rollout["naction_target"].shape[0] != rollout["actor_advantages"].shape[0]:
+            raise RuntimeError(
+                "Chunked FPO rollout produced mismatched actor data: "
+                f"targets={rollout['naction_target'].shape[0]}, advantages={rollout['actor_advantages'].shape[0]}"
+            )
 
         return rollout
-    
+
     def collect_rollout_single(self, env, device):
         cfg_t = self.cfg.training
         suppress_env_step_print = bool(getattr(cfg_t, "suppress_env_step_print", True))
@@ -1368,10 +1479,154 @@ class RobotWorkspace(BaseWorkspace):
 
         return rollout
 
+    def update_fpo_chunked_from_rollout(self, rollout, device):
+        cfg_t = self.cfg.training
+        clip_coef = float(cfg_t.clip_coef)
+        n_updates = int(cfg_t.n_updates_per_iteration)
+        max_grad_norm = float(getattr(cfg_t, "max_grad_norm", 1.0))
+        value_loss_coeff = float(getattr(cfg_t, "value_loss_coeff", 0.25))
+
+        ratio_mode = str(getattr(cfg_t, "ratio_mode", "vanilla"))
+        clamp_logratio = getattr(cfg_t, "clamp_logratio", None)
+        if clamp_logratio is not None:
+            clamp_logratio = float(clamp_logratio)
+        rho_min = float(getattr(cfg_t, "rho_min", 1e-6))
+        rho_max = float(getattr(cfg_t, "rho_max", 100.0))
+
+        critic_obs = rollout["critic_obs"].to(device)
+        returns = rollout["returns"].to(device)
+
+        actor_advantages = rollout["actor_advantages"].to(device)
+        actor_advantages = (actor_advantages - actor_advantages.mean()) / (
+            actor_advantages.std(unbiased=False) + 1e-8
+        )
+        naction_target = rollout["naction_target"].to(device)
+        loss_eps = rollout["loss_eps"].to(device)
+        loss_t = rollout["loss_t"].to(device)
+        init_loss = rollout["initial_cfm_loss"].to(device)
+        cond_data = rollout["cond_data"].to(device)
+        cond_mask = rollout["cond_mask"].to(device)
+        global_cond = rollout["global_cond"].to(device)
+
+        actor_s = naction_target.shape[0]
+        critic_s = critic_obs.shape[0]
+        num_minibatches = int(getattr(cfg_t, "num_minibatches", 4))
+        actor_minibatch_size = max(1, actor_s // num_minibatches)
+        critic_minibatch_size = max(1, critic_s // num_minibatches)
+
+        actor_losses = []
+        critic_losses = []
+        ratio_means = []
+        cfm_diffs = []
+        clipped_ratio_fracs = []
+
+        for _ in range(n_updates):
+            actor_idx_all = torch.randperm(actor_s, device=device)
+            for start in range(0, actor_s, actor_minibatch_size):
+                idx = actor_idx_all[start:start + actor_minibatch_size]
+                if idx.numel() == 0:
+                    continue
+
+                mb_adv = actor_advantages[idx]
+                mb_naction = naction_target[idx]
+                mb_eps = loss_eps[idx]
+                mb_t = loss_t[idx]
+                mb_init = init_loss[idx]
+                mb_cond_data = cond_data[idx]
+                mb_cond_mask = cond_mask[idx]
+                mb_global = global_cond[idx]
+
+                B, N, T, Da = mb_eps.shape
+                flat_naction = mb_naction.unsqueeze(1).expand(B, N, T, Da).reshape(B * N, T, Da)
+                flat_eps = mb_eps.reshape(B * N, T, Da)
+                flat_t = mb_t.reshape(B * N)
+                flat_init = mb_init.reshape(B * N)
+                flat_cond_data = mb_cond_data.unsqueeze(1).expand(B, N, T, Da).reshape(B * N, T, Da)
+                flat_cond_mask = mb_cond_mask.unsqueeze(1).expand(B, N, T, Da).reshape(B * N, T, Da)
+                flat_global = mb_global.unsqueeze(1).expand(
+                    B, N, mb_global.shape[-1]
+                ).reshape(B * N, mb_global.shape[-1])
+
+                postdict = {
+                    "cond_data": flat_cond_data,
+                    "cond_mask": flat_cond_mask.bool(),
+                    "local_cond": None,
+                    "global_cond": flat_global,
+                }
+                curr = self.model.compute_cfm_loss_with_fixed_noise_t(
+                    postdict,
+                    flat_naction,
+                    flat_eps,
+                    flat_t,
+                    return_per_sample=True,
+                    postdict=True,
+                )
+
+                logratio = (flat_init - curr).reshape(B, N)
+                if clamp_logratio is not None:
+                    logratio = torch.clamp(logratio, min=-clamp_logratio, max=clamp_logratio)
+                cfm_diffs.append(float(logratio.mean().item()))
+
+                if ratio_mode == "vanilla":
+                    ratio = torch.exp(logratio.mean(dim=1))
+                    ratio = torch.clamp(ratio, rho_min, rho_max)
+                    clipped_frac = (torch.abs(ratio - 1.0) > clip_coef).float().mean()
+                    clipped_ratio_fracs.append(float(clipped_frac.item()))
+                    surr1 = ratio * mb_adv
+                    surr2 = torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef) * mb_adv
+                    actor_loss = (-torch.min(surr1, surr2)).mean()
+                elif ratio_mode == "per_sample":
+                    ratio = torch.exp(logratio)
+                    ratio = torch.clamp(ratio, rho_min, rho_max)
+                    adv = mb_adv.unsqueeze(1).expand_as(ratio)
+                    clipped_frac = (torch.abs(ratio - 1.0) > clip_coef).float().mean()
+                    clipped_ratio_fracs.append(float(clipped_frac.item()))
+                    surr1 = ratio * adv
+                    surr2 = torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef) * adv
+                    actor_loss = (-torch.min(surr1, surr2)).mean()
+                else:
+                    raise ValueError(f"Unknown ratio_mode: {ratio_mode}")
+
+                self.optimizer.zero_grad()
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+                self.optimizer.step()
+
+                actor_losses.append(float(actor_loss.item()))
+                ratio_means.append(float(ratio.mean().item()))
+
+            critic_idx_all = torch.randperm(critic_s, device=device)
+            for start in range(0, critic_s, critic_minibatch_size):
+                idx = critic_idx_all[start:start + critic_minibatch_size]
+                if idx.numel() == 0:
+                    continue
+                mb_ret = returns[idx]
+                ret_pred = self.critic(critic_obs[idx]).squeeze(-1)
+                ret_error = mb_ret - ret_pred
+                critic_loss = (ret_error.pow(2).mean()) * value_loss_coeff
+
+                self.critic_optimizer.zero_grad()
+                critic_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_grad_norm)
+                self.critic_optimizer.step()
+
+                critic_losses.append(float(critic_loss.item()))
+
+        return {
+            "actor_loss": float(np.mean(actor_losses)) if actor_losses else 0.0,
+            "critic_loss": float(np.mean(critic_losses)) if critic_losses else 0.0,
+            "rho_mean": float(np.mean(ratio_means)) if ratio_means else 0.0,
+            "cfm_diff_mean": float(np.mean(cfm_diffs)) if cfm_diffs else 0.0,
+            "clipped_ratio_frac": float(np.mean(clipped_ratio_fracs)) if clipped_ratio_fracs else 0.0,
+        }
+
     def update_fpo_from_rollout(self, rollout, device):
         """
         使用 rollout 做一次 FPO 更新（actor+critic）
         """
+        if bool(rollout.get("chunked_fpo", False)):
+            return self.update_fpo_chunked_from_rollout(rollout, device)
+
         cfg_t = self.cfg.training
         clip_coef = float(cfg_t.clip_coef)
         n_updates = int(cfg_t.n_updates_per_iteration)
