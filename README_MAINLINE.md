@@ -293,7 +293,7 @@ CUDA_VISIBLE_DEVICES=0 python script/eval_maniskill_policy.py \
   --max-episode-steps 1000 \
   --sim-backend physx_cuda \
   --render-backend sapien_cuda \
-  --save-video-dir /tmp/eval_videos \
+  --save-video-dir /home/idiot/zhj/RoboTwin/eval_videos/checkpoint_name \
   --video-fps 10
 ```
 
