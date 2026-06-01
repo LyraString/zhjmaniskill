@@ -778,6 +778,10 @@ class RobotWorkspace(BaseWorkspace):
         obs, _ = env.reset()
         obs_hist = self._init_batched_obs_history(obs, n_obs_steps)
         ep_steps = [0 for _ in range(num_envs)]
+        fpo_reward_stage = torch.zeros(num_envs, device=device, dtype=torch.float32)
+        fpo_reward_potential = torch.zeros(num_envs, device=device, dtype=torch.float32)
+        fpo_reward_has_potential = torch.zeros(num_envs, device=device, dtype=torch.bool)
+        fpo_reward_success_awarded = torch.zeros(num_envs, device=device, dtype=torch.bool)
 
         reward_steps = []
         value_steps = []
@@ -849,6 +853,101 @@ class RobotWorkspace(BaseWorkspace):
                 return 0.0
             return float(values.mean().detach().cpu().item())
 
+        def info_tensor(info, key, dtype=torch.float32):
+            if not isinstance(info, dict) or key not in info:
+                return None
+            value = info[key]
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                tensor = value.detach().to(device=device, dtype=dtype).reshape(-1)
+            else:
+                tensor = torch.as_tensor(value, device=device, dtype=dtype).reshape(-1)
+            if tensor.numel() != num_envs:
+                return None
+            return tensor
+
+        def compute_fpo_reward(env_reward, info):
+            nonlocal fpo_reward_stage
+            nonlocal fpo_reward_potential
+            nonlocal fpo_reward_has_potential
+            nonlocal fpo_reward_success_awarded
+
+            required_keys = (
+                "reward_stage",
+                "reward_left_to_box",
+                "reward_right_to_box",
+                "reward_box_to_handover",
+                "reward_box_to_target",
+                "success",
+            )
+            if not isinstance(info, dict) or any(key not in info for key in required_keys):
+                return env_reward
+
+            stage = info_tensor(info, "reward_stage")
+            left_to_box = info_tensor(info, "reward_left_to_box")
+            right_to_box = info_tensor(info, "reward_right_to_box")
+            box_to_handover = info_tensor(info, "reward_box_to_handover")
+            box_to_target = info_tensor(info, "reward_box_to_target")
+            success = info_tensor(info, "success", dtype=torch.bool)
+            if any(value is None for value in (stage, left_to_box, right_to_box, box_to_handover, box_to_target, success)):
+                return env_reward
+
+            stage_id = stage.round().to(dtype=torch.long).clamp(0, 4)
+            prev_stage_id = fpo_reward_stage.round().to(dtype=torch.long).clamp(0, 4)
+
+            stage_bonus = torch.zeros(num_envs, device=device, dtype=torch.float32)
+            for next_stage, bonus in ((1, 8.0), (2, 10.0), (3, 15.0), (4, 20.0)):
+                crossed = (prev_stage_id < next_stage) & (stage_id >= next_stage)
+                stage_bonus = stage_bonus + crossed.to(dtype=torch.float32) * bonus
+
+            left_potential = torch.exp(-8.0 * left_to_box)
+            handover_potential = torch.exp(-6.0 * box_to_handover)
+            right_potential = torch.exp(-8.0 * right_to_box)
+            target_potential = torch.exp(-10.0 * box_to_target)
+            potential = torch.where(
+                stage_id <= 0,
+                left_potential,
+                torch.where(
+                    stage_id == 1,
+                    handover_potential,
+                    torch.where(stage_id == 2, right_potential, target_potential),
+                ),
+            )
+
+            same_stage = stage_id == prev_stage_id
+            potential_delta = torch.where(
+                fpo_reward_has_potential & same_stage,
+                potential - fpo_reward_potential,
+                torch.zeros_like(potential),
+            )
+            potential_delta = torch.clamp(potential_delta, min=-1.0, max=1.0)
+
+            new_success = success & (~fpo_reward_success_awarded)
+            reward = stage_bonus
+            reward = reward + 3.0 * potential_delta
+            reward = reward + new_success.to(dtype=torch.float32) * 120.0
+            reward = reward - 0.02
+
+            fpo_reward_stage = stage.detach()
+            fpo_reward_potential = potential.detach()
+            fpo_reward_has_potential = torch.ones_like(fpo_reward_has_potential, dtype=torch.bool)
+            fpo_reward_success_awarded = fpo_reward_success_awarded | success.detach()
+            return reward
+
+        def reset_fpo_reward_state(env_ids):
+            nonlocal fpo_reward_stage
+            nonlocal fpo_reward_potential
+            nonlocal fpo_reward_has_potential
+            nonlocal fpo_reward_success_awarded
+            if not env_ids:
+                return
+            env_idx = torch.as_tensor(env_ids, device=device, dtype=torch.long)
+            fpo_reward_stage[env_idx] = 0.0
+            fpo_reward_potential[env_idx] = 0.0
+            fpo_reward_has_potential[env_idx] = False
+            fpo_reward_success_awarded[env_idx] = False
+
         steps = 0
         rollout_pbar = None
         if show_rollout_tqdm:
@@ -903,7 +1002,9 @@ class RobotWorkspace(BaseWorkspace):
                     done_tensor = torch.logical_or(terminated, truncated)
                     next_obs_hist = self._append_batched_obs_history(obs_hist, next_obs)
 
-                    reward_steps.append((rew.detach().to(device=device, dtype=torch.float32) * reward_scaling))
+                    env_reward = rew.detach().to(device=device, dtype=torch.float32)
+                    fpo_reward = compute_fpo_reward(env_reward, info)
+                    reward_steps.append(fpo_reward * reward_scaling)
                     value_steps.append(v.detach().to(device=device, dtype=torch.float32))
                     trunc_steps.append(truncated.detach().to(device=device, dtype=torch.float32))
                     discount_steps.append((~terminated).detach().to(device=device, dtype=torch.float32))
@@ -933,6 +1034,7 @@ class RobotWorkspace(BaseWorkspace):
                         for env_id in finished_env_ids:
                             ep_len_totals.append(ep_steps[env_id])
                             ep_steps[env_id] = 0
+                        reset_fpo_reward_state(finished_env_ids)
                     else:
                         bootstrap_steps.append(torch.zeros(num_envs, device=device, dtype=torch.float32))
 
