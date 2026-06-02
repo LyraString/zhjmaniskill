@@ -451,6 +451,34 @@ class FPOImagePolicy(BaseImagePolicy):
         else:
             return loss.mean()
 
+    def compute_cfm_velocity_with_fixed_noise_t(self, obs_dict: Dict[str, torch.Tensor],
+                                                naction_target: torch.Tensor, noise: torch.Tensor,
+                                                t: torch.Tensor, postdict=False):
+        # Return the predicted flow velocity for the same fixed-noise CFM points
+        # used by FPO, plus the non-conditioned mask where losses are valid.
+        assert naction_target.shape == noise.shape
+        if not self.obs_as_global_cond:
+            raise NotImplementedError(
+                "当前实现仅支持 obs_as_global_cond=True。"
+            )
+
+        if postdict:
+            prep_dict = obs_dict
+        else:
+            prep_dict = self.build_condition_from_obs(obs_dict)
+        cond_data, cond_mask, local_cond, global_cond = prep_dict["cond_data"], prep_dict["cond_mask"], prep_dict["local_cond"], prep_dict["global_cond"]
+
+        x_1 = naction_target
+        x_0 = noise.to(device=x_1.device, dtype=x_1.dtype)
+
+        t_expanded = t.to(device=x_1.device, dtype=x_1.dtype).view(-1, 1, 1)
+        x_t = t_expanded * x_1 + (1.0 - t_expanded) * x_0
+        x_t[cond_mask] = cond_data[cond_mask]
+
+        timesteps = (t * 999).long()
+        pred_v = self.model(x_t, timesteps, local_cond=local_cond, global_cond=global_cond)
+        return pred_v, ~cond_mask
+
     # 采样动作 + 产出FPO训练所需信息
     def sample_action_with_info(self, obs_dict: Dict[str, torch.Tensor], num_fpo_samples, return_path=False):
         N = int(num_fpo_samples)

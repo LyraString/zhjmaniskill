@@ -99,6 +99,7 @@ def _format_online_progress(it, total, step_log):
     critic_loss = _safe_float(step_log.get("critic_loss", 0.0))
     rho_mean = _safe_float(step_log.get("rho_mean", 0.0))
     clipped_ratio_frac = _safe_float(step_log.get("clipped_ratio_frac", 0.0))
+    velocity_kl_mean = _safe_float(step_log.get("velocity_kl_mean", 0.0))
     stage_mean = _safe_float(step_log.get("rollout_reward_stage_mean", 0.0))
     action_abs_max = _safe_float(step_log.get("rollout_action_abs_max", 0.0))
 
@@ -106,7 +107,7 @@ def _format_online_progress(it, total, step_log):
         f"[online_fpo] iter {iter_idx}/{total_iters} | "
         f"reward={mean_reward:.4f} | "
         f"actor={actor_loss:.4f} critic={critic_loss:.4f} | "
-        f"rho={rho_mean:.4f} clip_frac={clipped_ratio_frac:.4f} | "
+        f"rho={rho_mean:.4f} clip_frac={clipped_ratio_frac:.4f} vkl={velocity_kl_mean:.6f} | "
         f"stage={stage_mean:.2f} action_abs_max={action_abs_max:.3f}"
     )
 # --------------------------------新增结束--------------------------------
@@ -147,6 +148,7 @@ def _payload_has_model_normalizer(payload: dict) -> bool:
 
 class RobotWorkspace(BaseWorkspace):
     include_keys = ["global_step", "epoch"]
+    exclude_keys = ("ref_model",)
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
@@ -159,6 +161,7 @@ class RobotWorkspace(BaseWorkspace):
 
         # configure model
         self.model: BaseImagePolicy = hydra.utils.instantiate(cfg.policy)
+        self.ref_model: BaseImagePolicy = None
 
         self.ema_model: BaseImagePolicy = None
         if cfg.training.use_ema:
@@ -239,6 +242,12 @@ class RobotWorkspace(BaseWorkspace):
             if cfg.training.use_ema:
                 self.ema_model.set_normalizer(normalizer)
 
+        velocity_kl_coeff = float(getattr(cfg.training, "velocity_kl_coeff", 0.0))
+        if velocity_kl_coeff > 0.0:
+            self.ref_model = copy.deepcopy(self.model)
+            self.ref_model.eval()
+            self.ref_model.requires_grad_(False)
+
         # configure lr scheduler
         lr_scheduler = None
         if train_dataloader is not None:
@@ -287,6 +296,8 @@ class RobotWorkspace(BaseWorkspace):
         self.model.to(device)
         if self.ema_model is not None:
             self.ema_model.to(device)
+        if self.ref_model is not None:
+            self.ref_model.to(device)
         optimizer_to(self.optimizer, device)
 
         # 设备迁移
@@ -610,6 +621,7 @@ class RobotWorkspace(BaseWorkspace):
                             tb_writer.add_scalar("online/rho_mean", _safe_float(step_log["rho_mean"]), tb_step)
                             tb_writer.add_scalar("online/cfm_diff_mean", _safe_float(step_log["cfm_diff_mean"]), tb_step)
                             tb_writer.add_scalar("online/clipped_ratio_frac", _safe_float(step_log["clipped_ratio_frac"]), tb_step)
+                            tb_writer.add_scalar("online/velocity_kl_mean", _safe_float(step_log.get("velocity_kl_mean", 0.0)), tb_step)
                             for diag_key in ONLINE_ROLLOUT_DIAG_KEYS:
                                 if diag_key in step_log:
                                     tb_writer.add_scalar(f"online/{diag_key}", _safe_float(step_log[diag_key]), tb_step)
@@ -1587,6 +1599,9 @@ class RobotWorkspace(BaseWorkspace):
         n_updates = int(cfg_t.n_updates_per_iteration)
         max_grad_norm = float(getattr(cfg_t, "max_grad_norm", 1.0))
         value_loss_coeff = float(getattr(cfg_t, "value_loss_coeff", 0.25))
+        velocity_kl_coeff = float(getattr(cfg_t, "velocity_kl_coeff", 0.0))
+        if velocity_kl_coeff > 0.0 and self.ref_model is None:
+            raise RuntimeError("training.velocity_kl_coeff > 0 requires an initialized ref_model.")
 
         ratio_mode = str(getattr(cfg_t, "ratio_mode", "vanilla"))
         clamp_logratio = getattr(cfg_t, "clamp_logratio", None)
@@ -1621,6 +1636,7 @@ class RobotWorkspace(BaseWorkspace):
         ratio_means = []
         cfm_diffs = []
         clipped_ratio_fracs = []
+        velocity_kl_losses = []
 
         for _ in range(n_updates):
             actor_idx_all = torch.randperm(actor_s, device=device)
@@ -1689,6 +1705,29 @@ class RobotWorkspace(BaseWorkspace):
                 else:
                     raise ValueError(f"Unknown ratio_mode: {ratio_mode}")
 
+                if velocity_kl_coeff > 0.0:
+                    pred_v, velocity_mask = self.model.compute_cfm_velocity_with_fixed_noise_t(
+                        postdict,
+                        flat_naction,
+                        flat_eps,
+                        flat_t,
+                        postdict=True,
+                    )
+                    with torch.no_grad():
+                        ref_v, _ = self.ref_model.compute_cfm_velocity_with_fixed_noise_t(
+                            postdict,
+                            flat_naction,
+                            flat_eps,
+                            flat_t,
+                            postdict=True,
+                        )
+                    velocity_mask = velocity_mask.to(dtype=pred_v.dtype)
+                    velocity_kl_per_sample = ((pred_v - ref_v).pow(2) * velocity_mask).reshape(B * N, -1).sum(dim=1)
+                    velocity_kl_den = velocity_mask.reshape(B * N, -1).sum(dim=1).clamp_min(1.0)
+                    velocity_kl_loss = (velocity_kl_per_sample / velocity_kl_den).reshape(B, N).mean()
+                    actor_loss = actor_loss + velocity_kl_coeff * velocity_kl_loss
+                    velocity_kl_losses.append(float(velocity_kl_loss.detach().item()))
+
                 self.optimizer.zero_grad()
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
@@ -1720,6 +1759,7 @@ class RobotWorkspace(BaseWorkspace):
             "rho_mean": float(np.mean(ratio_means)) if ratio_means else 0.0,
             "cfm_diff_mean": float(np.mean(cfm_diffs)) if cfm_diffs else 0.0,
             "clipped_ratio_frac": float(np.mean(clipped_ratio_fracs)) if clipped_ratio_fracs else 0.0,
+            "velocity_kl_mean": float(np.mean(velocity_kl_losses)) if velocity_kl_losses else 0.0,
         }
 
     def update_fpo_from_rollout(self, rollout, device):

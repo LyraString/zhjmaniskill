@@ -19,3 +19,4 @@ training:
   checkpoint_every: 100
   max_total_fpo_samples_per_call: 32
   num_fpo_samples: 2
+  velocity_kl_coeff: 0.01
