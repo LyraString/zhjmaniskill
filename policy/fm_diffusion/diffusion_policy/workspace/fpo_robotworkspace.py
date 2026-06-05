@@ -983,6 +983,9 @@ class RobotWorkspace(BaseWorkspace):
                     out = self.model.sample_action_with_info(
                         obs_hist,
                         num_fpo_samples=num_fpo_samples,
+                        # This path recomputes the old-policy loss below from the
+                        # action chunk that was actually executed.
+                        compute_initial_cfm_loss=False,
                     )
 
                 action_chunk = out["action"].detach()
@@ -1671,14 +1674,25 @@ class RobotWorkspace(BaseWorkspace):
                     "local_cond": None,
                     "global_cond": flat_global,
                 }
-                curr = self.model.compute_cfm_loss_with_fixed_noise_t(
-                    postdict,
-                    flat_naction,
-                    flat_eps,
-                    flat_t,
-                    return_per_sample=True,
-                    postdict=True,
-                )
+                if velocity_kl_coeff > 0.0:
+                    curr, pred_v, velocity_mask = self.model.compute_cfm_loss_with_fixed_noise_t(
+                        postdict,
+                        flat_naction,
+                        flat_eps,
+                        flat_t,
+                        return_per_sample=True,
+                        postdict=True,
+                        return_pred_v=True,
+                    )
+                else:
+                    curr = self.model.compute_cfm_loss_with_fixed_noise_t(
+                        postdict,
+                        flat_naction,
+                        flat_eps,
+                        flat_t,
+                        return_per_sample=True,
+                        postdict=True,
+                    )
 
                 logratio = (flat_init - curr).reshape(B, N)
                 if clamp_logratio is not None:
@@ -1706,13 +1720,8 @@ class RobotWorkspace(BaseWorkspace):
                     raise ValueError(f"Unknown ratio_mode: {ratio_mode}")
 
                 if velocity_kl_coeff > 0.0:
-                    pred_v, velocity_mask = self.model.compute_cfm_velocity_with_fixed_noise_t(
-                        postdict,
-                        flat_naction,
-                        flat_eps,
-                        flat_t,
-                        postdict=True,
-                    )
+                    # pred_v comes from the CFM loss forward above; only the
+                    # frozen reference policy needs another forward here.
                     with torch.no_grad():
                         ref_v, _ = self.ref_model.compute_cfm_velocity_with_fixed_noise_t(
                             postdict,

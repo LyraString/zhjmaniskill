@@ -412,7 +412,7 @@ class FPOImagePolicy(BaseImagePolicy):
     def compute_cfm_loss_with_fixed_noise_t(self, obs_dict: Dict[str, torch.Tensor],
                                             naction_target: torch.Tensor, noise: torch.Tensor,
                                             t: torch.Tensor, return_per_sample=False, 
-                                            postdict=False):
+                                            postdict=False, return_pred_v=False):
         # naction_target must stay in normalized action space.
         assert naction_target.shape == noise.shape
         if not self.obs_as_global_cond:
@@ -446,10 +446,12 @@ class FPOImagePolicy(BaseImagePolicy):
         # loss = reduce(loss, "b ... -> b (...)", "mean")
         loss = loss.reshape(loss.shape[0], -1).sum(dim=1)
 
-        if return_per_sample:
-            return loss
-        else:
-            return loss.mean()
+        result = loss if return_per_sample else loss.mean()
+        if return_pred_v:
+            # The actor update reuses this velocity for KL instead of forwarding
+            # the current policy a second time at the same fixed-noise points.
+            return result, pred_v, loss_mask
+        return result
 
     def compute_cfm_velocity_with_fixed_noise_t(self, obs_dict: Dict[str, torch.Tensor],
                                                 naction_target: torch.Tensor, noise: torch.Tensor,
@@ -480,7 +482,8 @@ class FPOImagePolicy(BaseImagePolicy):
         return pred_v, ~cond_mask
 
     # 采样动作 + 产出FPO训练所需信息
-    def sample_action_with_info(self, obs_dict: Dict[str, torch.Tensor], num_fpo_samples, return_path=False):
+    def sample_action_with_info(self, obs_dict: Dict[str, torch.Tensor], num_fpo_samples,
+                                return_path=False, compute_initial_cfm_loss=True):
         N = int(num_fpo_samples)
         conds_dict = self.build_condition_from_obs(obs_dict)
         cond_data, cond_mask, local_cond, global_cond = conds_dict["cond_data"], conds_dict["cond_mask"], conds_dict["local_cond"], conds_dict["global_cond"]
@@ -522,22 +525,30 @@ class FPOImagePolicy(BaseImagePolicy):
         else:
             t = torch.rand(B * N, device=x1.device)
 
-        # obs_tiled = dict_apply(obs_dict, lambda x: x.repeat_interleave(N, dim=0))
-        def repeat_bn(tensor):
-            if tensor is None: return None
-            return tensor.repeat_interleave(N, dim=0)
+        initial_cfm_loss = None
+        if compute_initial_cfm_loss:
+            # obs_tiled = dict_apply(obs_dict, lambda x: x.repeat_interleave(N, dim=0))
+            def repeat_bn(tensor):
+                if tensor is None: return None
+                return tensor.repeat_interleave(N, dim=0)
 
-        obs_tiled = {
-            "cond_data": repeat_bn(conds_dict["cond_data"]),
-            "cond_mask": repeat_bn(conds_dict["cond_mask"]),
-            "local_cond": repeat_bn(conds_dict["local_cond"]),
-            "global_cond": repeat_bn(conds_dict["global_cond"]),
-        }
+            obs_tiled = {
+                "cond_data": repeat_bn(conds_dict["cond_data"]),
+                "cond_mask": repeat_bn(conds_dict["cond_mask"]),
+                "local_cond": repeat_bn(conds_dict["local_cond"]),
+                "global_cond": repeat_bn(conds_dict["global_cond"]),
+            }
 
-        # 计算初始CFM损失
-        initial_cfm_loss = self.compute_cfm_loss_with_fixed_noise_t(obs_tiled, x1, eps,
-                                                                    t, return_per_sample=True, postdict=True)
-        initial_cfm_loss = initial_cfm_loss.detach().reshape(B, N)
+            # 计算初始CFM损失
+            initial_cfm_loss = self.compute_cfm_loss_with_fixed_noise_t(
+                obs_tiled,
+                x1,
+                eps,
+                t,
+                return_per_sample=True,
+                postdict=True,
+            )
+            initial_cfm_loss = initial_cfm_loss.detach().reshape(B, N)
 
         return {
             "action": action,                         # unnormalized action used by env.step
