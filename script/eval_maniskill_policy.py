@@ -32,6 +32,73 @@ def _to_bool_scalar(value) -> bool:
     return bool(value)
 
 
+def _to_float_scalar_or_none(value):
+    if value is None:
+        return None
+    if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "numpy"):
+        value = value.detach().cpu().numpy()
+    array = np.asarray(value).reshape(-1)
+    if array.size == 0:
+        return None
+    return float(array[0])
+
+
+def _new_handover_diag():
+    return {
+        "has_stage": False,
+        "max_stage": -1,
+        "final_stage": -1,
+        "left_hold_sum": 0.0,
+        "right_hold_sum": 0.0,
+        "hold_count": 0,
+        "box_to_target": None,
+    }
+
+
+def _update_handover_diag(diag, info) -> None:
+    stage = _to_float_scalar_or_none(info.get("reward_stage"))
+    if stage is None:
+        return
+
+    stage_id = int(round(stage))
+    clamped_stage_id = min(4, max(0, stage_id))
+    diag["has_stage"] = True
+    diag["max_stage"] = max(diag["max_stage"], clamped_stage_id)
+    diag["final_stage"] = clamped_stage_id
+
+    left_hold = _to_float_scalar_or_none(info.get("reward_left_holding"))
+    right_hold = _to_float_scalar_or_none(info.get("reward_right_holding"))
+    if left_hold is not None or right_hold is not None:
+        diag["left_hold_sum"] += 0.0 if left_hold is None else left_hold
+        diag["right_hold_sum"] += 0.0 if right_hold is None else right_hold
+        diag["hold_count"] += 1
+
+    box_to_target = _to_float_scalar_or_none(info.get("reward_box_to_target"))
+    if box_to_target is not None:
+        diag["box_to_target"] = box_to_target
+
+
+def _classify_handover_failure(diag, success: bool) -> str:
+    if success:
+        return "success"
+    if not diag["has_stage"]:
+        return "unknown"
+    max_stage = int(diag["max_stage"])
+    if max_stage < 1:
+        return "failed_left_grasp"
+    if max_stage < 3:
+        return "failed_handover"
+    if max_stage == 3:
+        return "failed_right_carry"
+    return "failed_place_or_release"
+
+
+def _format_optional_float(value, precision: int = 3) -> str:
+    if value is None:
+        return "nan"
+    return f"{float(value):.{precision}f}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate a ManiSkill checkpoint in a ManiSkill env.")
     parser.add_argument("policy_kind", choices=sorted(ADAPTER_MODULES.keys()))
@@ -122,6 +189,7 @@ def run_evaluation(args) -> None:
     returns = []
     lengths = []
     successes = []
+    handover_diags = []
 
     try:
         for episode_idx in range(args.episodes):
@@ -149,6 +217,7 @@ def run_evaluation(args) -> None:
             if video_dir is not None:
                 _maybe_capture_frame(env, frames)
             result = None
+            handover_diag = _new_handover_diag()
 
             while episode_length < args.max_episode_steps:
                 if len(model.obs_cache) == 0:
@@ -161,6 +230,7 @@ def run_evaluation(args) -> None:
                     )
                     episode_return += float(result.reward)
                     episode_length += 1
+                    _update_handover_diag(handover_diag, result.info)
                     encoded_obs = adapter.encode_obs(dict(result.observation.data))
                     model.update_obs(encoded_obs)
                     if video_dir is not None:
@@ -177,6 +247,8 @@ def run_evaluation(args) -> None:
             returns.append(episode_return)
             lengths.append(episode_length)
             successes.append(float(success))
+            if handover_diag["has_stage"]:
+                handover_diags.append({**handover_diag, "failure": _classify_handover_failure(handover_diag, success)})
             if video_dir is not None and len(frames) > 0:
                 episode_dir = video_dir
                 episode_dir.mkdir(parents=True, exist_ok=True)
@@ -189,6 +261,17 @@ def run_evaluation(args) -> None:
                 f"episode={episode_idx} return={episode_return:.4f} "
                 f"length={episode_length} success={int(success)}"
             )
+            if handover_diag["has_stage"]:
+                hold_count = max(1, int(handover_diag["hold_count"]))
+                print(
+                    "diag "
+                    f"max_stage={handover_diag['max_stage']} "
+                    f"final_stage={handover_diag['final_stage']} "
+                    f"failure={_classify_handover_failure(handover_diag, success)} "
+                    f"left_hold={handover_diag['left_hold_sum'] / hold_count:.3f} "
+                    f"right_hold={handover_diag['right_hold_sum'] / hold_count:.3f} "
+                    f"box_to_target={_format_optional_float(handover_diag['box_to_target'])}"
+                )
     finally:
         env.close()
 
@@ -198,6 +281,34 @@ def run_evaluation(args) -> None:
         f"mean_length={float(np.mean(lengths)):.2f} "
         f"success_rate={float(np.mean(successes)):.4f}"
     )
+    if len(handover_diags) > 0:
+        diag_count = float(len(handover_diags))
+        stage_buckets = [0, 0, 0, 0, 0]
+        failure_counts = {
+            "failed_left_grasp": 0,
+            "failed_handover": 0,
+            "failed_right_carry": 0,
+            "failed_place_or_release": 0,
+            "unknown": 0,
+        }
+        for diag in handover_diags:
+            stage_buckets[int(diag["max_stage"])] += 1
+            failure = str(diag["failure"])
+            if failure in failure_counts:
+                failure_counts[failure] += 1
+        print(
+            "diag_summary "
+            f"stage0={stage_buckets[0] / diag_count:.3f} "
+            f"stage1={stage_buckets[1] / diag_count:.3f} "
+            f"stage2={stage_buckets[2] / diag_count:.3f} "
+            f"stage3={stage_buckets[3] / diag_count:.3f} "
+            f"stage4={stage_buckets[4] / diag_count:.3f} "
+            f"failed_left_grasp={failure_counts['failed_left_grasp'] / diag_count:.3f} "
+            f"failed_handover={failure_counts['failed_handover'] / diag_count:.3f} "
+            f"failed_right_carry={failure_counts['failed_right_carry'] / diag_count:.3f} "
+            f"failed_place={failure_counts['failed_place_or_release'] / diag_count:.3f} "
+            f"unknown={failure_counts['unknown'] / diag_count:.3f}"
+        )
 
 
 def main(argv=None) -> None:
