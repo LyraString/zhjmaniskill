@@ -27,7 +27,7 @@ BOX_YAW_LIMIT = 0.2
 REWARD_LEFT_GRASP_DIST = 0.18
 REWARD_HANDOVER_DIST = 0.16
 REWARD_RIGHT_GRASP_DIST = 0.18
-REWARD_TARGET_NEAR_DIST = 0.08
+REWARD_TARGET_NEAR_DIST = 0.05
 REWARD_LEFT_CLEAR_DIST = 0.18
 REWARD_GRIPPER_CLOSED_THRESHOLD = 0.25
 REWARD_BOX_LIFT_Z = BOX_CENTER_Z + 0.025
@@ -260,7 +260,10 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         left_to_box = torch.linalg.norm(left_ee_pos - box_pos, dim=1)
         right_to_box = torch.linalg.norm(right_ee_pos - box_pos, dim=1)
         box_to_handover = torch.linalg.norm(box_pos - handover_pos, dim=1)
-        box_to_target = torch.linalg.norm(box_bottom_center - target_top_center, dim=1)
+        target_delta = box_bottom_center - target_top_center
+        target_xy_dist = torch.linalg.norm(target_delta[:, :2], dim=1)
+        target_z_dist = torch.abs(target_delta[:, 2])
+        box_to_target = torch.linalg.norm(target_delta, dim=1)
 
         left_gripper_val = self._get_gripper_state_tensor(arm_index=0).squeeze(-1)
         right_gripper_val = self._get_gripper_state_tensor(arm_index=1).squeeze(-1)
@@ -300,11 +303,14 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         right_reach_reward = torch.exp(-8.0 * right_to_box)
         right_grasp_reward = right_closed.to(torch.float32) * (right_to_box < REWARD_RIGHT_GRASP_DIST).to(torch.float32)
         target_reward = torch.exp(-10.0 * box_to_target)
+        xy_precision_reward = torch.exp(-40.0 * target_xy_dist)
+        z_precision_reward = torch.exp(-120.0 * target_z_dist)
+        spatial_success_float = info["spatial_success"].to(torch.float32)
         final_release_reward = (
             info["right_gripper_open"].to(torch.float32)
             + info["right_ee_clear"].to(torch.float32)
             + info["box_static"].to(torch.float32)
-        )
+        ) * spatial_success_float
 
         reward = reward + stage0.to(torch.float32) * (left_reach_reward + 0.5 * left_grasp_reward)
         reward = reward + stage1.to(torch.float32) * (1.0 + 2.0 * handover_reward + 0.5 * left_closed.to(torch.float32))
@@ -312,10 +318,20 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             2.0 + right_reach_reward + 0.5 * right_grasp_reward + 0.5 * left_closed.to(torch.float32)
         )
         reward = reward + stage3.to(torch.float32) * (
-            3.0 + 3.0 * target_reward + 0.5 * right_closed.to(torch.float32) + 0.5 * left_clear.to(torch.float32)
+            3.0
+            + 2.0 * target_reward
+            + xy_precision_reward
+            + z_precision_reward
+            + 0.5 * right_closed.to(torch.float32)
+            + 0.5 * left_clear.to(torch.float32)
         )
-        reward = reward + stage4.to(torch.float32) * (4.0 + 4.0 * target_reward + final_release_reward)
-        reward = reward + 10.0 * info["success"].to(torch.float32)
+        # Stage 4 is a memory flag; gate its high reward by current placement
+        # so drifting away after first contact cannot keep collecting reward.
+        stage4_current_near = stage4 & target_near
+        reward = reward + stage4_current_near.to(torch.float32) * (
+            4.0 + 2.0 * target_reward + xy_precision_reward + z_precision_reward + final_release_reward
+        )
+        reward = reward + 25.0 * info["success"].to(torch.float32)
         reward = reward - 1.0 * box_dropped.to(torch.float32)
         reward = reward - 0.01 * action_penalty
 
