@@ -24,12 +24,33 @@ ADAPTER_MODULES = {
 }
 
 
+FINAL_SUCCESS_FIELDS = (
+    ("spatial", "spatial_success"),
+    ("xy", "xy_aligned"),
+    ("z", "z_aligned"),
+    ("right_open", "right_gripper_open"),
+    ("right_clear", "right_ee_clear"),
+    ("box_static", "box_static"),
+)
+
+
 def _to_bool_scalar(value) -> bool:
     if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "numpy"):
         value = value.detach().cpu().numpy()
     if isinstance(value, np.ndarray):
         return bool(np.asarray(value).reshape(-1)[0])
     return bool(value)
+
+
+def _to_bool_scalar_or_none(value):
+    if value is None:
+        return None
+    if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "numpy"):
+        value = value.detach().cpu().numpy()
+    array = np.asarray(value).reshape(-1)
+    if array.size == 0:
+        return None
+    return bool(array[0])
 
 
 def _to_float_scalar_or_none(value):
@@ -52,6 +73,7 @@ def _new_handover_diag():
         "right_hold_sum": 0.0,
         "hold_count": 0,
         "box_to_target": None,
+        "final_success": {label: None for label, _info_key in FINAL_SUCCESS_FIELDS},
     }
 
 
@@ -77,6 +99,11 @@ def _update_handover_diag(diag, info) -> None:
     if box_to_target is not None:
         diag["box_to_target"] = box_to_target
 
+    for label, info_key in FINAL_SUCCESS_FIELDS:
+        value = _to_bool_scalar_or_none(info.get(info_key))
+        if value is not None:
+            diag["final_success"][label] = value
+
 
 def _classify_handover_failure(diag, success: bool) -> str:
     if success:
@@ -97,6 +124,12 @@ def _format_optional_float(value, precision: int = 3) -> str:
     if value is None:
         return "nan"
     return f"{float(value):.{precision}f}"
+
+
+def _format_optional_bool(value) -> str:
+    if value is None:
+        return "nan"
+    return str(int(bool(value)))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -247,8 +280,9 @@ def run_evaluation(args) -> None:
             returns.append(episode_return)
             lengths.append(episode_length)
             successes.append(float(success))
+            handover_failure = _classify_handover_failure(handover_diag, success)
             if handover_diag["has_stage"]:
-                handover_diags.append({**handover_diag, "failure": _classify_handover_failure(handover_diag, success)})
+                handover_diags.append({**handover_diag, "failure": handover_failure})
             if video_dir is not None and len(frames) > 0:
                 episode_dir = video_dir
                 episode_dir.mkdir(parents=True, exist_ok=True)
@@ -267,11 +301,22 @@ def run_evaluation(args) -> None:
                     "diag "
                     f"max_stage={handover_diag['max_stage']} "
                     f"final_stage={handover_diag['final_stage']} "
-                    f"failure={_classify_handover_failure(handover_diag, success)} "
+                    f"failure={handover_failure} "
                     f"left_hold={handover_diag['left_hold_sum'] / hold_count:.3f} "
                     f"right_hold={handover_diag['right_hold_sum'] / hold_count:.3f} "
                     f"box_to_target={_format_optional_float(handover_diag['box_to_target'])}"
                 )
+                if handover_failure == "failed_place_or_release":
+                    final_success = handover_diag["final_success"]
+                    print(
+                        "final_diag "
+                        f"spatial={_format_optional_bool(final_success['spatial'])} "
+                        f"xy={_format_optional_bool(final_success['xy'])} "
+                        f"z={_format_optional_bool(final_success['z'])} "
+                        f"right_open={_format_optional_bool(final_success['right_open'])} "
+                        f"right_clear={_format_optional_bool(final_success['right_clear'])} "
+                        f"box_static={_format_optional_bool(final_success['box_static'])}"
+                    )
     finally:
         env.close()
 
@@ -309,6 +354,26 @@ def run_evaluation(args) -> None:
             f"failed_place={failure_counts['failed_place_or_release'] / diag_count:.3f} "
             f"unknown={failure_counts['unknown'] / diag_count:.3f}"
         )
+        failed_place_diags = [
+            diag for diag in handover_diags if str(diag["failure"]) == "failed_place_or_release"
+        ]
+        if len(failed_place_diags) > 0:
+            failed_place_count = float(len(failed_place_diags))
+            final_success_sums = {label: 0.0 for label, _info_key in FINAL_SUCCESS_FIELDS}
+            for diag in failed_place_diags:
+                final_success = diag["final_success"]
+                for label, _info_key in FINAL_SUCCESS_FIELDS:
+                    final_success_sums[label] += float(bool(final_success.get(label, False)))
+            print(
+                "final_diag_summary "
+                f"failed_place_n={len(failed_place_diags)} "
+                f"spatial={final_success_sums['spatial'] / failed_place_count:.3f} "
+                f"xy={final_success_sums['xy'] / failed_place_count:.3f} "
+                f"z={final_success_sums['z'] / failed_place_count:.3f} "
+                f"right_open={final_success_sums['right_open'] / failed_place_count:.3f} "
+                f"right_clear={final_success_sums['right_clear'] / failed_place_count:.3f} "
+                f"box_static={final_success_sums['box_static'] / failed_place_count:.3f}"
+            )
 
 
 def main(argv=None) -> None:
