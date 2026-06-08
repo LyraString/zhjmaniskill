@@ -947,16 +947,20 @@ class RobotWorkspace(BaseWorkspace):
             prev_stage_id = fpo_reward_stage.round().to(dtype=torch.long).clamp(0, 4)
 
             stage_bonus = torch.zeros(num_envs, device=device, dtype=torch.float32)
-            for next_stage, bonus in ((1, 8.0), (2, 10.0), (3, 15.0)):
+            for next_stage, bonus in ((1, 8.0), (2, 10.0), (3, 15.0), (4, 20.0)):
                 crossed = (prev_stage_id < next_stage) & (stage_id >= next_stage)
                 stage_bonus = stage_bonus + crossed.to(dtype=torch.float32) * bonus
 
             left_potential = torch.exp(-8.0 * left_to_box)
             handover_potential = torch.exp(-6.0 * box_to_handover)
             right_potential = torch.exp(-8.0 * right_to_box)
+            box_to_target = info_tensor(info, "reward_box_to_target")
+            if box_to_target is None:
+                return env_reward, torch.ones(num_envs, device=device, dtype=torch.bool)
+            broad_target = torch.exp(-10.0 * box_to_target)
             xy_potential = torch.exp(-40.0 * target_xy_dist)
             z_potential = torch.exp(-120.0 * target_z_dist)
-            target_potential = 0.7 * xy_potential + 0.3 * z_potential
+            target_potential = 0.8 * broad_target + 0.15 * xy_potential + 0.05 * z_potential
             potential = torch.where(
                 stage_id <= 0,
                 left_potential,
@@ -979,7 +983,7 @@ class RobotWorkspace(BaseWorkspace):
             new_success = success & (~fpo_reward_success_awarded)
             reward = stage_bonus
             reward = reward + 3.0 * potential_delta
-            reward = reward + new_spatial_success.to(dtype=torch.float32) * 35.0
+            reward = reward + new_spatial_success.to(dtype=torch.float32) * 10.0
             reward = reward + new_success.to(dtype=torch.float32) * 120.0
             reward = reward - 0.02
 
