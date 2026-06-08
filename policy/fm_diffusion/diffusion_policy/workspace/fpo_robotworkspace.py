@@ -82,8 +82,14 @@ ONLINE_ROLLOUT_DIAG_KEYS = (
     "rollout_reward_right_to_box_mean",
     "rollout_reward_box_to_handover_mean",
     "rollout_reward_box_to_target_mean",
+    "rollout_reward_target_xy_dist_mean",
+    "rollout_reward_target_z_dist_mean",
     "rollout_reward_left_holding_frac",
     "rollout_reward_right_holding_frac",
+    "rollout_xy_aligned_frac",
+    "rollout_z_aligned_frac",
+    "rollout_spatial_success_frac",
+    "rollout_fpo_reward_fallback_frac",
     "rollout_chunk_steps_mean",
     "rollout_policy_calls",
     "rollout_env_steps",
@@ -793,9 +799,11 @@ class RobotWorkspace(BaseWorkspace):
         fpo_reward_stage = torch.zeros(num_envs, device=device, dtype=torch.float32)
         fpo_reward_potential = torch.zeros(num_envs, device=device, dtype=torch.float32)
         fpo_reward_has_potential = torch.zeros(num_envs, device=device, dtype=torch.bool)
+        fpo_reward_spatial_awarded = torch.zeros(num_envs, device=device, dtype=torch.bool)
         fpo_reward_success_awarded = torch.zeros(num_envs, device=device, dtype=torch.bool)
 
         reward_steps = []
+        fpo_reward_fallback_steps = []
         value_steps = []
         trunc_steps = []
         discount_steps = []
@@ -825,8 +833,13 @@ class RobotWorkspace(BaseWorkspace):
             "reward_right_to_box",
             "reward_box_to_handover",
             "reward_box_to_target",
+            "reward_target_xy_dist",
+            "reward_target_z_dist",
             "reward_left_holding",
             "reward_right_holding",
+            "xy_aligned",
+            "z_aligned",
+            "spatial_success",
         )
         info_metric_steps = {key: [] for key in info_metric_keys}
 
@@ -879,10 +892,16 @@ class RobotWorkspace(BaseWorkspace):
                 return None
             return tensor
 
-        def compute_fpo_reward(env_reward, info):
+        def compute_handover_fpo_reward(env_reward, info):
+            """Compute handover-specific FPO reward from info fields.
+
+            The environment dense reward is only used as a fallback when the
+            task does not expose the handover diagnostic fields required here.
+            """
             nonlocal fpo_reward_stage
             nonlocal fpo_reward_potential
             nonlocal fpo_reward_has_potential
+            nonlocal fpo_reward_spatial_awarded
             nonlocal fpo_reward_success_awarded
 
             required_keys = (
@@ -891,32 +910,53 @@ class RobotWorkspace(BaseWorkspace):
                 "reward_right_to_box",
                 "reward_box_to_handover",
                 "reward_box_to_target",
+                "reward_target_xy_dist",
+                "reward_target_z_dist",
+                "spatial_success",
                 "success",
             )
+            fallback_mask = torch.ones(num_envs, device=device, dtype=torch.bool)
             if not isinstance(info, dict) or any(key not in info for key in required_keys):
-                return env_reward
+                return env_reward, fallback_mask
 
             stage = info_tensor(info, "reward_stage")
             left_to_box = info_tensor(info, "reward_left_to_box")
             right_to_box = info_tensor(info, "reward_right_to_box")
             box_to_handover = info_tensor(info, "reward_box_to_handover")
-            box_to_target = info_tensor(info, "reward_box_to_target")
+            target_xy_dist = info_tensor(info, "reward_target_xy_dist")
+            target_z_dist = info_tensor(info, "reward_target_z_dist")
+            spatial_success = info_tensor(info, "spatial_success", dtype=torch.bool)
             success = info_tensor(info, "success", dtype=torch.bool)
-            if any(value is None for value in (stage, left_to_box, right_to_box, box_to_handover, box_to_target, success)):
-                return env_reward
+            if any(
+                value is None
+                for value in (
+                    stage,
+                    left_to_box,
+                    right_to_box,
+                    box_to_handover,
+                    target_xy_dist,
+                    target_z_dist,
+                    spatial_success,
+                    success,
+                )
+            ):
+                return env_reward, fallback_mask
+            fallback_mask = torch.zeros(num_envs, device=device, dtype=torch.bool)
 
             stage_id = stage.round().to(dtype=torch.long).clamp(0, 4)
             prev_stage_id = fpo_reward_stage.round().to(dtype=torch.long).clamp(0, 4)
 
             stage_bonus = torch.zeros(num_envs, device=device, dtype=torch.float32)
-            for next_stage, bonus in ((1, 8.0), (2, 10.0), (3, 15.0), (4, 20.0)):
+            for next_stage, bonus in ((1, 8.0), (2, 10.0), (3, 15.0)):
                 crossed = (prev_stage_id < next_stage) & (stage_id >= next_stage)
                 stage_bonus = stage_bonus + crossed.to(dtype=torch.float32) * bonus
 
             left_potential = torch.exp(-8.0 * left_to_box)
             handover_potential = torch.exp(-6.0 * box_to_handover)
             right_potential = torch.exp(-8.0 * right_to_box)
-            target_potential = torch.exp(-10.0 * box_to_target)
+            xy_potential = torch.exp(-40.0 * target_xy_dist)
+            z_potential = torch.exp(-120.0 * target_z_dist)
+            target_potential = 0.7 * xy_potential + 0.3 * z_potential
             potential = torch.where(
                 stage_id <= 0,
                 left_potential,
@@ -935,22 +975,26 @@ class RobotWorkspace(BaseWorkspace):
             )
             potential_delta = torch.clamp(potential_delta, min=-1.0, max=1.0)
 
+            new_spatial_success = spatial_success & (~fpo_reward_spatial_awarded)
             new_success = success & (~fpo_reward_success_awarded)
             reward = stage_bonus
             reward = reward + 3.0 * potential_delta
+            reward = reward + new_spatial_success.to(dtype=torch.float32) * 35.0
             reward = reward + new_success.to(dtype=torch.float32) * 120.0
             reward = reward - 0.02
 
             fpo_reward_stage = stage.detach()
             fpo_reward_potential = potential.detach()
             fpo_reward_has_potential = torch.ones_like(fpo_reward_has_potential, dtype=torch.bool)
+            fpo_reward_spatial_awarded = fpo_reward_spatial_awarded | spatial_success.detach()
             fpo_reward_success_awarded = fpo_reward_success_awarded | success.detach()
-            return reward
+            return reward, fallback_mask
 
         def reset_fpo_reward_state(env_ids):
             nonlocal fpo_reward_stage
             nonlocal fpo_reward_potential
             nonlocal fpo_reward_has_potential
+            nonlocal fpo_reward_spatial_awarded
             nonlocal fpo_reward_success_awarded
             if not env_ids:
                 return
@@ -958,6 +1002,7 @@ class RobotWorkspace(BaseWorkspace):
             fpo_reward_stage[env_idx] = 0.0
             fpo_reward_potential[env_idx] = 0.0
             fpo_reward_has_potential[env_idx] = False
+            fpo_reward_spatial_awarded[env_idx] = False
             fpo_reward_success_awarded[env_idx] = False
 
         steps = 0
@@ -1018,8 +1063,9 @@ class RobotWorkspace(BaseWorkspace):
                     next_obs_hist = self._append_batched_obs_history(obs_hist, next_obs)
 
                     env_reward = rew.detach().to(device=device, dtype=torch.float32)
-                    fpo_reward = compute_fpo_reward(env_reward, info)
+                    fpo_reward, fpo_reward_fallback = compute_handover_fpo_reward(env_reward, info)
                     reward_steps.append(fpo_reward * reward_scaling)
+                    fpo_reward_fallback_steps.append(fpo_reward_fallback.to(dtype=torch.float32).mean())
                     value_steps.append(v.detach().to(device=device, dtype=torch.float32))
                     trunc_steps.append(truncated.detach().to(device=device, dtype=torch.float32))
                     discount_steps.append((~terminated).detach().to(device=device, dtype=torch.float32))
@@ -1221,8 +1267,14 @@ class RobotWorkspace(BaseWorkspace):
             "rollout_reward_right_to_box_mean": metric_mean("reward_right_to_box"),
             "rollout_reward_box_to_handover_mean": metric_mean("reward_box_to_handover"),
             "rollout_reward_box_to_target_mean": metric_mean("reward_box_to_target"),
+            "rollout_reward_target_xy_dist_mean": metric_mean("reward_target_xy_dist"),
+            "rollout_reward_target_z_dist_mean": metric_mean("reward_target_z_dist"),
             "rollout_reward_left_holding_frac": metric_mean("reward_left_holding"),
             "rollout_reward_right_holding_frac": metric_mean("reward_right_holding"),
+            "rollout_xy_aligned_frac": metric_mean("xy_aligned"),
+            "rollout_z_aligned_frac": metric_mean("z_aligned"),
+            "rollout_spatial_success_frac": metric_mean("spatial_success"),
+            "rollout_fpo_reward_fallback_frac": scalar_mean(fpo_reward_fallback_steps),
             "rollout_chunk_steps_mean": float(np.mean(chunk_step_counts)) if chunk_step_counts else 0.0,
             "rollout_policy_calls": float(len(actor_start_step_indices)),
             "rollout_env_steps": float(rewards.numel()),

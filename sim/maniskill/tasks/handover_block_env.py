@@ -341,6 +341,8 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             reward_right_to_box=right_to_box,
             reward_box_to_handover=box_to_handover,
             reward_box_to_target=box_to_target,
+            reward_target_xy_dist=target_xy_dist,
+            reward_target_z_dist=target_z_dist,
             reward_box_lifted=box_lifted,
             reward_left_holding=left_holding,
             reward_right_holding=right_holding,
