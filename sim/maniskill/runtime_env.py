@@ -29,6 +29,7 @@ class ManiSkillEnvBackend:
         sim_freq: int | None = None,
         control_freq: int | None = None,
         max_episode_steps: int | None = None,
+        point_cloud_sampling: str | None = None,
         sim_config: dict[str, Any] | None = None,
         env_kwargs: dict[str, Any] | None = None,
     ) -> None:
@@ -41,6 +42,7 @@ class ManiSkillEnvBackend:
         self.requested_sim_freq = sim_freq
         self.requested_control_freq = control_freq
         self.max_episode_steps = int(max_episode_steps) if max_episode_steps is not None else None
+        self.point_cloud_sampling = str(point_cloud_sampling or "fps")
         self.requested_sim_config = dict(sim_config or {})
         self.env_kwargs = dict(env_kwargs or {})
 
@@ -101,6 +103,7 @@ class ManiSkillEnvBackend:
             "env_id": self.env_id,
             "obs_mode": self.obs_mode,
             "control_mode": self.control_mode,
+            "point_cloud_sampling": self.point_cloud_sampling,
             **self._fixed_rate_info,
             "reset_info": info,
         }
@@ -116,6 +119,7 @@ class ManiSkillEnvBackend:
                 "env_id": self.env_id,
                 "obs_mode": self.obs_mode,
                 "control_mode": self.control_mode,
+                "point_cloud_sampling": self.point_cloud_sampling,
                 **self._fixed_rate_info,
             },
         )

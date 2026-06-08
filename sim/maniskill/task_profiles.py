@@ -15,6 +15,7 @@ RUNTIME_DEFAULT_KEYS = (
     "robot_uids",
     "sim_freq",
     "control_freq",
+    "point_cloud_sampling",
 )
 
 
@@ -51,6 +52,7 @@ MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
         **DEFAULT_MANISKILL_RUNTIME,
         "action_type": "continuous",
         "robot_uids": "none",
+        "point_cloud_sampling": "fast",
         "shape_meta": {
             "point_cloud": [512, 3],
             "agent_pos": [14],
@@ -65,6 +67,7 @@ MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
         **DEFAULT_MANISKILL_RUNTIME,
         "action_type": "continuous",
         "robot_uids": "none",
+        "point_cloud_sampling": "fast",
         "shape_meta": {
             "point_cloud": [512, 3],
             "agent_pos": [14],
@@ -86,6 +89,7 @@ MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
         **DEFAULT_MANISKILL_RUNTIME,
         "action_type": "continuous",
         "robot_uids": "none",
+        "point_cloud_sampling": "fast",
         "shape_meta": {
             "point_cloud": [512, 3],
             "agent_pos": [14],
@@ -104,6 +108,7 @@ MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
         **DEFAULT_MANISKILL_RUNTIME,
         "action_type": "continuous",
         "robot_uids": "none",
+        "point_cloud_sampling": "fast",
         "shape_meta": {
             "point_cloud": [512, 3],
             "agent_pos": [14],
