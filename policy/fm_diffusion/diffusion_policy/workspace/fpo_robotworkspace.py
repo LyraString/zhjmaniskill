@@ -799,7 +799,6 @@ class RobotWorkspace(BaseWorkspace):
         fpo_reward_stage = torch.zeros(num_envs, device=device, dtype=torch.float32)
         fpo_reward_potential = torch.zeros(num_envs, device=device, dtype=torch.float32)
         fpo_reward_has_potential = torch.zeros(num_envs, device=device, dtype=torch.bool)
-        fpo_reward_spatial_awarded = torch.zeros(num_envs, device=device, dtype=torch.bool)
         fpo_reward_success_awarded = torch.zeros(num_envs, device=device, dtype=torch.bool)
 
         reward_steps = []
@@ -901,7 +900,6 @@ class RobotWorkspace(BaseWorkspace):
             nonlocal fpo_reward_stage
             nonlocal fpo_reward_potential
             nonlocal fpo_reward_has_potential
-            nonlocal fpo_reward_spatial_awarded
             nonlocal fpo_reward_success_awarded
 
             required_keys = (
@@ -910,9 +908,6 @@ class RobotWorkspace(BaseWorkspace):
                 "reward_right_to_box",
                 "reward_box_to_handover",
                 "reward_box_to_target",
-                "reward_target_xy_dist",
-                "reward_target_z_dist",
-                "spatial_success",
                 "success",
             )
             fallback_mask = torch.ones(num_envs, device=device, dtype=torch.bool)
@@ -923,9 +918,7 @@ class RobotWorkspace(BaseWorkspace):
             left_to_box = info_tensor(info, "reward_left_to_box")
             right_to_box = info_tensor(info, "reward_right_to_box")
             box_to_handover = info_tensor(info, "reward_box_to_handover")
-            target_xy_dist = info_tensor(info, "reward_target_xy_dist")
-            target_z_dist = info_tensor(info, "reward_target_z_dist")
-            spatial_success = info_tensor(info, "spatial_success", dtype=torch.bool)
+            box_to_target = info_tensor(info, "reward_box_to_target")
             success = info_tensor(info, "success", dtype=torch.bool)
             if any(
                 value is None
@@ -934,9 +927,7 @@ class RobotWorkspace(BaseWorkspace):
                     left_to_box,
                     right_to_box,
                     box_to_handover,
-                    target_xy_dist,
-                    target_z_dist,
-                    spatial_success,
+                    box_to_target,
                     success,
                 )
             ):
@@ -954,13 +945,7 @@ class RobotWorkspace(BaseWorkspace):
             left_potential = torch.exp(-8.0 * left_to_box)
             handover_potential = torch.exp(-6.0 * box_to_handover)
             right_potential = torch.exp(-8.0 * right_to_box)
-            box_to_target = info_tensor(info, "reward_box_to_target")
-            if box_to_target is None:
-                return env_reward, torch.ones(num_envs, device=device, dtype=torch.bool)
-            broad_target = torch.exp(-10.0 * box_to_target)
-            xy_potential = torch.exp(-40.0 * target_xy_dist)
-            z_potential = torch.exp(-120.0 * target_z_dist)
-            target_potential = 0.8 * broad_target + 0.15 * xy_potential + 0.05 * z_potential
+            target_potential = torch.exp(-10.0 * box_to_target)
             potential = torch.where(
                 stage_id <= 0,
                 left_potential,
@@ -979,18 +964,15 @@ class RobotWorkspace(BaseWorkspace):
             )
             potential_delta = torch.clamp(potential_delta, min=-1.0, max=1.0)
 
-            new_spatial_success = spatial_success & (~fpo_reward_spatial_awarded)
             new_success = success & (~fpo_reward_success_awarded)
             reward = stage_bonus
             reward = reward + 3.0 * potential_delta
-            reward = reward + new_spatial_success.to(dtype=torch.float32) * 10.0
             reward = reward + new_success.to(dtype=torch.float32) * 120.0
             reward = reward - 0.02
 
             fpo_reward_stage = stage.detach()
             fpo_reward_potential = potential.detach()
             fpo_reward_has_potential = torch.ones_like(fpo_reward_has_potential, dtype=torch.bool)
-            fpo_reward_spatial_awarded = fpo_reward_spatial_awarded | spatial_success.detach()
             fpo_reward_success_awarded = fpo_reward_success_awarded | success.detach()
             return reward, fallback_mask
 
@@ -998,7 +980,6 @@ class RobotWorkspace(BaseWorkspace):
             nonlocal fpo_reward_stage
             nonlocal fpo_reward_potential
             nonlocal fpo_reward_has_potential
-            nonlocal fpo_reward_spatial_awarded
             nonlocal fpo_reward_success_awarded
             if not env_ids:
                 return
@@ -1006,7 +987,6 @@ class RobotWorkspace(BaseWorkspace):
             fpo_reward_stage[env_idx] = 0.0
             fpo_reward_potential[env_idx] = 0.0
             fpo_reward_has_potential[env_idx] = False
-            fpo_reward_spatial_awarded[env_idx] = False
             fpo_reward_success_awarded[env_idx] = False
 
         steps = 0
