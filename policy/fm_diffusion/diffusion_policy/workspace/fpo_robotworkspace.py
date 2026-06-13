@@ -90,9 +90,22 @@ ONLINE_ROLLOUT_DIAG_KEYS = (
     "rollout_z_aligned_frac",
     "rollout_spatial_success_frac",
     "rollout_fpo_reward_fallback_frac",
+    "rollout_capo_coupling_mean",
+    "rollout_capo_coupling_stage0_mean",
+    "rollout_capo_coupling_stage1_mean",
+    "rollout_capo_coupling_stage2_mean",
+    "rollout_capo_coupling_stage3_mean",
+    "rollout_capo_coupling_stage4_mean",
     "rollout_chunk_steps_mean",
     "rollout_policy_calls",
     "rollout_env_steps",
+)
+
+
+ONLINE_UPDATE_DIAG_KEYS = (
+    "capo_clip_mean",
+    "capo_clip_min",
+    "capo_clip_max",
 )
 
 
@@ -631,6 +644,9 @@ class RobotWorkspace(BaseWorkspace):
                             for diag_key in ONLINE_ROLLOUT_DIAG_KEYS:
                                 if diag_key in step_log:
                                     tb_writer.add_scalar(f"online/{diag_key}", _safe_float(step_log[diag_key]), tb_step)
+                            for diag_key in ONLINE_UPDATE_DIAG_KEYS:
+                                if diag_key in step_log:
+                                    tb_writer.add_scalar(f"online/{diag_key}", _safe_float(step_log[diag_key]), tb_step)
                             tb_writer.add_scalar("online/iter", float(it), tb_step)
 
                         tqdm.tqdm.write(progress_line)
@@ -792,6 +808,17 @@ class RobotWorkspace(BaseWorkspace):
         max_total_fpo_samples = int(getattr(cfg_t, "max_total_fpo_samples_per_call", 0))
         show_rollout_tqdm = bool(getattr(cfg_t, "show_rollout_tqdm", True))
         rollout_tqdm_interval = float(getattr(cfg_t, "rollout_tqdm_interval_sec", 1.0))
+        capo_cfg = getattr(cfg_t, "capo", None)
+        capo_enabled = bool(getattr(capo_cfg, "enabled", False)) if capo_cfg is not None else False
+        stage_coupling_values = (
+            getattr(capo_cfg, "stage_coupling", [0.2, 0.5, 1.0, 0.7, 0.4])
+            if capo_cfg is not None
+            else [0.2, 0.5, 1.0, 0.7, 0.4]
+        )
+        stage_coupling_values = [float(value) for value in list(stage_coupling_values)]
+        if len(stage_coupling_values) != 5:
+            raise ValueError("training.capo.stage_coupling must contain exactly 5 values.")
+        stage_coupling_tensor = torch.as_tensor(stage_coupling_values, device=device, dtype=torch.float32)
 
         obs, _ = env.reset()
         obs_hist = self._init_batched_obs_history(obs, n_obs_steps)
@@ -821,6 +848,8 @@ class RobotWorkspace(BaseWorkspace):
         flat_actor_global_cond = []
         actor_start_step_indices = []
         chunk_step_counts = []
+        flat_actor_coupling_score = []
+        flat_actor_stage_id = []
 
         action_abs_max_steps = []
         action_abs_mean_steps = []
@@ -890,6 +919,10 @@ class RobotWorkspace(BaseWorkspace):
             if tensor.numel() != num_envs:
                 return None
             return tensor
+
+        def fpo_stage_to_coupling(stage):
+            stage_id = stage.round().to(dtype=torch.long).clamp(0, 4)
+            return stage_coupling_tensor[stage_id], stage_id
 
         def compute_handover_fpo_reward(env_reward, info):
             """Compute handover-specific FPO reward from info fields.
@@ -1007,6 +1040,10 @@ class RobotWorkspace(BaseWorkspace):
                 if max_total_fpo_samples > 0:
                     per_env_budget = max_total_fpo_samples // max(1, num_envs)
                     num_fpo_samples = max(1, min(base_num_fpo_samples, per_env_budget))
+
+                chunk_stage_at_sample = fpo_reward_stage.detach().clone()
+                if capo_enabled:
+                    chunk_coupling_score, chunk_stage_id = fpo_stage_to_coupling(chunk_stage_at_sample)
 
                 with torch.inference_mode():
                     out = self.model.sample_action_with_info(
@@ -1167,6 +1204,9 @@ class RobotWorkspace(BaseWorkspace):
                 flat_actor_global_cond.append(out["global_cond"].detach())
                 actor_start_step_indices.append(chunk_start_step)
                 chunk_step_counts.append(valid_len)
+                if capo_enabled:
+                    flat_actor_coupling_score.append(chunk_coupling_score.detach())
+                    flat_actor_stage_id.append(chunk_stage_id.detach())
 
             if any(ep_step > 0 for ep_step in ep_steps):
                 with torch.inference_mode():
@@ -1264,6 +1304,23 @@ class RobotWorkspace(BaseWorkspace):
             "rollout_env_steps": float(rewards.numel()),
         }
 
+        if capo_enabled and flat_actor_coupling_score:
+            actor_coupling_score = torch.cat(flat_actor_coupling_score, dim=0)
+            actor_stage_id = torch.cat(flat_actor_stage_id, dim=0)
+            rollout["actor_coupling_score"] = actor_coupling_score
+            rollout["rollout_capo_coupling_mean"] = float(
+                actor_coupling_score.mean().detach().cpu().item()
+            )
+            for stage_id in range(5):
+                stage_mask = actor_stage_id == stage_id
+                if stage_mask.any():
+                    stage_mean_value = actor_coupling_score[stage_mask].mean()
+                    rollout[f"rollout_capo_coupling_stage{stage_id}_mean"] = float(
+                        stage_mean_value.detach().cpu().item()
+                    )
+                else:
+                    rollout[f"rollout_capo_coupling_stage{stage_id}_mean"] = 0.0
+
         if rollout["critic_obs"].shape[0] != rollout["returns"].shape[0]:
             raise RuntimeError(
                 "Chunked FPO rollout produced mismatched critic data: "
@@ -1273,6 +1330,11 @@ class RobotWorkspace(BaseWorkspace):
             raise RuntimeError(
                 "Chunked FPO rollout produced mismatched actor data: "
                 f"targets={rollout['naction_target'].shape[0]}, advantages={rollout['actor_advantages'].shape[0]}"
+            )
+        if "actor_coupling_score" in rollout and rollout["actor_coupling_score"].shape[0] != rollout["actor_advantages"].shape[0]:
+            raise RuntimeError(
+                "Chunked FPO rollout produced mismatched CAPO data: "
+                f"coupling={rollout['actor_coupling_score'].shape[0]}, advantages={rollout['actor_advantages'].shape[0]}"
             )
 
         return rollout
@@ -1666,6 +1728,22 @@ class RobotWorkspace(BaseWorkspace):
 
         actor_s = naction_target.shape[0]
         critic_s = critic_obs.shape[0]
+        capo_cfg = getattr(cfg_t, "capo", None)
+        capo_enabled = (
+            bool(getattr(capo_cfg, "enabled", False))
+            if capo_cfg is not None and "actor_coupling_score" in rollout
+            else False
+        )
+        actor_coupling_score = None
+        if capo_enabled:
+            actor_coupling_score = rollout["actor_coupling_score"].to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
+            if actor_coupling_score.shape[0] != actor_s:
+                raise RuntimeError(
+                    "CAPO coupling score must align with actor samples: "
+                    f"coupling={actor_coupling_score.shape[0]}, actor_s={actor_s}"
+                )
+            capo_clip_low = float(getattr(capo_cfg, "clip_low_coupling", clip_coef))
+            capo_clip_high = float(getattr(capo_cfg, "clip_high_coupling", clip_coef))
         num_minibatches = int(getattr(cfg_t, "num_minibatches", 4))
         actor_minibatch_size = max(1, actor_s // num_minibatches)
         critic_minibatch_size = max(1, critic_s // num_minibatches)
@@ -1676,6 +1754,9 @@ class RobotWorkspace(BaseWorkspace):
         cfm_diffs = []
         clipped_ratio_fracs = []
         velocity_kl_losses = []
+        capo_clip_means = []
+        capo_clip_mins = []
+        capo_clip_maxs = []
 
         for _ in range(n_updates):
             actor_idx_all = torch.randperm(actor_s, device=device)
@@ -1692,6 +1773,14 @@ class RobotWorkspace(BaseWorkspace):
                 mb_cond_data = cond_data[idx]
                 mb_cond_mask = cond_mask[idx]
                 mb_global = global_cond[idx]
+                mb_clip_coef = None
+                if capo_enabled:
+                    mb_coupling = actor_coupling_score[idx]
+                    mb_clip_coef = capo_clip_low * (1.0 - mb_coupling) + capo_clip_high * mb_coupling
+                    mb_clip_coef = mb_clip_coef.clamp_min(1e-6)
+                    capo_clip_means.append(float(mb_clip_coef.mean().detach().item()))
+                    capo_clip_mins.append(float(mb_clip_coef.min().detach().item()))
+                    capo_clip_maxs.append(float(mb_clip_coef.max().detach().item()))
 
                 B, N, T, Da = mb_eps.shape
                 flat_naction = mb_naction.unsqueeze(1).expand(B, N, T, Da).reshape(B * N, T, Da)
@@ -1738,19 +1827,29 @@ class RobotWorkspace(BaseWorkspace):
                 if ratio_mode == "vanilla":
                     ratio = torch.exp(logratio.mean(dim=1))
                     ratio = torch.clamp(ratio, rho_min, rho_max)
-                    clipped_frac = (torch.abs(ratio - 1.0) > clip_coef).float().mean()
+                    clip = mb_clip_coef if capo_enabled else clip_coef
+                    clipped_frac = (torch.abs(ratio - 1.0) > clip).float().mean()
                     clipped_ratio_fracs.append(float(clipped_frac.item()))
                     surr1 = ratio * mb_adv
-                    surr2 = torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef) * mb_adv
+                    if capo_enabled:
+                        clipped_ratio = torch.minimum(torch.maximum(ratio, 1.0 - clip), 1.0 + clip)
+                    else:
+                        clipped_ratio = torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
+                    surr2 = clipped_ratio * mb_adv
                     actor_loss = (-torch.min(surr1, surr2)).mean()
                 elif ratio_mode == "per_sample":
                     ratio = torch.exp(logratio)
                     ratio = torch.clamp(ratio, rho_min, rho_max)
                     adv = mb_adv.unsqueeze(1).expand_as(ratio)
-                    clipped_frac = (torch.abs(ratio - 1.0) > clip_coef).float().mean()
+                    clip = mb_clip_coef.unsqueeze(1) if capo_enabled else clip_coef
+                    clipped_frac = (torch.abs(ratio - 1.0) > clip).float().mean()
                     clipped_ratio_fracs.append(float(clipped_frac.item()))
                     surr1 = ratio * adv
-                    surr2 = torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef) * adv
+                    if capo_enabled:
+                        clipped_ratio = torch.minimum(torch.maximum(ratio, 1.0 - clip), 1.0 + clip)
+                    else:
+                        clipped_ratio = torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
+                    surr2 = clipped_ratio * adv
                     actor_loss = (-torch.min(surr1, surr2)).mean()
                 else:
                     raise ValueError(f"Unknown ratio_mode: {ratio_mode}")
@@ -1798,7 +1897,7 @@ class RobotWorkspace(BaseWorkspace):
 
                 critic_losses.append(float(critic_loss.item()))
 
-        return {
+        update_log = {
             "actor_loss": float(np.mean(actor_losses)) if actor_losses else 0.0,
             "critic_loss": float(np.mean(critic_losses)) if critic_losses else 0.0,
             "rho_mean": float(np.mean(ratio_means)) if ratio_means else 0.0,
@@ -1806,6 +1905,13 @@ class RobotWorkspace(BaseWorkspace):
             "clipped_ratio_frac": float(np.mean(clipped_ratio_fracs)) if clipped_ratio_fracs else 0.0,
             "velocity_kl_mean": float(np.mean(velocity_kl_losses)) if velocity_kl_losses else 0.0,
         }
+        if capo_enabled:
+            update_log.update({
+                "capo_clip_mean": float(np.mean(capo_clip_means)) if capo_clip_means else 0.0,
+                "capo_clip_min": float(np.min(capo_clip_mins)) if capo_clip_mins else 0.0,
+                "capo_clip_max": float(np.max(capo_clip_maxs)) if capo_clip_maxs else 0.0,
+            })
+        return update_log
 
     def update_fpo_from_rollout(self, rollout, device):
         """
