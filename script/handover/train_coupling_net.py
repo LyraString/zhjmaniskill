@@ -14,12 +14,13 @@ from torch.utils.data import DataLoader, TensorDataset
 
 
 DEFAULT_DATA_PATH = "/home/idiot/zhj/RoboTwin/tmp/handover/counterfactual_labels_100ep.npz"
-DEFAULT_OUTPUT_PATH = "/home/idiot/zhj/RoboTwin/tmp/handover/coupling_net_v0.pt"
-TARGET_NAMES = ("left", "right", "both")
+DEFAULT_OUTPUT_PATH = "/home/idiot/zhj/RoboTwin/tmp/handover/coupling_net_scalar_v0.pt"
+TARGET_NAME = "coupling_score"
+DEFAULT_DEV_SCALE = 0.05
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train an offline CouplingNet on counterfactual labels.")
+    parser = argparse.ArgumentParser(description="Train scalar CouplingNet on counterfactual sensitivity.")
     parser.add_argument("--data-path", type=str, default=DEFAULT_DATA_PATH)
     parser.add_argument("--output-path", type=str, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--epochs", type=int, default=200)
@@ -28,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--train-frac", type=float, default=0.8)
+    parser.add_argument("--coupling-dev-scale", type=float, default=DEFAULT_DEV_SCALE)
     parser.add_argument("--seed", type=int, default=999)
     parser.add_argument("--device", type=str, default="auto")
     return parser
@@ -41,11 +43,11 @@ class CouplingNet(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, len(TARGET_NAMES)),
+            nn.Linear(hidden_dim, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return self.net(x).squeeze(-1)
 
 
 def _set_seed(seed: int) -> None:
@@ -72,20 +74,18 @@ def _resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
-def _load_dataset(path: Path) -> dict[str, np.ndarray]:
+def _load_dataset(path: Path, dev_scale: float) -> dict[str, np.ndarray]:
     data = np.load(path)
     features = data["features"].astype(np.float32)
-    labels = np.stack(
-        [
-            data["left_label"].astype(np.float32),
-            data["right_label"].astype(np.float32),
-            data["both_label"].astype(np.float32),
-        ],
-        axis=1,
-    )
+    left_dev = data["left_dev"].astype(np.float32)
+    right_dev = data["right_dev"].astype(np.float32)
+    both_dev = data["both_dev"].astype(np.float32)
+    max_dev = np.maximum.reduce([left_dev, right_dev, both_dev])
+    target = np.clip(max_dev / float(dev_scale), 0.0, 1.0).astype(np.float32)
     return {
         "features": features,
-        "labels": labels,
+        "target": target,
+        "max_dev": max_dev.astype(np.float32),
         "stage": data["stage"].astype(np.int64),
         "episode": data["episode"].astype(np.int64),
         "feature_names": data["feature_names"].astype(str),
@@ -118,79 +118,53 @@ def _normalize_features(
     return normalized.astype(np.float32), mean.reshape(-1).astype(np.float32), std.reshape(-1).astype(np.float32)
 
 
-def _pos_weight(labels: np.ndarray, train_mask: np.ndarray) -> np.ndarray:
-    train_labels = labels[train_mask]
-    pos = train_labels.sum(axis=0)
-    neg = train_labels.shape[0] - pos
-    weight = np.ones_like(pos, dtype=np.float32)
-    valid = pos > 0
-    weight[valid] = (neg[valid] / np.maximum(pos[valid], 1.0)).astype(np.float32)
-    return weight
-
-
 def _make_loader(
     features: np.ndarray,
-    labels: np.ndarray,
+    target: np.ndarray,
     mask: np.ndarray,
     *,
     batch_size: int,
     shuffle: bool,
 ) -> DataLoader:
     x = torch.from_numpy(features[mask]).to(torch.float32)
-    y = torch.from_numpy(labels[mask]).to(torch.float32)
+    y = torch.from_numpy(target[mask]).to(torch.float32)
     return DataLoader(TensorDataset(x, y), batch_size=batch_size, shuffle=shuffle)
 
 
-def _binary_auc(scores: np.ndarray, labels: np.ndarray) -> float:
-    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
-    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
-    pos = labels == 1
-    neg = labels == 0
-    n_pos = int(pos.sum())
-    n_neg = int(neg.sum())
-    if n_pos == 0 or n_neg == 0:
+def _corr(pred: np.ndarray, target: np.ndarray) -> float:
+    pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+    target = np.asarray(target, dtype=np.float64).reshape(-1)
+    if pred.size < 2:
         return float("nan")
-
-    order = np.argsort(scores)
-    sorted_scores = scores[order]
-    ranks = np.empty_like(sorted_scores, dtype=np.float64)
-    start = 0
-    while start < sorted_scores.size:
-        end = start + 1
-        while end < sorted_scores.size and sorted_scores[end] == sorted_scores[start]:
-            end += 1
-        ranks[start:end] = 0.5 * (start + 1 + end)
-        start = end
-
-    original_ranks = np.empty_like(ranks)
-    original_ranks[order] = ranks
-    pos_rank_sum = float(original_ranks[pos].sum())
-    return float((pos_rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+    pred_std = float(pred.std())
+    target_std = float(target.std())
+    if pred_std < 1e-12 or target_std < 1e-12:
+        return float("nan")
+    return float(np.corrcoef(pred, target)[0, 1])
 
 
-def _target_metrics(scores: np.ndarray, labels: np.ndarray) -> dict[str, float]:
-    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
-    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
-    preds = scores >= 0.5
-    truth = labels == 1
-
-    tp = float(np.logical_and(preds, truth).sum())
-    tn = float(np.logical_and(~preds, ~truth).sum())
-    fp = float(np.logical_and(preds, ~truth).sum())
-    fn = float(np.logical_and(~preds, truth).sum())
-
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2.0 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    accuracy = (tp + tn) / max(tp + tn + fp + fn, 1.0)
+def _regression_metrics(pred: np.ndarray, target: np.ndarray) -> dict[str, float]:
+    pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+    target = np.asarray(target, dtype=np.float64).reshape(-1)
+    if pred.size == 0:
+        return {
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "pearson_corr": float("nan"),
+            "target_mean": float("nan"),
+            "pred_mean": float("nan"),
+            "target_std": float("nan"),
+            "pred_std": float("nan"),
+        }
+    err = pred - target
     return {
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "auc": _binary_auc(scores, labels),
-        "positive_frac": float(truth.mean()) if truth.size else float("nan"),
-        "pred_positive_frac": float(preds.mean()) if preds.size else float("nan"),
+        "mae": float(np.mean(np.abs(err))),
+        "rmse": float(np.sqrt(np.mean(np.square(err)))),
+        "pearson_corr": _corr(pred, target),
+        "target_mean": float(target.mean()),
+        "pred_mean": float(pred.mean()),
+        "target_std": float(target.std()),
+        "pred_std": float(pred.std()),
     }
 
 
@@ -199,49 +173,35 @@ def _evaluate(
     model: nn.Module,
     criterion: nn.Module,
     features: np.ndarray,
-    labels: np.ndarray,
+    target: np.ndarray,
     stage: np.ndarray,
     mask: np.ndarray,
     device: torch.device,
 ) -> dict[str, Any]:
     model.eval()
     x = torch.from_numpy(features[mask]).to(device=device, dtype=torch.float32)
-    y = torch.from_numpy(labels[mask]).to(device=device, dtype=torch.float32)
-    logits = model(x)
-    loss = float(criterion(logits, y).item())
-    probs = torch.sigmoid(logits).detach().cpu().numpy()
-    y_np = y.detach().cpu().numpy().astype(np.int64)
+    y = torch.from_numpy(target[mask]).to(device=device, dtype=torch.float32)
+    pred = torch.sigmoid(model(x))
+    loss = float(criterion(pred, y).item())
+    pred_np = pred.detach().cpu().numpy()
+    target_np = y.detach().cpu().numpy()
     stage_np = stage[mask]
 
-    targets = {
-        name: _target_metrics(probs[:, idx], y_np[:, idx])
-        for idx, name in enumerate(TARGET_NAMES)
-    }
-    macro_f1 = float(np.nanmean([target["f1"] for target in targets.values()]))
-    macro_auc = float(np.nanmean([target["auc"] for target in targets.values()]))
-
+    metrics = _regression_metrics(pred_np, target_np)
     stage_metrics = {}
     for stage_id in sorted(np.unique(stage_np).tolist()):
         stage_mask = stage_np == stage_id
         if not stage_mask.any():
             continue
-        stage_targets = {
-            name: _target_metrics(probs[stage_mask, idx], y_np[stage_mask, idx])
-            for idx, name in enumerate(TARGET_NAMES)
-        }
         stage_metrics[str(int(stage_id))] = {
             "n": int(stage_mask.sum()),
-            "macro_f1": float(np.nanmean([target["f1"] for target in stage_targets.values()])),
-            "macro_auc": float(np.nanmean([target["auc"] for target in stage_targets.values()])),
-            "targets": stage_targets,
+            **_regression_metrics(pred_np[stage_mask], target_np[stage_mask]),
         }
 
     return {
         "loss": loss,
         "n": int(mask.sum()),
-        "macro_f1": macro_f1,
-        "macro_auc": macro_auc,
-        "targets": targets,
+        **metrics,
         "stage_metrics": stage_metrics,
     }
 
@@ -249,29 +209,29 @@ def _evaluate(
 def train(args) -> dict[str, Any]:
     _set_seed(int(args.seed))
     device = _resolve_device(args.device)
-    dataset = _load_dataset(Path(args.data_path))
+    dataset = _load_dataset(Path(args.data_path), float(args.coupling_dev_scale))
     features = dataset["features"]
-    labels = dataset["labels"]
+    target = dataset["target"]
+    max_dev = dataset["max_dev"]
     stage = dataset["stage"]
     episodes = dataset["episode"]
     feature_names = dataset["feature_names"]
 
     if features.shape[0] == 0:
         raise ValueError("Dataset is empty.")
-    if features.shape[0] != labels.shape[0]:
-        raise ValueError("Feature/label length mismatch.")
+    if features.shape[0] != target.shape[0]:
+        raise ValueError("Feature/target length mismatch.")
 
     train_mask, val_mask = _episode_split(episodes, float(args.train_frac), int(args.seed))
     normalized_features, feature_mean, feature_std = _normalize_features(features, train_mask)
-    pos_weight = _pos_weight(labels, train_mask)
 
     model = CouplingNet(input_dim=features.shape[1], hidden_dim=int(args.hidden_dim)).to(device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.from_numpy(pos_weight).to(device=device))
+    criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
 
     train_loader = _make_loader(
         normalized_features,
-        labels,
+        target,
         train_mask,
         batch_size=int(args.batch_size),
         shuffle=True,
@@ -280,30 +240,25 @@ def train(args) -> dict[str, Any]:
     history = []
     best_state_dict = copy.deepcopy(model.state_dict())
     best_epoch = 0
-    best_val_macro_f1 = -1.0
+    best_val_mae = float("inf")
     best_val_loss = float("inf")
     for epoch in range(1, int(args.epochs) + 1):
         model.train()
-        total_loss = 0.0
-        total_count = 0
         for x, y in train_loader:
             x = x.to(device=device, dtype=torch.float32)
             y = y.to(device=device, dtype=torch.float32)
-            logits = model(x)
-            loss = criterion(logits, y)
+            pred = torch.sigmoid(model(x))
+            loss = criterion(pred, y)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-            batch_count = int(x.shape[0])
-            total_loss += float(loss.item()) * batch_count
-            total_count += batch_count
 
-        train_eval = _evaluate(model, criterion, normalized_features, labels, stage, train_mask, device)
-        val_eval = _evaluate(model, criterion, normalized_features, labels, stage, val_mask, device)
-        val_macro_f1 = float(val_eval["macro_f1"])
+        train_eval = _evaluate(model, criterion, normalized_features, target, stage, train_mask, device)
+        val_eval = _evaluate(model, criterion, normalized_features, target, stage, val_mask, device)
+        val_mae = float(val_eval["mae"])
         val_loss = float(val_eval["loss"])
-        if val_macro_f1 > best_val_macro_f1:
-            best_val_macro_f1 = val_macro_f1
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
             best_val_loss = val_loss
             best_epoch = int(epoch)
             best_state_dict = copy.deepcopy(model.state_dict())
@@ -314,16 +269,22 @@ def train(args) -> dict[str, Any]:
                     "epoch": int(epoch),
                     "train_loss": float(train_eval["loss"]),
                     "val_loss": float(val_eval["loss"]),
-                    "train_macro_f1": float(train_eval["macro_f1"]),
-                    "val_macro_f1": float(val_eval["macro_f1"]),
-                    "train_macro_auc": float(train_eval["macro_auc"]),
-                    "val_macro_auc": float(val_eval["macro_auc"]),
+                    "train_mae": float(train_eval["mae"]),
+                    "val_mae": float(val_eval["mae"]),
+                    "train_rmse": float(train_eval["rmse"]),
+                    "val_rmse": float(val_eval["rmse"]),
+                    "train_corr": float(train_eval["pearson_corr"]),
+                    "val_corr": float(val_eval["pearson_corr"]),
                 }
             )
 
     model.load_state_dict(best_state_dict)
-    train_metrics = _evaluate(model, criterion, normalized_features, labels, stage, train_mask, device)
-    val_metrics = _evaluate(model, criterion, normalized_features, labels, stage, val_mask, device)
+    train_metrics = _evaluate(model, criterion, normalized_features, target, stage, train_mask, device)
+    val_metrics = _evaluate(model, criterion, normalized_features, target, stage, val_mask, device)
+
+    train_mean_baseline = float(np.mean(target[train_mask]))
+    val_baseline_pred = np.full_like(target[val_mask], fill_value=train_mean_baseline, dtype=np.float32)
+    val_baseline_metrics = _regression_metrics(val_baseline_pred, target[val_mask])
 
     summary = {
         "data_path": str(args.data_path),
@@ -335,8 +296,12 @@ def train(args) -> dict[str, Any]:
         "unique_episode_count": int(np.unique(episodes).size),
         "train_episode_count": int(np.unique(episodes[train_mask]).size),
         "val_episode_count": int(np.unique(episodes[val_mask]).size),
-        "target_names": list(TARGET_NAMES),
-        "pos_weight": pos_weight.tolist(),
+        "target_name": TARGET_NAME,
+        "coupling_dev_scale": float(args.coupling_dev_scale),
+        "target_min": float(target.min()),
+        "target_max": float(target.max()),
+        "target_mean": float(target.mean()),
+        "max_dev_mean": float(max_dev.mean()),
         "epochs": int(args.epochs),
         "batch_size": int(args.batch_size),
         "hidden_dim": int(args.hidden_dim),
@@ -345,8 +310,9 @@ def train(args) -> dict[str, Any]:
         "seed": int(args.seed),
         "device": str(device),
         "selected_epoch": int(best_epoch),
-        "selected_val_macro_f1": float(best_val_macro_f1),
+        "selected_val_mae": float(best_val_mae),
         "selected_val_loss": float(best_val_loss),
+        "val_mean_baseline_metrics": val_baseline_metrics,
         "history": history,
         "train_metrics": train_metrics,
         "val_metrics": val_metrics,
@@ -360,7 +326,8 @@ def train(args) -> dict[str, Any]:
             "feature_names": feature_names.tolist(),
             "feature_mean": feature_mean,
             "feature_std": feature_std,
-            "target_names": list(TARGET_NAMES),
+            "target_name": TARGET_NAME,
+            "coupling_dev_scale": float(args.coupling_dev_scale),
             "hidden_dim": int(args.hidden_dim),
             "summary": summary,
         },
