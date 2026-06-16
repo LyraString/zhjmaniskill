@@ -118,6 +118,24 @@ MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
             "zarr_path": "data/HandoverBlockUR5-v2-smoke_npz-1.zarr",
         },
     },
+    "handover_block_ur5_v2_multiview_probe": {
+        "env_id": "HandoverBlockUR5-v2",
+        **DEFAULT_MANISKILL_RUNTIME,
+        "action_type": "continuous",
+        "robot_uids": "none",
+        "point_cloud_sampling": "fast",
+        "shape_meta": {
+            "point_cloud": [512, 3],
+            "agent_pos": [14],
+            "action": [14],
+        },
+        "dataset": {
+            "zarr_path": "data/HandoverBlockUR5-v2-smoke_npz-1.zarr",
+        },
+        "env_kwargs": {
+            "enable_wrist_cameras": True,
+        },
+    },
 }
 
 

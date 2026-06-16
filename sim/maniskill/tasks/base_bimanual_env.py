@@ -38,6 +38,7 @@ class BaseBimanualEnv(BaseEnv):
     HEAD_CAMERA_HEIGHT = 240
     HEAD_CAMERA_NEAR = 0.1
     HEAD_CAMERA_FAR = 100.0
+    WRIST_CAMERA_FOVY_DEG = 60.0
 
     def __init__(
         self,
@@ -46,6 +47,7 @@ class BaseBimanualEnv(BaseEnv):
         robot_uids="none",
         **kwargs,
     ):
+        self.enable_wrist_cameras = bool(kwargs.pop("enable_wrist_cameras", False))
         self.embodiment_spec = embodiment_spec
         self.left_gripper_val = 0.0
         self.right_gripper_val = 0.0
@@ -68,10 +70,11 @@ class BaseBimanualEnv(BaseEnv):
 
     @property
     def _default_sensor_configs(self):
+        sensor_configs = []
         static_camera_list = self.embodiment_spec.left_config.get("static_camera_list", [])
         if len(static_camera_list) == 0:
             pose = sapien_utils.look_at(eye=[-0.032, -0.45, 1.35], target=[0.0, -0.15, 0.95])
-            return [
+            sensor_configs.append(
                 CameraConfig(
                     "head_camera",
                     pose,
@@ -81,34 +84,63 @@ class BaseBimanualEnv(BaseEnv):
                     self.HEAD_CAMERA_NEAR,
                     self.HEAD_CAMERA_FAR,
                 )
-            ]
-
-        camera_info = static_camera_list[0]
-        cam_pos = np.asarray(camera_info["position"], dtype=np.float32)
-        cam_forward = np.asarray(camera_info.get("forward", -cam_pos), dtype=np.float32)
-        cam_forward = cam_forward / np.linalg.norm(cam_forward)
-        cam_left = np.asarray(
-            camera_info.get("left", [-cam_forward[1], cam_forward[0], 0.0]),
-            dtype=np.float32,
-        )
-        cam_left = cam_left / np.linalg.norm(cam_left)
-        cam_up = np.cross(cam_forward, cam_left)
-        cam_up = cam_up / np.linalg.norm(cam_up)
-        transform = np.eye(4, dtype=np.float32)
-        transform[:3, :3] = np.stack([cam_forward, cam_left, cam_up], axis=1)
-        transform[:3, 3] = cam_pos
-        pose = sapien.Pose(transform)
-        return [
-            CameraConfig(
-                camera_info.get("name", "head_camera"),
-                pose,
-                self.HEAD_CAMERA_WIDTH,
-                self.HEAD_CAMERA_HEIGHT,
-                np.deg2rad(self.HEAD_CAMERA_FOVY_DEG),
-                self.HEAD_CAMERA_NEAR,
-                self.HEAD_CAMERA_FAR,
             )
-        ]
+        else:
+            camera_info = static_camera_list[0]
+            cam_pos = np.asarray(camera_info["position"], dtype=np.float32)
+            cam_forward = np.asarray(camera_info.get("forward", -cam_pos), dtype=np.float32)
+            cam_forward = cam_forward / np.linalg.norm(cam_forward)
+            cam_left = np.asarray(
+                camera_info.get("left", [-cam_forward[1], cam_forward[0], 0.0]),
+                dtype=np.float32,
+            )
+            cam_left = cam_left / np.linalg.norm(cam_left)
+            cam_up = np.cross(cam_forward, cam_left)
+            cam_up = cam_up / np.linalg.norm(cam_up)
+            transform = np.eye(4, dtype=np.float32)
+            transform[:3, :3] = np.stack([cam_forward, cam_left, cam_up], axis=1)
+            transform[:3, 3] = cam_pos
+            pose = sapien.Pose(transform)
+            sensor_configs.append(
+                CameraConfig(
+                    camera_info.get("name", "head_camera"),
+                    pose,
+                    self.HEAD_CAMERA_WIDTH,
+                    self.HEAD_CAMERA_HEIGHT,
+                    np.deg2rad(self.HEAD_CAMERA_FOVY_DEG),
+                    self.HEAD_CAMERA_NEAR,
+                    self.HEAD_CAMERA_FAR,
+                )
+            )
+
+        if self.enable_wrist_cameras:
+            wrist_pose = sapien.Pose()
+            sensor_configs.extend(
+                [
+                    CameraConfig(
+                        "left_wrist_camera",
+                        wrist_pose,
+                        self.HEAD_CAMERA_WIDTH,
+                        self.HEAD_CAMERA_HEIGHT,
+                        np.deg2rad(self.WRIST_CAMERA_FOVY_DEG),
+                        self.HEAD_CAMERA_NEAR,
+                        self.HEAD_CAMERA_FAR,
+                        mount=self.get_arm_link_by_name(arm_index=0, link_name="camera"),
+                    ),
+                    CameraConfig(
+                        "right_wrist_camera",
+                        wrist_pose,
+                        self.HEAD_CAMERA_WIDTH,
+                        self.HEAD_CAMERA_HEIGHT,
+                        np.deg2rad(self.WRIST_CAMERA_FOVY_DEG),
+                        self.HEAD_CAMERA_NEAR,
+                        self.HEAD_CAMERA_FAR,
+                        mount=self.get_arm_link_by_name(arm_index=1, link_name="camera"),
+                    ),
+                ]
+            )
+
+        return sensor_configs
 
     @property
     def _default_human_render_camera_configs(self):
@@ -253,6 +285,13 @@ class BaseBimanualEnv(BaseEnv):
             else:
                 names.append(str(link.name))
         return names
+
+    def get_arm_link_by_name(self, arm_index: int, link_name: str):
+        for link in self.get_arm_robot(arm_index).get_links():
+            current_name = link.get_name() if hasattr(link, "get_name") else str(link.name)
+            if current_name == str(link_name):
+                return link
+        raise KeyError(f"Could not find link `{link_name}` for arm {arm_index}.")
 
     def get_arm_joint_positions(self, arm_index: int) -> np.ndarray:
         joints = self.left_arm_joints if arm_index == 0 else self.right_arm_joints
