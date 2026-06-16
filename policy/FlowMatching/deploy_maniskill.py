@@ -9,12 +9,19 @@ from .dp_model import DP
 
 
 def encode_obs(observation):
-    point_cloud = np.asarray(observation["point_cloud"], dtype=np.float32)
     agent_pos = np.asarray(observation["agent_pos"], dtype=np.float32)
-    return {
-        "point_cloud": point_cloud,
+    encoded = {
         "agent_pos": agent_pos,
     }
+    for key in (
+        "point_cloud",
+        "head_point_cloud",
+        "left_wrist_point_cloud",
+        "right_wrist_point_cloud",
+    ):
+        if key in observation:
+            encoded[key] = np.asarray(observation[key], dtype=np.float32)
+    return encoded
 
 
 def get_model(usr_args):

@@ -492,11 +492,18 @@ class PolicyManualInterventionCollector:
             value = getattr(raw_recorder, attr_name, None)
             if isinstance(value, list):
                 raw_lengths[attr_name] = len(value)
+        raw_obs_lengths: dict[str, int] = {}
+        obs_arrays = getattr(raw_recorder, "_obs_arrays", None)
+        if isinstance(obs_arrays, dict):
+            for key, value in obs_arrays.items():
+                if isinstance(value, list):
+                    raw_obs_lengths[str(key)] = len(value)
         last_obs = getattr(recorder, "last_obs", None)
         return {
             "step_count": int(getattr(recorder, "step_count", 0)),
             "last_obs": None if last_obs is None else dict(last_obs),
             "raw_lengths": raw_lengths,
+            "raw_obs_lengths": raw_obs_lengths,
         }
 
     @staticmethod
@@ -508,6 +515,12 @@ class PolicyManualInterventionCollector:
             value = getattr(raw_recorder, attr_name, None)
             if isinstance(value, list):
                 del value[int(length) :]
+        obs_arrays = getattr(raw_recorder, "_obs_arrays", None)
+        if isinstance(obs_arrays, dict):
+            for key, length in snapshot.get("raw_obs_lengths", {}).items():
+                value = obs_arrays.get(key)
+                if isinstance(value, list):
+                    del value[int(length) :]
 
     def _sync_manual_state_to_sim(self) -> None:
         scene = getattr(self.base_env, "scene", None)

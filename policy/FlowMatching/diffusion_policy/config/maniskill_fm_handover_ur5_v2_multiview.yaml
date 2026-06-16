@@ -1,0 +1,28 @@
+defaults:
+  - maniskill_fm_base
+  - task: maniskill_handover_block_ur5_v2_multiview_task
+  - _self_
+
+name: maniskill_fm_handover_ur5_v2_multiview
+exp_name: handover_block_ur5_v2_multiview_fm
+
+policy:
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.pointcloud_obs_encoder.MultiViewPointCloudObsEncoder
+    shape_meta: ${shape_meta}
+    pointnet_out_dim: 512
+    fusion_hidden_dim: 512
+    use_layernorm: True
+
+dataloader:
+  batch_size: 64
+
+val_dataloader:
+  batch_size: 64
+
+training:
+  num_epochs: 3000
+  gradient_accumulate_every: 2
+  rollout_every: 50
+  checkpoint_every: 100
+  sample_every: 5

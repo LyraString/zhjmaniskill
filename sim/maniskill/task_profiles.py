@@ -16,6 +16,7 @@ RUNTIME_DEFAULT_KEYS = (
     "sim_freq",
     "control_freq",
     "point_cloud_sampling",
+    "point_cloud_views",
 )
 
 
@@ -31,7 +32,15 @@ DEFAULT_MANISKILL_RUNTIME: dict[str, Any] = {
     "robot_uids": "panda",
     "sim_freq": 200,
     "control_freq": 20,
+    "point_cloud_views": None,
 }
+
+
+UR5_V2_MULTIVIEW_POINT_CLOUD_VIEWS: list[dict[str, Any]] = [
+    {"key": "head_point_cloud", "camera": "head_camera", "points": 1024},
+    {"key": "left_wrist_point_cloud", "camera": "left_wrist_camera", "points": 512},
+    {"key": "right_wrist_point_cloud", "camera": "right_wrist_camera", "points": 512},
+]
 
 
 MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
@@ -136,13 +145,33 @@ MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
             "enable_wrist_cameras": True,
         },
     },
+    "handover_block_ur5_v2_multiview_train": {
+        "env_id": "HandoverBlockUR5-v2",
+        **DEFAULT_MANISKILL_RUNTIME,
+        "action_type": "continuous",
+        "robot_uids": "none",
+        "point_cloud_sampling": "fast",
+        "point_cloud_views": UR5_V2_MULTIVIEW_POINT_CLOUD_VIEWS,
+        "shape_meta": {
+            "head_point_cloud": [1024, 3],
+            "left_wrist_point_cloud": [512, 3],
+            "right_wrist_point_cloud": [512, 3],
+            "agent_pos": [14],
+            "action": [14],
+        },
+        "dataset": {
+            "zarr_path": "data/HandoverBlockUR5-v2-handover_block_ur5_v2_multiview_train-1.zarr",
+        },
+        "env_kwargs": {
+            "enable_wrist_cameras": True,
+        },
+    },
 }
 
 
-_ENV_ID_TO_PROFILE = {
-    str(profile["env_id"]): profile_name
-    for profile_name, profile in MANISKILL_TASK_PROFILES.items()
-}
+_ENV_ID_TO_PROFILE: dict[str, str] = {}
+for _profile_name, _profile in MANISKILL_TASK_PROFILES.items():
+    _ENV_ID_TO_PROFILE.setdefault(str(_profile["env_id"]), _profile_name)
 
 
 def get_task_profile(profile_name: str) -> dict[str, Any]:

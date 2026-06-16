@@ -131,6 +131,13 @@ def check_dataset_schema(zarr_path: Path, task_profile: str) -> dict:
     head_camera_arr = data_group["head_camera"] if "head_camera" in data_group else None
     episode_ends = np.asarray(meta_group["episode_ends"], dtype=np.int64)
 
+    expected_shape_meta = profile["shape_meta"]
+    expected_point_cloud_shapes = {
+        key: _shape_tuple(value)
+        for key, value in expected_shape_meta.items()
+        if key != "action" and _shape_tuple(value)[-1:] == (3,) and len(_shape_tuple(value)) == 2
+    }
+
     checks = {}
     checks["has_episode_ends"] = len(episode_ends) > 0
     checks["episode_ends_monotonic"] = bool(
@@ -152,15 +159,20 @@ def check_dataset_schema(zarr_path: Path, task_profile: str) -> dict:
     else:
         checks["state_length_matches_episode_ends"] = False
 
-    if point_cloud_arr is not None and n_steps is not None:
-        checks["point_cloud_length_matches_episode_ends"] = int(point_cloud_arr.shape[0]) == n_steps
-    else:
-        checks["point_cloud_length_matches_episode_ends"] = False
+    point_cloud_shapes = {}
+    for key, expected_shape in expected_point_cloud_shapes.items():
+        arr = data_group[key] if key in data_group else None
+        point_cloud_shapes[key] = None if arr is None else tuple(int(x) for x in arr.shape)
+        checks[f"{key}_present"] = arr is not None
+        checks[f"{key}_length_matches_episode_ends"] = bool(
+            arr is not None and n_steps is not None and int(arr.shape[0]) == n_steps
+        )
+        checks[f"{key}_shape_matches_profile"] = bool(
+            arr is not None and _shape_tuple(arr.shape[1:]) == expected_shape
+        )
 
-    expected_shape_meta = profile["shape_meta"]
     expected_action_shape = _shape_tuple(expected_shape_meta["action"])
     expected_agent_pos_shape = _shape_tuple(expected_shape_meta["agent_pos"])
-    expected_point_cloud_shape = _shape_tuple(expected_shape_meta["point_cloud"])
 
     checks["action_rank_ok"] = bool(action_arr is not None and len(action_arr.shape) >= 2)
     checks["action_shape_matches_profile"] = bool(
@@ -170,10 +182,16 @@ def check_dataset_schema(zarr_path: Path, task_profile: str) -> dict:
     checks["state_shape_matches_profile"] = bool(
         state_arr is not None and _shape_tuple(state_arr.shape[1:]) == expected_agent_pos_shape
     )
-    checks["point_cloud_present"] = point_cloud_arr is not None
+    checks["point_cloud_present"] = bool(
+        expected_point_cloud_shapes and all(checks[f"{key}_present"] for key in expected_point_cloud_shapes)
+    )
+    checks["point_cloud_length_matches_episode_ends"] = bool(
+        expected_point_cloud_shapes
+        and all(checks[f"{key}_length_matches_episode_ends"] for key in expected_point_cloud_shapes)
+    )
     checks["point_cloud_shape_matches_profile"] = bool(
-        point_cloud_arr is not None
-        and _shape_tuple(point_cloud_arr.shape[1:]) == expected_point_cloud_shape
+        expected_point_cloud_shapes
+        and all(checks[f"{key}_shape_matches_profile"] for key in expected_point_cloud_shapes)
     )
 
     checks["usable_for_legacy_replay"] = all(
@@ -207,6 +225,7 @@ def check_dataset_schema(zarr_path: Path, task_profile: str) -> dict:
         "point_cloud_shape": (
             None if point_cloud_arr is None else tuple(int(x) for x in point_cloud_arr.shape)
         ),
+        "point_cloud_shapes": point_cloud_shapes,
         "head_camera_shape": (
             None if head_camera_arr is None else tuple(int(x) for x in head_camera_arr.shape)
         ),
@@ -214,7 +233,7 @@ def check_dataset_schema(zarr_path: Path, task_profile: str) -> dict:
         "n_steps": n_steps,
         "expected_action_shape": expected_action_shape,
         "expected_state_shape": expected_agent_pos_shape,
-        "expected_point_cloud_shape": expected_point_cloud_shape,
+        "expected_point_cloud_shapes": expected_point_cloud_shapes,
         "checks": checks,
     }
     return info
@@ -427,6 +446,9 @@ def print_report(schema_info: dict, replay_info: dict | None) -> None:
     print(f"  action shape: {schema_info['action_shape']}")
     print(f"  state shape: {schema_info['state_shape']}")
     print(f"  point_cloud shape: {schema_info['point_cloud_shape']}")
+    if schema_info.get("point_cloud_shapes"):
+        for key, shape in schema_info["point_cloud_shapes"].items():
+            print(f"  {key} shape: {shape}")
     print(f"  head_camera shape: {schema_info['head_camera_shape']}")
     print(f"  episode_count: {schema_info['episode_count']}")
     print(f"  n_steps: {schema_info['n_steps']}")
@@ -434,7 +456,8 @@ def print_report(schema_info: dict, replay_info: dict | None) -> None:
     print("Expected by target profile:")
     print(f"  action shape: {schema_info['expected_action_shape']}")
     print(f"  state shape: {schema_info['expected_state_shape']}")
-    print(f"  point_cloud shape: {schema_info['expected_point_cloud_shape']}")
+    for key, shape in schema_info["expected_point_cloud_shapes"].items():
+        print(f"  {key} shape: {shape}")
     print("")
     print("Checks:")
     for key in (
@@ -451,6 +474,14 @@ def print_report(schema_info: dict, replay_info: dict | None) -> None:
         "point_cloud_shape_matches_profile",
     ):
         print(f"  {_bool_icon(checks[key])} {key}")
+    for key in schema_info["expected_point_cloud_shapes"]:
+        for suffix in (
+            "present",
+            "length_matches_episode_ends",
+            "shape_matches_profile",
+        ):
+            check_key = f"{key}_{suffix}"
+            print(f"  {_bool_icon(checks[check_key])} {check_key}")
     print("")
     print(f"Verdict: usable_for_legacy_replay={checks['usable_for_legacy_replay']}")
     print(f"Verdict: usable_for_training={checks['usable_for_training']}")

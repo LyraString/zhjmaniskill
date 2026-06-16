@@ -15,6 +15,11 @@ DEFAULT_POINT_CLOUD_PRIMARY_CAMERA = "head_camera"
 DEFAULT_POINT_CLOUD_CROP_MIN = np.asarray([-0.6, -0.35, 0.7401], dtype=np.float32)
 DEFAULT_POINT_CLOUD_CROP_MAX = np.asarray([0.6, 0.35, 2.0], dtype=np.float32)
 DEFAULT_POINT_CLOUD_SAMPLING = "fps"
+DEFAULT_MULTIVIEW_POINT_CLOUD_VIEWS = (
+    {"key": "head_point_cloud", "camera": "head_camera", "points": 1024},
+    {"key": "left_wrist_point_cloud", "camera": "left_wrist_camera", "points": 512},
+    {"key": "right_wrist_point_cloud", "camera": "right_wrist_camera", "points": 512},
+)
 ENV_POINT_CLOUD_EXCLUDED_SEG_IDS: dict[str, tuple[int, ...]] = {
     "HandoverBlock-v1": (3,),
 }
@@ -221,6 +226,63 @@ def _extract_point_cloud_from_sensor_data(
     return _postprocess_point_cloud(merged, target_points, sampling=sampling)
 
 
+def _normalize_point_cloud_views(views: Any) -> list[dict[str, Any]]:
+    if views in (None, "", False):
+        return []
+    if views is True:
+        return [dict(view) for view in DEFAULT_MULTIVIEW_POINT_CLOUD_VIEWS]
+    if not isinstance(views, Sequence) or isinstance(views, (str, bytes, bytearray)):
+        raise TypeError("point_cloud_views must be a sequence of view specs.")
+
+    normalized = []
+    for view in views:
+        if not isinstance(view, Mapping):
+            raise TypeError(f"Invalid point cloud view spec: {view!r}")
+        key = str(view.get("key", "")).strip()
+        camera = str(view.get("camera", "")).strip()
+        points = int(view.get("points", DEFAULT_POINT_CLOUD_SIZE))
+        if not key or not camera:
+            raise ValueError(f"View spec requires non-empty `key` and `camera`: {view!r}")
+        if points <= 0:
+            raise ValueError(f"View spec points must be positive: {view!r}")
+        normalized.append({"key": key, "camera": camera, "points": points})
+    return normalized
+
+
+def _extract_multiview_point_clouds_from_sensor_data(
+    payload: Mapping[str, Any],
+    views: Any,
+    *,
+    env_id: str | None = None,
+    sampling: str = DEFAULT_POINT_CLOUD_SAMPLING,
+) -> dict[str, np.ndarray]:
+    view_specs = _normalize_point_cloud_views(views)
+    if len(view_specs) == 0:
+        return {}
+
+    sensor_data = payload.get("sensor_data")
+    sensor_param = payload.get("sensor_param")
+    if not isinstance(sensor_data, Mapping) or not isinstance(sensor_param, Mapping):
+        return {}
+
+    result: dict[str, np.ndarray] = {}
+    for view in view_specs:
+        camera_name = str(view["camera"])
+        images = sensor_data.get(camera_name)
+        cam_param = sensor_param.get(camera_name)
+        if not isinstance(images, Mapping) or not isinstance(cam_param, Mapping):
+            continue
+        xyz = _extract_world_xyz_from_camera(images, cam_param, env_id=env_id)
+        if xyz is None:
+            continue
+        result[str(view["key"])] = _postprocess_point_cloud(
+            xyz,
+            int(view["points"]),
+            sampling=sampling,
+        )
+    return result
+
+
 def _extract_point_cloud(
     payload: Mapping[str, Any],
     target_points: int = DEFAULT_POINT_CLOUD_SIZE,
@@ -291,9 +353,19 @@ def convert_maniskill_obs(raw_obs: Any, metadata: dict[str, Any] | None = None) 
             if metadata is None
             else metadata.get("point_cloud_sampling", DEFAULT_POINT_CLOUD_SAMPLING)
         )
-        point_cloud = _extract_point_cloud(payload, env_id=env_id, sampling=sampling)
-        if point_cloud is not None:
-            payload["point_cloud"] = point_cloud
+        point_cloud_views = None if metadata is None else metadata.get("point_cloud_views")
+        multiview_point_clouds = _extract_multiview_point_clouds_from_sensor_data(
+            payload,
+            point_cloud_views,
+            env_id=env_id,
+            sampling=sampling,
+        )
+        if multiview_point_clouds:
+            payload.update(multiview_point_clouds)
+        else:
+            point_cloud = _extract_point_cloud(payload, env_id=env_id, sampling=sampling)
+            if point_cloud is not None:
+                payload["point_cloud"] = point_cloud
 
         agent_pos = _extract_agent_pos(payload)
         if agent_pos is not None:

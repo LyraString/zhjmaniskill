@@ -27,7 +27,10 @@ class ManiSkillTaskFactory(TaskFactory):
         control_freq = resolved_kwargs.pop("control_freq", None)
         max_episode_steps = resolved_kwargs.pop("max_episode_steps", None)
         point_cloud_sampling = resolved_kwargs.pop("point_cloud_sampling", None)
+        point_cloud_views = resolved_kwargs.pop("point_cloud_views", None)
         sim_config = resolved_kwargs.pop("sim_config", None)
+        resolved_kwargs.pop("task_profile", None)
+        resolved_kwargs.pop("profile_name", None)
 
         _resolved_action_type, control_mode = resolve_runtime_control_mode(
             action_type=action_type,
@@ -47,6 +50,7 @@ class ManiSkillTaskFactory(TaskFactory):
             point_cloud_sampling=(
                 str(point_cloud_sampling) if point_cloud_sampling not in (None, "") else None
             ),
+            point_cloud_views=point_cloud_views,
             sim_config=dict(sim_config or {}),
             env_kwargs=dict(resolved_kwargs),
         )
@@ -67,7 +71,10 @@ class ManiSkillTaskFactory(TaskFactory):
         sim_freq = resolved_kwargs.pop("sim_freq", None)
         control_freq = resolved_kwargs.pop("control_freq", None)
         point_cloud_sampling = resolved_kwargs.pop("point_cloud_sampling", None)
+        resolved_kwargs.pop("point_cloud_views", None)
         sim_config = resolved_kwargs.pop("sim_config", None)
+        resolved_kwargs.pop("task_profile", None)
+        resolved_kwargs.pop("profile_name", None)
 
         _resolved_action_type, control_mode = resolve_runtime_control_mode(
             action_type=action_type,
