@@ -41,6 +41,7 @@ from diffusion_policy.env_runner.maniskill_fpo_runner import ManiSkillFPORunner
 from diffusion_policy.env_runner.maniskill_vector_fpo_runner import ManiSkillVectorFPORunner
 from diffusion_policy.env_runner.maniskill_cuda_fpo_runner import ManiSkillCudaFPORunner
 from sim.maniskill.task_profiles import resolve_runtime_control_mode
+from sim.maniskill.tasks.handover_block_env import BOX_HALF_SIZE, TARGET_HALF_SIZE
 
 # # Maniskill并行训练环境
 # import gymnasium as gym
@@ -109,6 +110,68 @@ ONLINE_UPDATE_DIAG_KEYS = (
 )
 
 
+CAPO_COUPLING_FEATURE_NAMES = (
+    "left_ee_x",
+    "left_ee_y",
+    "left_ee_z",
+    "left_ee_qw",
+    "left_ee_qx",
+    "left_ee_qy",
+    "left_ee_qz",
+    "right_ee_x",
+    "right_ee_y",
+    "right_ee_z",
+    "right_ee_qw",
+    "right_ee_qx",
+    "right_ee_qy",
+    "right_ee_qz",
+    "box_x",
+    "box_y",
+    "box_z",
+    "box_qw",
+    "box_qx",
+    "box_qy",
+    "box_qz",
+    "target_x",
+    "target_y",
+    "target_z",
+    "target_qw",
+    "target_qx",
+    "target_qy",
+    "target_qz",
+    "left_gripper",
+    "right_gripper",
+    "box_minus_left_ee_x",
+    "box_minus_left_ee_y",
+    "box_minus_left_ee_z",
+    "box_minus_right_ee_x",
+    "box_minus_right_ee_y",
+    "box_minus_right_ee_z",
+    "target_top_minus_box_bottom_x",
+    "target_top_minus_box_bottom_y",
+    "target_top_minus_box_bottom_z",
+    "left_to_box_dist",
+    "right_to_box_dist",
+    "box_to_target_dist",
+    "ee_to_ee_dist",
+)
+
+
+class _ScalarCouplingNet(torch.nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)
+
+
 def _format_online_progress(it, total, step_log):
     iter_idx = int(it) + 1
     total_iters = int(total)
@@ -167,7 +230,7 @@ def _payload_has_model_normalizer(payload: dict) -> bool:
 
 class RobotWorkspace(BaseWorkspace):
     include_keys = ["global_step", "epoch"]
-    exclude_keys = ("ref_model",)
+    exclude_keys = ("ref_model", "capo_coupling_model")
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
@@ -181,6 +244,10 @@ class RobotWorkspace(BaseWorkspace):
         # configure model
         self.model: BaseImagePolicy = hydra.utils.instantiate(cfg.policy)
         self.ref_model: BaseImagePolicy = None
+        self.capo_coupling_model = None
+        self.capo_feature_mean = None
+        self.capo_feature_std = None
+        self.capo_coupling_ckpt_path = None
 
         self.ema_model: BaseImagePolicy = None
         if cfg.training.use_ema:
@@ -697,6 +764,135 @@ class RobotWorkspace(BaseWorkspace):
         
         return gc
 
+    def _load_capo_coupling_model(self, capo_cfg, device):
+        ckpt_path = getattr(capo_cfg, "coupling_ckpt_path", None)
+        if ckpt_path in (None, ""):
+            raise ValueError("training.capo.coupling_ckpt_path is required when training.capo.source=learned.")
+        ckpt_path = pathlib.Path(str(ckpt_path))
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"CAPO coupling checkpoint not found: {ckpt_path}")
+        if self.capo_coupling_model is not None and self.capo_coupling_ckpt_path == str(ckpt_path):
+            return
+
+        payload = torch.load(ckpt_path, map_location="cpu")
+        feature_names = tuple(str(value) for value in payload.get("feature_names", ()))
+        if feature_names != CAPO_COUPLING_FEATURE_NAMES:
+            raise ValueError(
+                "CAPO coupling checkpoint feature_names do not match the runtime feature extractor."
+            )
+
+        input_dim = len(CAPO_COUPLING_FEATURE_NAMES)
+        hidden_dim = int(payload.get("hidden_dim", 128))
+        model = _ScalarCouplingNet(input_dim=input_dim, hidden_dim=hidden_dim)
+        model.load_state_dict(payload["model_state_dict"])
+        model.to(device=device)
+        model.eval()
+        model.requires_grad_(False)
+
+        feature_mean = torch.as_tensor(
+            payload["feature_mean"],
+            device=device,
+            dtype=torch.float32,
+        ).reshape(1, input_dim)
+        feature_std = torch.as_tensor(
+            payload["feature_std"],
+            device=device,
+            dtype=torch.float32,
+        ).reshape(1, input_dim).clamp_min(1e-6)
+
+        self.capo_coupling_model = model
+        self.capo_feature_mean = feature_mean
+        self.capo_feature_std = feature_std
+        self.capo_coupling_ckpt_path = str(ckpt_path)
+
+    def _pose_feature_tensor(self, pose, *, num_envs: int, device: torch.device) -> torch.Tensor:
+        pos = pose.p.to(device=device, dtype=torch.float32).reshape(num_envs, 3)
+        quat = pose.q.to(device=device, dtype=torch.float32).reshape(num_envs, 4)
+        return torch.cat([pos, quat], dim=-1)
+
+    def _extract_handover_capo_features(self, env, device) -> torch.Tensor:
+        if not hasattr(env, "env") or not hasattr(env.env, "unwrapped"):
+            raise RuntimeError("Learned CAPO requires a ManiSkill runner exposing env.unwrapped.")
+        unwrapped = env.env.unwrapped
+        required_attrs = ("box", "target_box", "get_arm_end_effector_link", "_get_gripper_state_tensor")
+        missing = [attr for attr in required_attrs if not hasattr(unwrapped, attr)]
+        if missing:
+            raise RuntimeError(f"Learned CAPO requires HandoverBlock task attributes, missing {missing}.")
+
+        num_envs = int(getattr(env, "num_envs", getattr(unwrapped, "num_envs", 1)))
+        left_ee_pose = self._pose_feature_tensor(
+            unwrapped.get_arm_end_effector_link(arm_index=0).pose,
+            num_envs=num_envs,
+            device=device,
+        )
+        right_ee_pose = self._pose_feature_tensor(
+            unwrapped.get_arm_end_effector_link(arm_index=1).pose,
+            num_envs=num_envs,
+            device=device,
+        )
+        box_pose = self._pose_feature_tensor(unwrapped.box.pose, num_envs=num_envs, device=device)
+        target_pose = self._pose_feature_tensor(unwrapped.target_box.pose, num_envs=num_envs, device=device)
+
+        left_ee_pos = left_ee_pose[:, :3]
+        right_ee_pos = right_ee_pose[:, :3]
+        box_pos = box_pose[:, :3]
+        box_bottom = box_pos.clone()
+        box_bottom[:, 2] -= float(BOX_HALF_SIZE[2])
+        target_top = target_pose[:, :3].clone()
+        target_top[:, 2] += float(TARGET_HALF_SIZE[2])
+
+        left_gripper = unwrapped._get_gripper_state_tensor(arm_index=0).to(
+            device=device,
+            dtype=torch.float32,
+        ).reshape(num_envs, -1)[:, :1]
+        right_gripper = unwrapped._get_gripper_state_tensor(arm_index=1).to(
+            device=device,
+            dtype=torch.float32,
+        ).reshape(num_envs, -1)[:, :1]
+
+        box_minus_left = box_pos - left_ee_pos
+        box_minus_right = box_pos - right_ee_pos
+        target_top_minus_box_bottom = target_top - box_bottom
+        distances = torch.stack(
+            [
+                torch.linalg.norm(box_minus_left, dim=1),
+                torch.linalg.norm(box_minus_right, dim=1),
+                torch.linalg.norm(target_top_minus_box_bottom, dim=1),
+                torch.linalg.norm(right_ee_pos - left_ee_pos, dim=1),
+            ],
+            dim=1,
+        )
+
+        features = torch.cat(
+            [
+                left_ee_pose,
+                right_ee_pose,
+                box_pose,
+                target_pose,
+                left_gripper,
+                right_gripper,
+                box_minus_left,
+                box_minus_right,
+                target_top_minus_box_bottom,
+                distances,
+            ],
+            dim=1,
+        )
+        if features.shape != (num_envs, len(CAPO_COUPLING_FEATURE_NAMES)):
+            raise RuntimeError(
+                "Learned CAPO feature shape mismatch: "
+                f"expected {(num_envs, len(CAPO_COUPLING_FEATURE_NAMES))}, got {tuple(features.shape)}"
+            )
+        return features
+
+    def _predict_handover_capo_coupling(self, env, capo_cfg, device) -> torch.Tensor:
+        self._load_capo_coupling_model(capo_cfg, device)
+        features = self._extract_handover_capo_features(env, device)
+        normalized = (features - self.capo_feature_mean) / self.capo_feature_std
+        with torch.no_grad():
+            score = torch.sigmoid(self.capo_coupling_model(normalized))
+        return score.reshape(-1).clamp(0.0, 1.0)
+
     # 计算GAE函数
     def calculate_gae(self, rewards, values, truncs, discounts, bootstrap_values):
 
@@ -810,15 +1006,18 @@ class RobotWorkspace(BaseWorkspace):
         rollout_tqdm_interval = float(getattr(cfg_t, "rollout_tqdm_interval_sec", 1.0))
         capo_cfg = getattr(cfg_t, "capo", None)
         capo_enabled = bool(getattr(capo_cfg, "enabled", False)) if capo_cfg is not None else False
-        stage_coupling_values = (
-            getattr(capo_cfg, "stage_coupling", [0.2, 0.5, 1.0, 0.7, 0.4])
-            if capo_cfg is not None
-            else [0.2, 0.5, 1.0, 0.7, 0.4]
-        )
-        stage_coupling_values = [float(value) for value in list(stage_coupling_values)]
-        if len(stage_coupling_values) != 5:
-            raise ValueError("training.capo.stage_coupling must contain exactly 5 values.")
-        stage_coupling_tensor = torch.as_tensor(stage_coupling_values, device=device, dtype=torch.float32)
+        capo_source = str(getattr(capo_cfg, "source", "stage")).lower() if capo_cfg is not None else "stage"
+        if capo_enabled and capo_source not in {"stage", "learned"}:
+            raise ValueError(f"Unknown training.capo.source `{capo_source}`. Expected `stage` or `learned`.")
+        stage_coupling_tensor = None
+        if capo_enabled and capo_source == "stage":
+            stage_coupling_values = getattr(capo_cfg, "stage_coupling", [0.2, 0.5, 1.0, 0.7, 0.4])
+            stage_coupling_values = [float(value) for value in list(stage_coupling_values)]
+            if len(stage_coupling_values) != 5:
+                raise ValueError("training.capo.stage_coupling must contain exactly 5 values.")
+            stage_coupling_tensor = torch.as_tensor(stage_coupling_values, device=device, dtype=torch.float32)
+        if capo_enabled and capo_source == "learned":
+            self._load_capo_coupling_model(capo_cfg, device)
 
         obs, _ = env.reset()
         obs_hist = self._init_batched_obs_history(obs, n_obs_steps)
@@ -920,8 +1119,10 @@ class RobotWorkspace(BaseWorkspace):
                 return None
             return tensor
 
-        def fpo_stage_to_coupling(stage):
+        def fpo_current_coupling(stage):
             stage_id = stage.round().to(dtype=torch.long).clamp(0, 4)
+            if capo_source == "learned":
+                return self._predict_handover_capo_coupling(env, capo_cfg, device), stage_id
             return stage_coupling_tensor[stage_id], stage_id
 
         def compute_handover_fpo_reward(env_reward, info):
@@ -1043,7 +1244,7 @@ class RobotWorkspace(BaseWorkspace):
 
                 chunk_stage_at_sample = fpo_reward_stage.detach().clone()
                 if capo_enabled:
-                    chunk_coupling_score, chunk_stage_id = fpo_stage_to_coupling(chunk_stage_at_sample)
+                    chunk_coupling_score, chunk_stage_id = fpo_current_coupling(chunk_stage_at_sample)
 
                 with torch.inference_mode():
                     out = self.model.sample_action_with_info(
