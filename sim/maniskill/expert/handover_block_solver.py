@@ -110,7 +110,7 @@ class HandoverBlockSolver:
     RIGHT_PRE_PLACE_WORLD_OFFSET = np.asarray([0.0, 0.0, 0.0], dtype=np.float64)
     RIGHT_PLACE_WORLD_OFFSET = np.asarray([0.0, 0.0, 0.0], dtype=np.float64)
     USE_SELECTED_PLACE_CANDIDATE_AT_RUNTIME = True
-    RETURN_LEFT_HOME_AFTER_HANDOVER = False
+    RETURN_LEFT_HOME_AFTER_HANDOVER = True
     RIGHT_CARRY_RETRACT_SEGMENTS = ((0.02, -0.02, 0.0), (0.02, -0.02, 0.0))
     RIGHT_CARRY_LIFT_SEGMENTS = (0.03, 0.03, 0.03, 0.03, 0.02)
     RIGHT_CARRY_RELAX_BLEND = 0.0
@@ -176,7 +176,7 @@ class HandoverBlockSolver:
     LEFT_RELEASE_OPEN_SETTLE_STEPS = 10
     LEFT_RELEASE_CLEAR_WORLD_DELTA = np.asarray([0.0, -0.05, 0.04], dtype=np.float64)
     LEFT_RELEASE_CLEAR_LIFT_DELTA = np.asarray([0.0, 0.0, 0.06], dtype=np.float64)
-    LEFT_RELEASE_CLEAR_RETREAT_DELTA = np.asarray([0.0, -0.10, 0.02], dtype=np.float64)
+    LEFT_RELEASE_CLEAR_RETREAT_DELTA = np.asarray([0.0, -0.25, 0.05], dtype=np.float64)
     LEFT_RELEASE_CLEAR_STEPS = 16
     LEFT_RELEASE_CLEAR_SETTLE_STEPS = 4
     LEFT_RELEASE_CLEAR_IK_THRESHOLD = 1e-2
