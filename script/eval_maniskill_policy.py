@@ -1,6 +1,7 @@
 import argparse
 import importlib
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import dill
@@ -32,6 +33,61 @@ FINAL_SUCCESS_FIELDS = (
     ("right_clear", "right_ee_clear"),
     ("box_static", "box_static"),
 )
+
+
+MULTIVIEW_POINT_CLOUD_SPECS = {
+    "head_point_cloud": "head_camera",
+    "left_wrist_point_cloud": "left_wrist_camera",
+    "right_wrist_point_cloud": "right_wrist_camera",
+}
+
+
+def _shape_meta_obs_items(ckpt_cfg) -> list[tuple[str, object]]:
+    obs_meta = ckpt_cfg.task.shape_meta.obs
+    if isinstance(obs_meta, Mapping):
+        return list(obs_meta.items())
+    return [(str(key), obs_meta[key]) for key in obs_meta.keys()]
+
+
+def _shape_meta_shape(meta) -> list[int]:
+    if isinstance(meta, Mapping):
+        shape = meta.get("shape")
+    else:
+        shape = getattr(meta, "shape")
+    return [int(dim) for dim in shape]
+
+
+def _shape_meta_obs_keys(ckpt_cfg) -> list[str]:
+    return [key for key, _meta in _shape_meta_obs_items(ckpt_cfg)]
+
+
+def _checkpoint_multiview_point_cloud_views(ckpt_cfg) -> list[dict[str, object]]:
+    views = []
+    for key, meta in _shape_meta_obs_items(ckpt_cfg):
+        if key not in MULTIVIEW_POINT_CLOUD_SPECS:
+            continue
+        shape = _shape_meta_shape(meta)
+        if len(shape) != 2 or int(shape[-1]) != 3:
+            raise ValueError(
+                f"Invalid multiview point-cloud shape for `{key}` in checkpoint: {shape}"
+            )
+        views.append(
+            {
+                "key": key,
+                "camera": MULTIVIEW_POINT_CLOUD_SPECS[key],
+                "points": int(shape[0]),
+            }
+        )
+    return views
+
+
+def _adapt_runtime_for_checkpoint_obs(ckpt_cfg, runtime_kwargs: dict) -> None:
+    views = _checkpoint_multiview_point_cloud_views(ckpt_cfg)
+    if not views:
+        return
+
+    runtime_kwargs["point_cloud_views"] = views
+    runtime_kwargs["enable_wrist_cameras"] = True
 
 
 def _to_bool_scalar(value) -> bool:
@@ -200,6 +256,7 @@ def run_evaluation(args) -> None:
         "control_freq": args.control_freq,
         "max_episode_steps": args.max_episode_steps,
     }
+    _adapt_runtime_for_checkpoint_obs(ckpt_cfg, runtime_kwargs)
     _resolved_action_type, resolved_control_mode = resolve_runtime_control_mode(
         action_type=runtime_kwargs["action_type"],
         control_mode=runtime_kwargs["control_mode"],
@@ -229,6 +286,15 @@ def run_evaluation(args) -> None:
             obs = env.reset(seed=args.seed + episode_idx)
             adapter.reset_model(model)
             encoded_obs = adapter.encode_obs(dict(obs.data))
+            missing_obs_keys = [
+                key for key in _shape_meta_obs_keys(ckpt_cfg) if key not in encoded_obs
+            ]
+            if missing_obs_keys:
+                raise KeyError(
+                    "Runtime observation is missing checkpoint-required obs keys: "
+                    f"{missing_obs_keys}. "
+                    "Check the task profile or checkpoint observation schema."
+                )
             expected_obs_dim = int(ckpt_cfg.task.shape_meta.obs.agent_pos.shape[0])
             actual_obs_dim = int(np.asarray(encoded_obs["agent_pos"]).shape[-1])
             expected_action_dim = int(ckpt_cfg.task.shape_meta.action.shape[0])

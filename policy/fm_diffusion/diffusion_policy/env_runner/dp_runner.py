@@ -75,6 +75,13 @@ class DPRunner:
 
         return result
 
+    def get_policy_obs_keys(self, policy: BaseImagePolicy, obs_dict: dict) -> list[str]:
+        normalizer = getattr(policy, "normalizer", None)
+        params_dict = getattr(normalizer, "params_dict", None)
+        if params_dict is None:
+            return list(obs_dict.keys())
+        return [key for key in params_dict.keys() if key != "action"]
+
     def get_action(self, policy: BaseImagePolicy, observaton=None):
         device, dtype = policy.device, policy.dtype
         if observaton is not None:
@@ -88,8 +95,13 @@ class DPRunner:
         # run policy
         with torch.no_grad():
             obs_dict_input = {}
-            obs_dict_input["point_cloud"] = obs_dict["point_cloud"].unsqueeze(0)
-            obs_dict_input["agent_pos"] = obs_dict["agent_pos"].unsqueeze(0)
+            for key in self.get_policy_obs_keys(policy, obs_dict):
+                if key not in obs_dict:
+                    raise KeyError(
+                        f"Policy expects observation key `{key}`, but runtime obs only has "
+                        f"{sorted(obs_dict.keys())}."
+                    )
+                obs_dict_input[key] = obs_dict[key].unsqueeze(0)
 
             action_dict = policy.predict_action(obs_dict_input)
 
