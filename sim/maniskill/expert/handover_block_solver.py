@@ -195,10 +195,10 @@ class HandoverBlockSolver:
     LEFT_LIFT_FALLBACK_SETTLE_STEPS = 4
     LEFT_LIFT_FALLBACK_IK_THRESHOLD = 5e-2
 
-    def __init__(self, env_backend):
+    def __init__(self, env_backend, *, ctrl_cls=FixedRateMotionPrimitives):
         self.backend = env_backend
         self.base_env = env_backend.env.unwrapped
-        self.ctrl = FixedRateMotionPrimitives(env_backend)
+        self.ctrl = ctrl_cls(env_backend)
         self.box_half_size = to_numpy(BOX_HALF_SIZE).reshape(3)
         self.target_half_size = to_numpy(TARGET_HALF_SIZE).reshape(3)
         self.last_debug_info: dict[str, object] = {}
@@ -1179,6 +1179,7 @@ class HandoverBlockSolver:
                 0: float(self.ctrl.commanded_gripper[0]),
                 1: float(self.ctrl.commanded_gripper[1]),
             },
+            "ctrl_extra_state": copy.deepcopy(self.ctrl.capture_extra_state()),
             "last_debug_info": copy.deepcopy(self.last_debug_info),
             "first_pick_debug": copy.deepcopy(self.first_pick_debug),
         }
@@ -1196,6 +1197,7 @@ class HandoverBlockSolver:
         self.ctrl.commanded_arm_qpos[1] = np.asarray(snapshot["commanded_arm_qpos"][1], dtype=np.float64).copy()
         self.ctrl.commanded_gripper[0] = float(snapshot["commanded_gripper"][0])
         self.ctrl.commanded_gripper[1] = float(snapshot["commanded_gripper"][1])
+        self.ctrl.restore_extra_state(copy.deepcopy(snapshot.get("ctrl_extra_state", {})))
         self.last_debug_info = copy.deepcopy(snapshot["last_debug_info"])
         self.first_pick_debug = copy.deepcopy(snapshot["first_pick_debug"])
 
@@ -1755,14 +1757,23 @@ class HandoverBlockSolver:
             right_carry_relax_qpos = np.asarray(selected_place_candidate["relaxed_start_qpos"], dtype=np.float64).copy()
         else:
             right_carry_relax_qpos = current_right_qpos.copy()
-        if self.ctrl.move_to_qpos(
-            1,
-            right_carry_relax_qpos,
-            recorder,
-            steps=self.RIGHT_CARRY_RELAX_STEPS,
-            settle_steps=self.RIGHT_CARRY_RELAX_SETTLE_STEPS,
-        ):
-            return True, self.ctrl.steps_taken, self.ctrl.last_status
+        if getattr(self.ctrl, "uses_delta_pose_actions", False):
+            self.ctrl.last_plan_debug = {
+                "stage": "right_carry_relax",
+                "skipped": True,
+                "reason": "delta_pose_data_has_no_qpos_relax_action",
+                "current_right_qpos": np.asarray(current_right_qpos, dtype=np.float64).round(4).tolist(),
+                "right_carry_relax_qpos": np.asarray(right_carry_relax_qpos, dtype=np.float64).round(4).tolist(),
+            }
+        else:
+            if self.ctrl.move_to_qpos(
+                1,
+                right_carry_relax_qpos,
+                recorder,
+                steps=self.RIGHT_CARRY_RELAX_STEPS,
+                settle_steps=self.RIGHT_CARRY_RELAX_SETTLE_STEPS,
+            ):
+                return True, self.ctrl.steps_taken, self.ctrl.last_status
         if self.ctrl.last_status != "running":
             self.last_debug_info = {
                 "stage": "right_carry_relax",
@@ -1877,7 +1888,12 @@ class HandoverBlockSolver:
                 return False, self.ctrl.steps_taken, self.ctrl.last_status
 
         if use_selected_place_candidate:
-            if self.ctrl.execute_plan(1, selected_place_candidate["pre_plan"], recorder):
+            if self.ctrl.execute_plan_to_gripper_pose(
+                1,
+                selected_place_candidate["pre_plan"],
+                right_pre_place_pose,
+                recorder,
+            ):
                 return True, self.ctrl.steps_taken, self.ctrl.last_status
             if self.ctrl.last_status != "running":
                 self.last_debug_info = {
@@ -1916,9 +1932,10 @@ class HandoverBlockSolver:
             candidate_place_plan_start = np.asarray(selected_place_candidate["grasp_plan"]["position"][0], dtype=np.float64)
             candidate_place_plan_start_arm = candidate_place_plan_start[: current_qpos_before_place.shape[0]]
             place_plan_start_delta = current_qpos_before_place - candidate_place_plan_start_arm
-            if self.ctrl.execute_plan(
+            if self.ctrl.execute_plan_to_gripper_pose(
                 1,
                 selected_place_candidate["grasp_plan"],
+                right_place_pose,
                 recorder,
             ):
                 return True, self.ctrl.steps_taken, self.ctrl.last_status
@@ -2763,7 +2780,12 @@ class HandoverBlockSolver:
                 return False, self.ctrl.steps_taken, self.ctrl.last_status
 
             left_grasp_pose = self.ctrl.gripper_pose_to_planner_pose(0, pick_candidate.grasp_pose)
-            if self.ctrl.execute_plan(0, pick_candidate.grasp_plan, recorder):
+            if self.ctrl.execute_plan_to_gripper_pose(
+                0,
+                pick_candidate.grasp_plan,
+                pick_candidate.grasp_pose,
+                recorder,
+            ):
                 return True, self.ctrl.steps_taken, self.ctrl.last_status
             if self.ctrl.last_status != "running":
                 self.last_debug_info = {
