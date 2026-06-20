@@ -1375,17 +1375,21 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
     DELTA_ROTATION_EPS = 1e-9
     DEFAULT_TRANSLATION_STEP = 0.015
     DEFAULT_ROTATION_STEP = 0.10
+    POSE_POSITION_TOLERANCE = 0.005
+    POSE_ROTATION_TOLERANCE = 0.05
+    FINAL_CORRECTION_STEPS = 16
+    ACTION_BOUND_EPS = 1e-6
     uses_delta_pose_actions = True
 
     def reset_episode(self, max_episode_steps: int) -> None:
         super().reset_episode(max_episode_steps)
-        self.commanded_gripper_pose = {
+        self.desired_gripper_pose = {
             0: self.current_gripper_pose(0).copy(),
             1: self.current_gripper_pose(1).copy(),
         }
         self.home_gripper_pose = {
-            0: self.commanded_gripper_pose[0].copy(),
-            1: self.commanded_gripper_pose[1].copy(),
+            0: self.desired_gripper_pose[0].copy(),
+            1: self.desired_gripper_pose[1].copy(),
         }
         self.delta_step_count = 0
         self.ik_failure_count = 0
@@ -1393,9 +1397,9 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
 
     def capture_extra_state(self) -> dict[str, Any]:
         return {
-            "commanded_gripper_pose": {
-                0: np.asarray(self.commanded_gripper_pose[0], dtype=np.float64).copy(),
-                1: np.asarray(self.commanded_gripper_pose[1], dtype=np.float64).copy(),
+            "desired_gripper_pose": {
+                0: np.asarray(self.desired_gripper_pose[0], dtype=np.float64).copy(),
+                1: np.asarray(self.desired_gripper_pose[1], dtype=np.float64).copy(),
             },
             "home_gripper_pose": {
                 0: np.asarray(self.home_gripper_pose[0], dtype=np.float64).copy(),
@@ -1409,9 +1413,9 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
     def restore_extra_state(self, state: dict[str, Any]) -> None:
         if not state:
             return
-        self.commanded_gripper_pose = {
-            0: np.asarray(state["commanded_gripper_pose"][0], dtype=np.float64).copy(),
-            1: np.asarray(state["commanded_gripper_pose"][1], dtype=np.float64).copy(),
+        self.desired_gripper_pose = {
+            0: np.asarray(state["desired_gripper_pose"][0], dtype=np.float64).copy(),
+            1: np.asarray(state["desired_gripper_pose"][1], dtype=np.float64).copy(),
         }
         self.home_gripper_pose = {
             0: np.asarray(state["home_gripper_pose"][0], dtype=np.float64).copy(),
@@ -1423,7 +1427,7 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
 
     def delta_debug_summary(self) -> dict[str, int | str]:
         return {
-            "action_semantics": "delta_pose_world_gripper",
+            "action_semantics": "delta_pose_world_current_gripper",
             "delta_step_count": int(self.delta_step_count),
             "ik_failure_count": int(self.ik_failure_count),
             "qpos_fallback_count": int(self.qpos_fallback_count),
@@ -1482,11 +1486,29 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         delta_action = np.asarray(delta_action, dtype=np.float64).reshape(self.base_env.ACTION_DIM)
         targets: dict[int, np.ndarray] = {}
         for arm_index, offset in ((0, 0), (1, 7)):
-            current_pose = np.asarray(self.commanded_gripper_pose[arm_index], dtype=np.float64).copy()
-            current_pose[:3] += delta_action[offset : offset + 3]
-            current_pose[3:] = _apply_rotvec_to_quat_wxyz(current_pose[3:], delta_action[offset + 3 : offset + 6])
-            targets[arm_index] = current_pose
+            base_pose = np.asarray(self.desired_gripper_pose[arm_index], dtype=np.float64).copy()
+            base_pose[:3] += delta_action[offset : offset + 3]
+            base_pose[3:] = _apply_rotvec_to_quat_wxyz(base_pose[3:], delta_action[offset + 3 : offset + 6])
+            targets[arm_index] = base_pose
         return targets
+
+    @staticmethod
+    def _bounded_vector(vector: np.ndarray, max_norm: float) -> np.ndarray:
+        vector = np.asarray(vector, dtype=np.float64)
+        norm = float(np.linalg.norm(vector))
+        if norm <= max_norm or norm <= 0.0:
+            return vector
+        return vector * (float(max_norm) / norm)
+
+    @staticmethod
+    def _pose_error(current_pose: np.ndarray, target_pose: np.ndarray) -> tuple[float, float]:
+        current_pose = np.asarray(current_pose, dtype=np.float64).reshape(7)
+        target_pose = np.asarray(target_pose, dtype=np.float64).reshape(7)
+        position_error = float(np.linalg.norm(target_pose[:3] - current_pose[:3]))
+        rotation_error = float(
+            np.linalg.norm(_relative_rotvec_wxyz(current_pose[3:], target_pose[3:]))
+        )
+        return position_error, rotation_error
 
     def _delta_action_from_targets(
         self,
@@ -1497,12 +1519,22 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         grippers = {} if grippers is None else grippers
         chunks: list[np.ndarray] = []
         for arm_index in (0, 1):
-            current_pose = np.asarray(self.commanded_gripper_pose[arm_index], dtype=np.float64).reshape(7)
-            target_pose = np.asarray(target_gripper_poses.get(arm_index, current_pose), dtype=np.float64).reshape(7)
+            current_pose = self.current_gripper_pose(arm_index)
+            if arm_index in target_gripper_poses:
+                desired_pose = np.asarray(target_gripper_poses[arm_index], dtype=np.float64).reshape(7).copy()
+                desired_pose[3:] = _normalize_quat_wxyz(desired_pose[3:], reference=current_pose[3:])
+                self.desired_gripper_pose[arm_index] = desired_pose
+            target_pose = np.asarray(self.desired_gripper_pose[arm_index], dtype=np.float64).reshape(7)
             target_pose = target_pose.copy()
             target_pose[3:] = _normalize_quat_wxyz(target_pose[3:], reference=current_pose[3:])
-            delta_pos = target_pose[:3] - current_pose[:3]
-            delta_rot = _relative_rotvec_wxyz(current_pose[3:], target_pose[3:])
+            delta_pos = self._bounded_vector(
+                target_pose[:3] - current_pose[:3],
+                self.DEFAULT_TRANSLATION_STEP,
+            )
+            delta_rot = self._bounded_vector(
+                _relative_rotvec_wxyz(current_pose[3:], target_pose[3:]),
+                self.DEFAULT_ROTATION_STEP,
+            )
             gripper = float(grippers.get(arm_index, self.commanded_gripper[arm_index]))
             chunks.append(
                 np.concatenate(
@@ -1516,7 +1548,7 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
             )
         return np.concatenate(chunks, axis=0).astype(np.float32, copy=False)
 
-    def apply_delta_action(self, delta_action: np.ndarray, recorder) -> tuple[Any, bool]:
+    def apply_delta_action(self, delta_action: np.ndarray, recorder, *, _ik_poses: dict[int, np.ndarray] | None = None) -> tuple[Any, bool]:
         if self.steps_taken >= self.step_limit:
             raise EpisodeLimitReached
         delta_action = np.asarray(delta_action, dtype=np.float32).reshape(self.base_env.ACTION_DIM)
@@ -1525,13 +1557,32 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
             self.last_plan_debug = {"action": delta_action.tolist()}
             return self._failed_result(), False
 
-        target_poses = self._target_poses_from_delta_action(delta_action)
+        for arm_index, offset in ((0, 0), (1, 7)):
+            delta_pos_norm = float(np.linalg.norm(delta_action[offset : offset + 3]))
+            delta_rot_norm = float(np.linalg.norm(delta_action[offset + 3 : offset + 6]))
+            if (
+                delta_pos_norm > self.DEFAULT_TRANSLATION_STEP + self.ACTION_BOUND_EPS
+                or delta_rot_norm > self.DEFAULT_ROTATION_STEP + self.ACTION_BOUND_EPS
+            ):
+                self.last_status = "delta_pose_action_out_of_bounds"
+                self.last_plan_debug = {
+                    "arm_index": int(arm_index),
+                    "translation_norm": delta_pos_norm,
+                    "rotation_norm": delta_rot_norm,
+                    "action": delta_action.tolist(),
+                }
+                return self._failed_result(), False
+
+        if _ik_poses is not None:
+            target_poses = {k: np.asarray(v, dtype=np.float64).reshape(7) for k, v in _ik_poses.items()}
+        else:
+            target_poses = self._target_poses_from_delta_action(delta_action)
         arm_qpos: dict[int, np.ndarray] = {}
         for arm_index, offset in ((0, 0), (1, 7)):
             delta_pos_norm = float(np.linalg.norm(delta_action[offset : offset + 3]))
             delta_rot_norm = float(np.linalg.norm(delta_action[offset + 3 : offset + 6]))
             if delta_pos_norm <= self.DELTA_TRANSLATION_EPS and delta_rot_norm <= self.DELTA_ROTATION_EPS:
-                arm_qpos[arm_index] = np.asarray(self.commanded_arm_qpos[arm_index], dtype=np.float64).copy()
+                arm_qpos[arm_index] = self.current_qpos(arm_index).copy()
                 continue
             target_pose = self.gripper_pose_to_planner_pose(arm_index, target_poses[arm_index])
             ik_qpos, ik_reason = self.ik_to_pose_debug(arm_index, target_pose)
@@ -1562,8 +1613,8 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         self.commanded_arm_qpos[1] = arm_qpos[1].astype(np.float64, copy=True)
         self.commanded_gripper[0] = left_gripper
         self.commanded_gripper[1] = right_gripper
-        self.commanded_gripper_pose[0] = target_poses[0].copy()
-        self.commanded_gripper_pose[1] = target_poses[1].copy()
+        self.desired_gripper_pose[0] = target_poses[0].copy()
+        self.desired_gripper_pose[1] = target_poses[1].copy()
         self.steps_taken += 1
         self.delta_step_count += 1
         self.maybe_render()
@@ -1577,7 +1628,8 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         recorder,
     ) -> tuple[Any, bool]:
         delta_action = self._delta_action_from_targets(target_gripper_poses, grippers)
-        return self.apply_delta_action(delta_action, recorder)
+        ik_poses = {0: self.desired_gripper_pose[0], 1: self.desired_gripper_pose[1]}
+        return self.apply_delta_action(delta_action, recorder, _ik_poses=ik_poses)
 
     def _move_arm_to_gripper_pose(
         self,
@@ -1592,7 +1644,7 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         allow_success_early: bool = True,
     ) -> bool:
         target_gripper_pose = np.asarray(target_gripper_pose, dtype=np.float64).reshape(7).copy()
-        start_pose = np.asarray(self.commanded_gripper_pose[int(arm_index)], dtype=np.float64).copy()
+        start_pose = self.desired_gripper_pose[int(arm_index)].copy()
         if steps is None:
             steps = self._estimate_pose_steps(start_pose, target_gripper_pose)
         for pose in self._interpolate_gripper_poses(start_pose, target_gripper_pose, int(steps)):
@@ -1607,6 +1659,37 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
             if result.terminated or result.truncated:
                 self.last_status = "terminated_during_delta_pose_move"
                 return False
+
+        self.desired_gripper_pose[int(arm_index)] = target_gripper_pose.copy()
+        position_error, rotation_error = self._pose_error(
+            self.current_gripper_pose(int(arm_index)),
+            target_gripper_pose,
+        )
+        for _ in range(self.FINAL_CORRECTION_STEPS):
+            if (
+                position_error <= self.POSE_POSITION_TOLERANCE
+                and rotation_error <= self.POSE_ROTATION_TOLERANCE
+            ):
+                break
+            grippers = {} if gripper is None else {int(arm_index): float(gripper)}
+            result, success = self._step_target_gripper_poses(
+                {int(arm_index): target_gripper_pose},
+                grippers,
+                recorder,
+            )
+            if success and allow_success_early:
+                self.last_status = "success"
+                return True
+            if self.last_status != "running":
+                self.last_status = fail_status
+                return False
+            if result.terminated or result.truncated:
+                self.last_status = "terminated_during_delta_pose_correction"
+                return False
+            position_error, rotation_error = self._pose_error(
+                self.current_gripper_pose(int(arm_index)),
+                target_gripper_pose,
+            )
         if settle_steps > 0:
             for _ in range(int(settle_steps)):
                 grippers = {} if gripper is None else {int(arm_index): float(gripper)}

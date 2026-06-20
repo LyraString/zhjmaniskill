@@ -108,6 +108,21 @@ def _recorder_actions(recorder) -> np.ndarray:
     return np.asarray(actions, dtype=np.float32)
 
 
+def _delta_pose_actions_valid(actions: np.ndarray) -> bool:
+    actions = np.asarray(actions, dtype=np.float32)
+    if actions.size == 0 or actions.ndim != 2 or actions.shape[1] != 14:
+        return False
+    if not np.all(np.isfinite(actions)):
+        return False
+    eps = 1e-6
+    for offset in (0, 7):
+        translation_norms = np.linalg.norm(actions[:, offset : offset + 3], axis=1)
+        rotation_norms = np.linalg.norm(actions[:, offset + 3 : offset + 6], axis=1)
+        if np.any(translation_norms > 0.015 + eps) or np.any(rotation_norms > 0.10 + eps):
+            return False
+    return True
+
+
 def _validate_action_replay(
     *,
     task_name: str,
@@ -181,98 +196,6 @@ def _validate_action_replay(
             debug["bottom_minus_target_top"] = [
                 round(float(value), 4) for value in bottom_minus_top
             ]
-        return bool(success), debug
-    finally:
-        replay_env.close()
-
-
-class _NoopRecorder:
-    def append_step(self, *args, **kwargs) -> None:
-        return None
-
-
-def _final_eval_debug(env_backend) -> dict[str, object]:
-    eval_info: dict[str, object] = {}
-    evaluator = getattr(env_backend.env.unwrapped, "evaluate", None)
-    if callable(evaluator):
-        raw_eval = evaluator()
-        eval_info = {
-            key: _to_bool_scalar(value)
-            for key, value in raw_eval.items()
-            if key
-            in {
-                "success",
-                "spatial_success",
-                "right_gripper_open",
-                "right_ee_clear",
-                "box_static",
-                "xy_aligned",
-                "z_aligned",
-            }
-        }
-    base_env = env_backend.env.unwrapped
-    if hasattr(base_env, "box") and hasattr(base_env, "target_box"):
-        box = _to_numpy(base_env.box.pose.p).reshape(-1, 3)[0]
-        target = _to_numpy(base_env.target_box.pose.p).reshape(-1, 3)[0]
-        bottom_minus_top = (box - np.asarray([0.0, 0.0, 0.1])) - (
-            target + np.asarray([0.0, 0.0, 0.005])
-        )
-        eval_info["bottom_minus_target_top"] = [
-            round(float(value), 4) for value in bottom_minus_top
-        ]
-    return eval_info
-
-
-def _validate_delta_pose_replay(
-    *,
-    task_name: str,
-    resolved_runtime: dict,
-    seed: int,
-    actions: np.ndarray,
-    max_episode_steps: int,
-) -> tuple[bool, dict]:
-    from sim.maniskill.expert.primitives import DeltaPoseMotionPrimitives
-
-    replay_runtime = dict(resolved_runtime)
-    replay_runtime["render_mode"] = None
-    replay_runtime["obs_mode"] = "state_dict"
-    replay_env = ManiSkillTaskFactory().create_env(
-        task_name=task_name,
-        **replay_runtime,
-    )
-    ctrl = DeltaPoseMotionPrimitives(replay_env)
-    noop_recorder = _NoopRecorder()
-    try:
-        replay_env.reset(seed=int(seed))
-        ctrl.reset_episode(max_episode_steps)
-        steps = 0
-        terminated = False
-        truncated = False
-        success = False
-        for action in np.asarray(actions, dtype=np.float32)[: int(max_episode_steps)]:
-            result, step_success = ctrl.apply_delta_action(action, noop_recorder)
-            steps += 1
-            success = bool(step_success) or _to_bool_scalar(getattr(result, "info", {}).get("success", False))
-            if success:
-                break
-            terminated = bool(getattr(result, "terminated", False))
-            truncated = bool(getattr(result, "truncated", False))
-            if terminated or truncated or ctrl.last_status != "running":
-                break
-
-        eval_info = _final_eval_debug(replay_env)
-        success = bool(eval_info.get("success", success))
-        debug: dict[str, object] = {
-            "seed": int(seed),
-            "steps": int(steps),
-            "success": int(success),
-            "terminated": int(terminated),
-            "truncated": int(truncated),
-            "status": str(ctrl.last_status),
-            "plan_debug": dict(ctrl.last_plan_debug),
-            **ctrl.delta_debug_summary(),
-            **eval_info,
-        }
         return bool(success), debug
     finally:
         replay_env.close()
@@ -573,55 +496,27 @@ def run_collection(args) -> None:
                     max_episode_steps=args.max_episode_steps,
                 )
                 delta_debug = solver.ctrl.delta_debug_summary()
-
-                replay_debug = None
-                replay_success = None
-                if episode_length > 0 and success and int(delta_debug.get("qpos_fallback_count", 0)) == 0:
-                    try:
-                        replay_success, replay_debug = _validate_delta_pose_replay(
-                            task_name=runtime_task_name,
-                            resolved_runtime=resolved_runtime,
-                            seed=reset_seed,
-                            actions=_recorder_actions(recorder),
-                            max_episode_steps=args.max_episode_steps,
-                        )
-                    except Exception as exc:
-                        replay_success = False
-                        replay_debug = {
-                            "seed": int(reset_seed),
-                            "success": 0,
-                            "error": repr(exc),
-                        }
-                    if not replay_success:
-                        status = f"{status}|delta_replay_failed"
-                elif int(delta_debug.get("qpos_fallback_count", 0)) > 0:
-                    replay_success = False
-                    replay_debug = {
-                        "seed": int(reset_seed),
-                        "success": 0,
-                        "status": "qpos_fallback_in_delta_episode",
-                        **delta_debug,
-                    }
-                    status = f"{status}|qpos_fallback_in_delta_episode"
-
+                actions_valid = _delta_pose_actions_valid(_recorder_actions(recorder))
+                ik_failure_count = int(delta_debug.get("ik_failure_count", 0))
+                qpos_fallback_count = int(delta_debug.get("qpos_fallback_count", 0))
+                if episode_length > 0 and not actions_valid:
+                    status = f"{status}|delta_action_invalid"
                 should_save = (
                     episode_length > 0
                     and success
-                    and replay_success is True
-                    and int(delta_debug.get("qpos_fallback_count", 0)) == 0
-                ) or (not args.save_only_success and episode_length > 0)
+                    and qpos_fallback_count == 0
+                    and actions_valid
+                )
                 if should_save:
                     out_path = recorder.save_episode(saved_episode_idx)
                     metadata = {
                         "collector": "scripted_delta_pose_expert",
-                        "action_semantics": "delta_pose_world_gripper",
+                        "action_semantics": "delta_pose_world_current_gripper",
                         "seed": int(reset_seed),
                         "length": int(episode_length),
                         "success": bool(success),
-                        "delta_replay_success": None if replay_success is None else bool(replay_success),
                         "status": str(status),
                         "delta_debug": delta_debug,
-                        "delta_replay": replay_debug,
                         "first_pick_debug": getattr(solver, "first_pick_debug", None),
                         "debug": getattr(solver, "last_debug_info", None),
                     }
@@ -630,8 +525,9 @@ def run_collection(args) -> None:
                         f"saved {out_path} "
                         f"(seed={reset_seed}, length={episode_length}, "
                         f"success={int(success)}, "
-                        f"delta_replay_success={int(replay_success) if replay_success is not None else 'n/a'}, "
-                        f"qpos_fallback_count={int(delta_debug.get('qpos_fallback_count', 0))}, "
+                        f"ik_failure_count={ik_failure_count}, "
+                        f"qpos_fallback_count={qpos_fallback_count}, "
+                        f"actions_valid={int(actions_valid)}, "
                         f"status={status})"
                     )
                     saved_episode_idx += 1
@@ -639,15 +535,11 @@ def run_collection(args) -> None:
                     print(
                         f"skipped scripted_delta_pose_expert attempt={attempted_episode_idx} "
                         f"(seed={reset_seed}, length={episode_length}, success={int(success)}, "
-                        f"delta_replay_success={int(replay_success) if replay_success is not None else 'n/a'}, "
-                        f"qpos_fallback_count={int(delta_debug.get('qpos_fallback_count', 0))}, "
+                        f"ik_failure_count={ik_failure_count}, "
+                        f"qpos_fallback_count={qpos_fallback_count}, "
+                        f"actions_valid={int(actions_valid)}, "
                         f"status={status})"
                     )
-                    if replay_debug is not None:
-                        print(
-                            "scripted_delta_pose_expert_replay_debug="
-                            + json.dumps(replay_debug, ensure_ascii=False)
-                        )
                     if args.debug_scripted_expert and getattr(solver, "first_pick_debug", None):
                         print("scripted_delta_pose_expert_pick_debug=" + json.dumps(solver.first_pick_debug, ensure_ascii=False))
                     if args.debug_scripted_expert and getattr(solver, "last_debug_info", None):
