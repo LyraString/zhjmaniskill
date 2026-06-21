@@ -1486,10 +1486,10 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         delta_action = np.asarray(delta_action, dtype=np.float64).reshape(self.base_env.ACTION_DIM)
         targets: dict[int, np.ndarray] = {}
         for arm_index, offset in ((0, 0), (1, 7)):
-            base_pose = np.asarray(self.desired_gripper_pose[arm_index], dtype=np.float64).copy()
-            base_pose[:3] += delta_action[offset : offset + 3]
-            base_pose[3:] = _apply_rotvec_to_quat_wxyz(base_pose[3:], delta_action[offset + 3 : offset + 6])
-            targets[arm_index] = base_pose
+            current_pose = self.current_gripper_pose(arm_index).copy()
+            current_pose[:3] += delta_action[offset : offset + 3]
+            current_pose[3:] = _apply_rotvec_to_quat_wxyz(current_pose[3:], delta_action[offset + 3 : offset + 6])
+            targets[arm_index] = current_pose
         return targets
 
     @staticmethod
