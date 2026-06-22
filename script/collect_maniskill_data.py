@@ -118,7 +118,7 @@ def _delta_pose_actions_valid(actions: np.ndarray) -> bool:
     for offset in (0, 7):
         translation_norms = np.linalg.norm(actions[:, offset : offset + 3], axis=1)
         rotation_norms = np.linalg.norm(actions[:, offset + 3 : offset + 6], axis=1)
-        if np.any(translation_norms > 0.030 + eps) or np.any(rotation_norms > 0.10 + eps):
+        if np.any(translation_norms > 0.015 + eps) or np.any(rotation_norms > 0.10 + eps):
             return False
     return True
 
@@ -504,6 +504,7 @@ def run_collection(args) -> None:
                 should_save = (
                     episode_length > 0
                     and success
+                    and ik_failure_count == 0
                     and qpos_fallback_count == 0
                     and actions_valid
                 )
