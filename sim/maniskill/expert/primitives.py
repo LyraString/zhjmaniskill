@@ -1379,6 +1379,11 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
     # overshoot; this wider bound covers the true distribution and is used for the
     # bounds check (policy output) and recorded-data validity check.
     RECORDED_TRANSLATION_STEP = 0.030
+    # Per-dimension normalization allows the policy to combine independent rotation
+    # components up to their individual maxima simultaneously, producing 3-D rotation
+    # vector norms above DEFAULT_ROTATION_STEP even when training data was bounded.
+    # 0.20 rad covers the worst-case combination of per-dimension training maxima.
+    RECORDED_ROTATION_STEP = 0.20
     POSE_POSITION_TOLERANCE = 0.005
     POSE_ROTATION_TOLERANCE = 0.05
     FINAL_CORRECTION_STEPS = 16
@@ -1597,15 +1602,14 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
             self.last_plan_debug = {"action": delta_action.tolist()}
             return self._failed_result(), False
 
-        # Use RECORDED_TRANSLATION_STEP for bounds: actual post-step deltas can exceed
-        # DEFAULT_TRANSLATION_STEP due to PD overshoot, and policy output is trained on
-        # the actual-delta distribution.
+        # Use RECORDED_*_STEP for bounds: policy output may combine per-dimension
+        # normalizer maxima in ways that produce norms slightly above DEFAULT_*_STEP.
         for arm_index, offset in ((0, 0), (1, 7)):
             delta_pos_norm = float(np.linalg.norm(delta_action[offset : offset + 3]))
             delta_rot_norm = float(np.linalg.norm(delta_action[offset + 3 : offset + 6]))
             if (
                 delta_pos_norm > self.RECORDED_TRANSLATION_STEP + self.ACTION_BOUND_EPS
-                or delta_rot_norm > self.DEFAULT_ROTATION_STEP + self.ACTION_BOUND_EPS
+                or delta_rot_norm > self.RECORDED_ROTATION_STEP + self.ACTION_BOUND_EPS
             ):
                 self.last_status = "delta_pose_action_out_of_bounds"
                 self.last_plan_debug = {
