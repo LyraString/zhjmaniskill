@@ -31,6 +31,19 @@ from diffusion_policy.model.common.lr_scheduler import get_scheduler
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
+def _resolve_amp_config(training_cfg) -> tuple[bool, torch.dtype]:
+    amp_cfg = training_cfg.get("amp", {})
+    enabled = bool(amp_cfg.get("enabled", False))
+    dtype_name = str(amp_cfg.get("dtype", "bf16")).lower()
+    if dtype_name in ("bf16", "bfloat16"):
+        dtype = torch.bfloat16
+    elif dtype_name in ("fp16", "float16"):
+        dtype = torch.float16
+    else:
+        raise ValueError(f"Unsupported training.amp.dtype: {dtype_name}")
+    return enabled, dtype
+
+
 class RobotWorkspace(BaseWorkspace):
     include_keys = ["global_step", "epoch"]
 
@@ -143,6 +156,10 @@ class RobotWorkspace(BaseWorkspace):
         if self.ema_model is not None:
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
+        amp_enabled, amp_dtype = _resolve_amp_config(cfg.training)
+        amp_enabled = bool(amp_enabled and device.type == "cuda")
+        if amp_enabled:
+            print(f"Using AMP autocast: dtype={amp_dtype}")
 
         # save batch for sampling
         train_sampling_batch = None
@@ -212,7 +229,12 @@ class RobotWorkspace(BaseWorkspace):
                                 fpo_checks_done = True
 
                             # compute loss
-                            raw_loss = self.model.compute_loss(batch)
+                            with torch.autocast(
+                                device_type=device.type,
+                                dtype=amp_dtype,
+                                enabled=amp_enabled,
+                            ):
+                                raw_loss = self.model.compute_loss(batch)
                             loss = raw_loss / cfg.training.gradient_accumulate_every
                             loss.backward()
 
@@ -287,7 +309,12 @@ class RobotWorkspace(BaseWorkspace):
                             ) as tepoch:
                                 for batch_idx, batch in enumerate(tepoch):
                                     batch = dataset.postprocess(batch, device)
-                                    loss = self.model.compute_loss(batch)
+                                    with torch.autocast(
+                                        device_type=device.type,
+                                        dtype=amp_dtype,
+                                        enabled=amp_enabled,
+                                    ):
+                                        loss = self.model.compute_loss(batch)
                                     val_losses.append(loss)
                                     if (cfg.training.max_val_steps
                                             is not None) and batch_idx >= (cfg.training.max_val_steps - 1):
@@ -305,9 +332,14 @@ class RobotWorkspace(BaseWorkspace):
                             obs_dict = batch["obs"]
                             gt_action = batch["action"]
 
-                            result = policy.predict_action(obs_dict)
+                            with torch.autocast(
+                                device_type=device.type,
+                                dtype=amp_dtype,
+                                enabled=amp_enabled,
+                            ):
+                                result = policy.predict_action(obs_dict)
                             pred_action = result["action_pred"]
-                            mse = torch.nn.functional.mse_loss(pred_action, gt_action)
+                            mse = torch.nn.functional.mse_loss(pred_action.float(), gt_action.float())
                             step_log["train_action_mse_error"] = mse.item()
                             del batch
                             del obs_dict

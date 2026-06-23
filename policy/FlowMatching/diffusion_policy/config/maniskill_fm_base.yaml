@@ -89,6 +89,9 @@ training:
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0
+  amp:
+    enabled: False
+    dtype: bf16
 
 logging:
   project: flow_matching_policy_debug

@@ -28,3 +28,6 @@ training:
   rollout_every: 50
   checkpoint_every: 100
   sample_every: 5
+  amp:
+    enabled: True
+    dtype: bf16
