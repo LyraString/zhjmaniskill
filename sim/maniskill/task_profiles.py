@@ -166,6 +166,31 @@ MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
             "enable_wrist_cameras": True,
         },
     },
+    "handover_block_ur5_v2_multiview_delta_pose_actual": {
+        "env_id": "HandoverBlockUR5-v2",
+        **DEFAULT_MANISKILL_RUNTIME,
+        "action_type": "bimanual_pd_ee_delta_pose",
+        "control_mode": "bimanual_pd_ee_delta_pose",
+        "robot_uids": "none",
+        "point_cloud_sampling": "fast",
+        "point_cloud_views": UR5_V2_MULTIVIEW_POINT_CLOUD_VIEWS,
+        "shape_meta": {
+            "head_point_cloud": [1024, 3],
+            "left_wrist_point_cloud": [512, 3],
+            "right_wrist_point_cloud": [512, 3],
+            "agent_pos": [14],
+            "action": [14],
+        },
+        "dataset": {
+            "zarr_path": (
+                "data/HandoverBlockUR5-v2-"
+                "handover_block_ur5_v2_multiview_delta_pose_native_actual_100_v1-100.zarr"
+            ),
+        },
+        "env_kwargs": {
+            "enable_wrist_cameras": True,
+        },
+    },
 }
 
 

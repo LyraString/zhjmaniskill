@@ -89,6 +89,13 @@ def _relative_rotvec_wxyz(start_quat: np.ndarray, target_quat: np.ndarray) -> np
     return relative.as_rotvec().astype(np.float64, copy=False)
 
 
+def _relative_euler_xyz_wxyz(start_quat: np.ndarray, target_quat: np.ndarray) -> np.ndarray:
+    start_quat = _normalize_quat_wxyz(start_quat)
+    target_quat = _normalize_quat_wxyz(target_quat, reference=start_quat)
+    relative = _rotation_from_quat_wxyz(target_quat) * _rotation_from_quat_wxyz(start_quat).inv()
+    return relative.as_euler("XYZ").astype(np.float64, copy=False)
+
+
 def _apply_rotvec_to_quat_wxyz(quat: np.ndarray, rotvec: np.ndarray) -> np.ndarray:
     rotation = Rotation.from_rotvec(np.asarray(rotvec, dtype=np.float64).reshape(3)) * _rotation_from_quat_wxyz(quat)
     return _quat_wxyz_from_rotation(rotation)
@@ -1363,55 +1370,28 @@ class FixedRateMotionPrimitives:
 
 
 class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
-    """Execute expert motion through gripper-pose delta commands.
-
-    The environment still receives its native joint-position action, but the
-    recorder stores the 14-D delta-pose command that produced that joint action.
-    Any path that only has a joint-qpos target is treated as a data-quality
-    failure instead of silently recording mixed action semantics.
-    """
+    """Convert expert Cartesian waypoints into native actual-relative actions."""
 
     DELTA_TRANSLATION_EPS = 1e-9
     DELTA_ROTATION_EPS = 1e-9
     DEFAULT_TRANSLATION_STEP = 0.015
     DEFAULT_ROTATION_STEP = 0.10
-    # Actual post-step EE displacement can exceed DEFAULT_TRANSLATION_STEP due to PD
-    # overshoot; this wider bound covers the true distribution and is used for the
-    # bounds check (policy output) and recorded-data validity check.
-    RECORDED_TRANSLATION_STEP = 0.030
-    # Per-dimension normalization allows the policy to combine independent rotation
-    # components up to their individual maxima simultaneously, producing 3-D rotation
-    # vector norms above DEFAULT_ROTATION_STEP even when training data was bounded.
-    # 0.20 rad covers the worst-case combination of per-dimension training maxima.
-    RECORDED_ROTATION_STEP = 0.20
+    POSITION_CORRECTION_GAIN = 1.0
+    ROTATION_CORRECTION_GAIN = 1.0
     POSE_POSITION_TOLERANCE = 0.005
     POSE_ROTATION_TOLERANCE = 0.05
-    FINAL_CORRECTION_STEPS = 16
+    MAX_WAYPOINT_TRACKING_STEPS = 32
     ACTION_BOUND_EPS = 1e-6
-    # Multiplier applied to joint stiffness/damping when DeltaPoseMotionPrimitives
-    # is active.  1x = no change (default K=1000 D=200).  Contact physics during
-    # handover requires compliant arms; higher stiffness interferes with box transfer.
-    DRIVE_STIFFNESS_MULTIPLIER = 1.0
     uses_delta_pose_actions = True
-
-    def _apply_delta_drives(self) -> None:
-        """Override arm joint stiffness/damping for delta-pose execution.
-        Does NOT modify gripper drives (gripper tracking is non-critical)."""
-        mult = float(self.DRIVE_STIFFNESS_MULTIPLIER)
-        if mult == 1.0:
-            return
-        spec = getattr(self.base_env, "embodiment_spec", None)
-        if spec is None:
-            return
-        for arm_idx in (0, 1):
-            joint_k, joint_d = spec.joint_drive_params(arm_idx)
-            joints = self.base_env.left_arm_joints if arm_idx == 0 else self.base_env.right_arm_joints
-            for joint in joints:
-                joint.set_drive_properties(joint_k * mult, joint_d * mult)
 
     def reset_episode(self, max_episode_steps: int) -> None:
         super().reset_episode(max_episode_steps)
-        self._apply_delta_drives()
+        expected_mode = getattr(self.base_env, "DELTA_POSE_CONTROL_MODE", "bimanual_pd_ee_delta_pose")
+        if getattr(self.base_env, "_control_mode", None) != expected_mode:
+            raise RuntimeError(
+                f"DeltaPoseMotionPrimitives requires control_mode={expected_mode}; "
+                f"got {getattr(self.base_env, '_control_mode', None)}"
+            )
         self.desired_gripper_pose = {
             0: self.current_gripper_pose(0).copy(),
             1: self.current_gripper_pose(1).copy(),
@@ -1421,8 +1401,9 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
             1: self.desired_gripper_pose[1].copy(),
         }
         self.delta_step_count = 0
-        self.ik_failure_count = 0
+        self.controller_failure_count = 0
         self.qpos_fallback_count = 0
+        self.waypoint_nonconvergence_count = 0
 
     def capture_extra_state(self) -> dict[str, Any]:
         return {
@@ -1435,8 +1416,9 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
                 1: np.asarray(self.home_gripper_pose[1], dtype=np.float64).copy(),
             },
             "delta_step_count": int(self.delta_step_count),
-            "ik_failure_count": int(self.ik_failure_count),
+            "controller_failure_count": int(self.controller_failure_count),
             "qpos_fallback_count": int(self.qpos_fallback_count),
+            "waypoint_nonconvergence_count": int(self.waypoint_nonconvergence_count),
         }
 
     def restore_extra_state(self, state: dict[str, Any]) -> None:
@@ -1451,55 +1433,33 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
             1: np.asarray(state["home_gripper_pose"][1], dtype=np.float64).copy(),
         }
         self.delta_step_count = int(state.get("delta_step_count", 0))
-        self.ik_failure_count = int(state.get("ik_failure_count", 0))
+        self.controller_failure_count = int(state.get("controller_failure_count", 0))
         self.qpos_fallback_count = int(state.get("qpos_fallback_count", 0))
+        self.waypoint_nonconvergence_count = int(
+            state.get("waypoint_nonconvergence_count", 0)
+        )
 
-    def delta_debug_summary(self) -> dict[str, int | str]:
+    def delta_debug_summary(self) -> dict[str, float | int | str]:
         return {
-            "action_semantics": "delta_pose_world_current_gripper",
+            "action_semantics": "delta_pose_actual",
+            "rotation_representation": "euler_xyz",
+            "translation_frame": "root_world_aligned",
+            "gripper_semantics": "absolute",
+            "control_mode": "bimanual_pd_ee_delta_pose",
+            "translation_action_limit": float(self.DEFAULT_TRANSLATION_STEP),
+            "rotation_action_limit": float(self.DEFAULT_ROTATION_STEP),
+            "position_correction_gain": float(self.POSITION_CORRECTION_GAIN),
+            "rotation_correction_gain": float(self.ROTATION_CORRECTION_GAIN),
+            "position_waypoint_tolerance": float(self.POSE_POSITION_TOLERANCE),
+            "rotation_waypoint_tolerance": float(self.POSE_ROTATION_TOLERANCE),
             "delta_step_count": int(self.delta_step_count),
-            "ik_failure_count": int(self.ik_failure_count),
+            "controller_failure_count": int(self.controller_failure_count),
             "qpos_fallback_count": int(self.qpos_fallback_count),
+            "waypoint_nonconvergence_count": int(self.waypoint_nonconvergence_count),
         }
 
     def _failed_result(self):
         return SimpleNamespace(terminated=True, truncated=False, info={})
-
-    def _clik_to_pose_debug(
-        self,
-        arm_index: int,
-        target_pose: np.ndarray,
-        *,
-        threshold: float = 1e-3,
-    ) -> tuple[np.ndarray | None, str]:
-        """Warm-start CLIK IK via pinocchio — no random restarts, no collision check.
-        Reliably converges for sub-centimeter deltas where planner.IK fails because the
-        planning-world collision checker falsely rejects valid near-contact configurations."""
-        planner = self.planners[arm_index]
-        self.sync_sim_state()
-        current_qpos = self.current_full_qpos(arm_index)
-        q_init = planner.pad_qpos(current_qpos.copy())
-        goal_pose = planner.transform_goal_to_wrt_base(np.asarray(target_pose, dtype=np.float64))
-        q_min = planner.joint_limits[:, 0]
-        q_max = planner.joint_limits[:, 1]
-        try:
-            q_result, success, error = planner.pinocchio_model.compute_IK_CLIK_JL(
-                planner.move_group_link_id,
-                goal_pose,
-                q_init,
-                q_min,
-                q_max,
-                eps=float(threshold),
-                max_iter=1000,
-                dt=0.1,
-                damp=1e-3,
-            )
-        except Exception as exc:
-            return None, f"clik_exception:{type(exc).__name__}:{exc}"
-        if not success:
-            err_norm = float(np.linalg.norm(np.asarray(error, dtype=np.float64)))
-            return None, f"clik_not_converged:err={err_norm:.4f}"
-        return np.asarray(q_result, dtype=np.float64), "success"
 
     def _step_and_record(self, action: np.ndarray, recorder) -> tuple[Any, bool]:
         self.qpos_fallback_count += 1
@@ -1547,16 +1507,6 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
             poses.append(pose)
         return poses
 
-    def _target_poses_from_delta_action(self, delta_action: np.ndarray) -> dict[int, np.ndarray]:
-        delta_action = np.asarray(delta_action, dtype=np.float64).reshape(self.base_env.ACTION_DIM)
-        targets: dict[int, np.ndarray] = {}
-        for arm_index, offset in ((0, 0), (1, 7)):
-            current_pose = self.current_gripper_pose(arm_index).copy()
-            current_pose[:3] += delta_action[offset : offset + 3]
-            current_pose[3:] = _apply_rotvec_to_quat_wxyz(current_pose[3:], delta_action[offset + 3 : offset + 6])
-            targets[arm_index] = current_pose
-        return targets
-
     @staticmethod
     def _bounded_vector(vector: np.ndarray, max_norm: float) -> np.ndarray:
         vector = np.asarray(vector, dtype=np.float64)
@@ -1584,20 +1534,31 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         grippers = {} if grippers is None else grippers
         chunks: list[np.ndarray] = []
         for arm_index in (0, 1):
-            current_pose = self.current_gripper_pose(arm_index)
+            current_gripper_pose = self.current_gripper_pose(arm_index)
             if arm_index in target_gripper_poses:
                 desired_pose = np.asarray(target_gripper_poses[arm_index], dtype=np.float64).reshape(7).copy()
-                desired_pose[3:] = _normalize_quat_wxyz(desired_pose[3:], reference=current_pose[3:])
+                desired_pose[3:] = _normalize_quat_wxyz(
+                    desired_pose[3:], reference=current_gripper_pose[3:]
+                )
                 self.desired_gripper_pose[arm_index] = desired_pose
-            target_pose = np.asarray(self.desired_gripper_pose[arm_index], dtype=np.float64).reshape(7)
-            target_pose = target_pose.copy()
-            target_pose[3:] = _normalize_quat_wxyz(target_pose[3:], reference=current_pose[3:])
+            target_gripper_pose = np.asarray(
+                self.desired_gripper_pose[arm_index], dtype=np.float64
+            ).reshape(7).copy()
+            target_gripper_pose[3:] = _normalize_quat_wxyz(
+                target_gripper_pose[3:], reference=current_gripper_pose[3:]
+            )
+            current_ee_pose = self.current_ee_pose(arm_index)
+            target_ee_pose = self.gripper_pose_to_planner_pose(
+                arm_index, target_gripper_pose
+            )
             delta_pos = self._bounded_vector(
-                target_pose[:3] - current_pose[:3],
+                self.POSITION_CORRECTION_GAIN
+                * (target_ee_pose[:3] - current_ee_pose[:3]),
                 self.DEFAULT_TRANSLATION_STEP,
             )
             delta_rot = self._bounded_vector(
-                _relative_rotvec_wxyz(current_pose[3:], target_pose[3:]),
+                self.ROTATION_CORRECTION_GAIN
+                * _relative_euler_xyz_wxyz(current_ee_pose[3:], target_ee_pose[3:]),
                 self.DEFAULT_ROTATION_STEP,
             )
             gripper = float(grippers.get(arm_index, self.commanded_gripper[arm_index]))
@@ -1613,15 +1574,8 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
             )
         return np.concatenate(chunks, axis=0).astype(np.float32, copy=False)
 
-    def apply_delta_action(self, delta_action: np.ndarray, recorder, *, _ik_poses: dict[int, np.ndarray] | None = None) -> tuple[Any, bool]:
-        """Execute a delta-pose command and record it.
-
-        Recording (both paths): delta_action as-is — this is the commanded delta.
-        Execution target:
-          - _ik_poses provided (collection): CLIK/IK to the full waypoint, for precision.
-          - _ik_poses None (eval): CLIK to actual_pose + delta_action.
-        IK failure always aborts.
-        """
+    def apply_delta_action(self, delta_action: np.ndarray, recorder) -> tuple[Any, bool]:
+        """Send and record the same native actual-relative delta action."""
         if self.steps_taken >= self.step_limit:
             raise EpisodeLimitReached
         delta_action = np.asarray(delta_action, dtype=np.float32).reshape(self.base_env.ACTION_DIM)
@@ -1630,13 +1584,13 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
             self.last_plan_debug = {"action": delta_action.tolist()}
             return self._failed_result(), False
 
-        # Enforce action bounds (RECORDED_*_STEP covers training-data distribution).
+        # Expert deltas use radial bounds stricter than the environment's Box bounds.
         for arm_index, offset in ((0, 0), (1, 7)):
             delta_pos_norm = float(np.linalg.norm(delta_action[offset : offset + 3]))
             delta_rot_norm = float(np.linalg.norm(delta_action[offset + 3 : offset + 6]))
             if (
-                delta_pos_norm > self.RECORDED_TRANSLATION_STEP + self.ACTION_BOUND_EPS
-                or delta_rot_norm > self.RECORDED_ROTATION_STEP + self.ACTION_BOUND_EPS
+                delta_pos_norm > self.DEFAULT_TRANSLATION_STEP + self.ACTION_BOUND_EPS
+                or delta_rot_norm > self.DEFAULT_ROTATION_STEP + self.ACTION_BOUND_EPS
             ):
                 self.last_status = "delta_pose_action_out_of_bounds"
                 self.last_plan_debug = {
@@ -1647,56 +1601,23 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
                 }
                 return self._failed_result(), False
 
-        if _ik_poses is not None:
-            target_poses = {k: np.asarray(v, dtype=np.float64).reshape(7) for k, v in _ik_poses.items()}
-        else:
-            target_poses = self._target_poses_from_delta_action(delta_action)
-        arm_qpos: dict[int, np.ndarray] = {}
-        for arm_index, offset in ((0, 0), (1, 7)):
-            delta_pos_norm = float(np.linalg.norm(delta_action[offset : offset + 3]))
-            delta_rot_norm = float(np.linalg.norm(delta_action[offset + 3 : offset + 6]))
-            if delta_pos_norm <= self.DELTA_TRANSLATION_EPS and delta_rot_norm <= self.DELTA_ROTATION_EPS:
-                arm_qpos[arm_index] = self.current_qpos(arm_index).copy()
-                continue
-            target_pose = self.gripper_pose_to_planner_pose(arm_index, target_poses[arm_index])
-            if _ik_poses is not None:
-                # Collection path: global IK (collision-checked) for precision.
-                # Waypoint targets are within 30mm (enforced by _step_target_gripper_poses).
-                ik_qpos, ik_reason = self.ik_to_pose_debug(arm_index, target_pose)
-            else:
-                # Eval path: CLIK primary (no collision check) + global IK fallback.
-                ik_qpos, ik_reason = self._clik_to_pose_debug(arm_index, target_pose)
-                if ik_qpos is None:
-                    ik_qpos, ik_reason = self.ik_to_pose_debug(arm_index, target_pose)
-            if ik_qpos is None:
-                self.ik_failure_count += 1
-                self.last_status = "delta_pose_ik_failed"
-                self.last_plan_debug = {
-                    "arm_index": int(arm_index),
-                    "target_gripper_pose": target_poses[arm_index].round(4).tolist(),
-                    "target_pose": np.asarray(target_pose, dtype=np.float64).round(4).tolist(),
-                    "delta_action": delta_action.round(4).tolist(),
-                    "ik_reason": ik_reason,
-                }
-                return self._failed_result(), False
-            arm_qpos[arm_index] = self._arm_qpos_from_plan(ik_qpos)
-
-        left_gripper = float(delta_action[6])
-        right_gripper = float(delta_action[13])
-        joint_action = self.compose_action(
-            left_qpos=arm_qpos[0],
-            right_qpos=arm_qpos[1],
-            left_gripper=left_gripper,
-            right_gripper=right_gripper,
-        )
-        result = self.backend.step(ActionSpec.from_value(joint_action))
+        try:
+            result = self.backend.step(
+                ActionSpec.from_value(delta_action, action_type="bimanual_pd_ee_delta_pose")
+            )
+        except (RuntimeError, ValueError) as exc:
+            self.controller_failure_count += 1
+            self.last_status = "delta_pose_controller_failed"
+            self.last_plan_debug = {
+                "delta_action": delta_action.round(6).tolist(),
+                "reason": f"{type(exc).__name__}:{exc}",
+            }
+            return self._failed_result(), False
         recorder.append_step(delta_action, dict(result.observation.data))
-        self.commanded_arm_qpos[0] = arm_qpos[0].astype(np.float64, copy=True)
-        self.commanded_arm_qpos[1] = arm_qpos[1].astype(np.float64, copy=True)
-        self.commanded_gripper[0] = left_gripper
-        self.commanded_gripper[1] = right_gripper
-        self.desired_gripper_pose[0] = target_poses[0].copy()
-        self.desired_gripper_pose[1] = target_poses[1].copy()
+        self.commanded_arm_qpos[0] = self.current_qpos(0).copy()
+        self.commanded_arm_qpos[1] = self.current_qpos(1).copy()
+        self.commanded_gripper[0] = float(delta_action[6])
+        self.commanded_gripper[1] = float(delta_action[13])
         self.steps_taken += 1
         self.delta_step_count += 1
         self.maybe_render()
@@ -1710,10 +1631,7 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         recorder,
     ) -> tuple[Any, bool]:
         delta_action = self._delta_action_from_targets(target_gripper_poses, grippers)
-        return self.apply_delta_action(delta_action, recorder, _ik_poses={
-            0: self.desired_gripper_pose[0],
-            1: self.desired_gripper_pose[1],
-        })
+        return self.apply_delta_action(delta_action, recorder)
 
     def _move_arm_to_gripper_pose(
         self,
@@ -1728,12 +1646,14 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         allow_success_early: bool = True,
     ) -> bool:
         target_gripper_pose = np.asarray(target_gripper_pose, dtype=np.float64).reshape(7).copy()
-        start_pose = self.desired_gripper_pose[int(arm_index)].copy()
+        start_pose = self.current_gripper_pose(int(arm_index)).copy()
         if steps is None:
             steps = self._estimate_pose_steps(start_pose, target_gripper_pose)
         for pose in self._interpolate_gripper_poses(start_pose, target_gripper_pose, int(steps)):
             grippers = {} if gripper is None else {int(arm_index): float(gripper)}
-            result, success = self._step_target_gripper_poses({int(arm_index): pose}, grippers, recorder)
+            result, success = self._step_target_gripper_poses(
+                {int(arm_index): pose}, grippers, recorder
+            )
             if success and allow_success_early:
                 self.last_status = "success"
                 return True
@@ -1745,21 +1665,20 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
                 return False
 
         self.desired_gripper_pose[int(arm_index)] = target_gripper_pose.copy()
-        position_error, rotation_error = self._pose_error(
-            self.current_gripper_pose(int(arm_index)),
-            target_gripper_pose,
-        )
-        for _ in range(self.FINAL_CORRECTION_STEPS):
+        converged = False
+        for _ in range(self.MAX_WAYPOINT_TRACKING_STEPS):
+            position_error, rotation_error = self._pose_error(
+                self.current_gripper_pose(int(arm_index)), target_gripper_pose
+            )
             if (
                 position_error <= self.POSE_POSITION_TOLERANCE
                 and rotation_error <= self.POSE_ROTATION_TOLERANCE
             ):
+                converged = True
                 break
             grippers = {} if gripper is None else {int(arm_index): float(gripper)}
             result, success = self._step_target_gripper_poses(
-                {int(arm_index): target_gripper_pose},
-                grippers,
-                recorder,
+                {int(arm_index): target_gripper_pose}, grippers, recorder
             )
             if success and allow_success_early:
                 self.last_status = "success"
@@ -1770,10 +1689,15 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
             if result.terminated or result.truncated:
                 self.last_status = "terminated_during_delta_pose_correction"
                 return False
-            position_error, rotation_error = self._pose_error(
-                self.current_gripper_pose(int(arm_index)),
-                target_gripper_pose,
-            )
+        if not converged:
+            self.waypoint_nonconvergence_count += 1
+            self.last_plan_debug = {
+                "warning": "delta_pose_final_waypoint_not_converged",
+                "arm_index": int(arm_index),
+                "position_error": float(position_error),
+                "rotation_error": float(rotation_error),
+                "target_gripper_pose": target_gripper_pose.round(6).tolist(),
+            }
         if settle_steps > 0:
             for _ in range(int(settle_steps)):
                 grippers = {} if gripper is None else {int(arm_index): float(gripper)}

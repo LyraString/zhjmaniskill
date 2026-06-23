@@ -1,0 +1,46 @@
+name: handover_block_ur5_v2_multiview_delta_pose_actual
+
+maniskill:
+  profile: handover_block_ur5_v2_multiview_delta_pose_actual
+  env_id: HandoverBlockUR5-v2
+  action_type: bimanual_pd_ee_delta_pose
+  obs_mode: pointcloud+state_dict
+  control_mode: bimanual_pd_ee_delta_pose
+  render_mode: null
+  reward_mode: normalized_dense
+  robot_uids: none
+  sim_freq: 200
+  control_freq: 20
+  zarr_path: data/HandoverBlockUR5-v2-handover_block_ur5_v2_multiview_delta_pose_native_actual_100_v1-100.zarr
+  action_semantics: delta_pose_actual
+  rotation_representation: euler_xyz
+  translation_frame: root_world_aligned
+  gripper_semantics: absolute
+
+shape_meta: &shape_meta
+  obs:
+    head_point_cloud:
+      shape: [1024, 3]
+      type: point_cloud
+    left_wrist_point_cloud:
+      shape: [512, 3]
+      type: point_cloud
+    right_wrist_point_cloud:
+      shape: [512, 3]
+      type: point_cloud
+    agent_pos:
+      shape: [14]
+      type: low_dim
+  action:
+    shape: [14]
+
+dataset:
+  _target_: diffusion_policy.dataset.robot_pointcloud_dataset.RobotMultiViewPointCloudDataset
+  zarr_path: ${task.maniskill.zarr_path}
+  batch_size: ${dataloader.batch_size}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.0
+  max_train_episodes: null

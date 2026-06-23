@@ -90,6 +90,17 @@ def _adapt_runtime_for_checkpoint_obs(ckpt_cfg, runtime_kwargs: dict) -> None:
     runtime_kwargs["enable_wrist_cameras"] = True
 
 
+def _adapt_runtime_for_checkpoint_action(ckpt_cfg, runtime_kwargs: dict) -> None:
+    task_cfg = getattr(ckpt_cfg, "task", None)
+    maniskill_cfg = getattr(task_cfg, "maniskill", None)
+    checkpoint_control_mode = getattr(maniskill_cfg, "control_mode", None)
+    if runtime_kwargs.get("control_mode") in (None, "") and checkpoint_control_mode not in (None, ""):
+        runtime_kwargs["control_mode"] = str(checkpoint_control_mode)
+    checkpoint_action_type = getattr(maniskill_cfg, "action_type", None)
+    if runtime_kwargs.get("action_type") in (None, "") and checkpoint_action_type not in (None, ""):
+        runtime_kwargs["action_type"] = str(checkpoint_action_type)
+
+
 def _to_bool_scalar(value) -> bool:
     if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "numpy"):
         value = value.detach().cpu().numpy()
@@ -209,11 +220,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-freq", type=int, default=None)
     parser.add_argument("--save-video-dir", type=str, default=None)
     parser.add_argument("--video-fps", type=int, default=10)
-    parser.add_argument(
-        "--delta-pose",
-        action="store_true",
-        help="Execute policy delta-pose output via CLIK instead of passing raw joint actions.",
-    )
     return parser
 
 
@@ -262,6 +268,7 @@ def run_evaluation(args) -> None:
         "max_episode_steps": args.max_episode_steps,
     }
     _adapt_runtime_for_checkpoint_obs(ckpt_cfg, runtime_kwargs)
+    _adapt_runtime_for_checkpoint_action(ckpt_cfg, runtime_kwargs)
     _resolved_action_type, resolved_control_mode = resolve_runtime_control_mode(
         action_type=runtime_kwargs["action_type"],
         control_mode=runtime_kwargs["control_mode"],
@@ -277,19 +284,6 @@ def run_evaluation(args) -> None:
         **resolved_runtime,
     )
 
-    # Delta-pose execution path: policy outputs 14-D delta → CLIK → joint action.
-    if getattr(args, "delta_pose", False):
-        from sim.maniskill.expert.primitives import DeltaPoseMotionPrimitives, EpisodeLimitReached
-
-        class _NullRecorder:
-            def append_step(self, action, obs):
-                pass
-
-        _delta_rec = _NullRecorder()
-        delta_ctrl = DeltaPoseMotionPrimitives(env)
-    else:
-        delta_ctrl = None
-
     video_dir = Path(args.save_video_dir) if args.save_video_dir is not None else None
     if video_dir is not None:
         video_dir.mkdir(parents=True, exist_ok=True)
@@ -298,7 +292,6 @@ def run_evaluation(args) -> None:
     lengths = []
     successes = []
     handover_diags = []
-    delta_pose_episode_stats = []  # list of (ik_holds, mean_tracking_err) per episode
 
     try:
         for episode_idx in range(args.episodes):
@@ -336,49 +329,17 @@ def run_evaluation(args) -> None:
                 _maybe_capture_frame(env, frames)
             result = None
             handover_diag = _new_handover_diag()
-            if delta_ctrl is not None:
-                delta_ctrl.reset_episode(args.max_episode_steps)
-                delta_tracking_errs: list[float] = []
-
             while episode_length < args.max_episode_steps:
                 if len(model.obs_cache) == 0:
                     model.update_obs(encoded_obs)
                 action_chunk = model.get_action()
 
                 for action in action_chunk:
-                    if delta_ctrl is not None:
-                        action_np = np.asarray(action, dtype=np.float32).reshape(-1)
-                        pre_l = delta_ctrl.current_gripper_pose(0)[:3].copy()
-                        pre_r = delta_ctrl.current_gripper_pose(1)[:3].copy()
-                        try:
-                            result, step_success = delta_ctrl.apply_delta_action(action_np, _delta_rec)
-                        except EpisodeLimitReached:
-                            break
-                        if not hasattr(result, "reward"):
-                            # apply_delta_action returned _failed_result (non-finite or out-of-bounds).
-                            # This usually means a checkpoint mismatch (e.g. joint-pos ckpt).
-                            print(
-                                f"  WARNING step={episode_length}: delta_ctrl rejected "
-                                f"({delta_ctrl.last_status}) "
-                                f"action_max={float(np.abs(action_np).max()):.4f}"
-                            )
-                            break
-                        if step_success:
-                            success = True
-                        # Tracking error: ||actual_EE_displacement - requested_delta||
-                        post_l = delta_ctrl.current_gripper_pose(0)[:3]
-                        post_r = delta_ctrl.current_gripper_pose(1)[:3]
-                        err = (
-                            float(np.linalg.norm(post_l - pre_l - action_np[:3]))
-                            + float(np.linalg.norm(post_r - pre_r - action_np[7:10]))
-                        ) / 2.0
-                        delta_tracking_errs.append(err)
-                    else:
-                        result = env.step(
-                            ActionSpec.from_value(action, action_type=resolved_runtime["action_type"])
-                        )
-                        if _to_bool_scalar(result.info.get("success", False)):
-                            success = True
+                    result = env.step(
+                        ActionSpec.from_value(action, action_type=resolved_runtime["action_type"])
+                    )
+                    if _to_bool_scalar(result.info.get("success", False)):
+                        success = True
 
                     episode_return += float(result.reward)
                     episode_length += 1
@@ -401,10 +362,6 @@ def run_evaluation(args) -> None:
             handover_failure = _classify_handover_failure(handover_diag, success)
             if handover_diag["has_stage"]:
                 handover_diags.append({**handover_diag, "failure": handover_failure})
-            if delta_ctrl is not None:
-                ik_holds = int(delta_ctrl.ik_failure_count)
-                mean_track_err = float(np.mean(delta_tracking_errs)) if delta_tracking_errs else 0.0
-                delta_pose_episode_stats.append((ik_holds, mean_track_err))
             if video_dir is not None and len(frames) > 0:
                 episode_dir = video_dir
                 episode_dir.mkdir(parents=True, exist_ok=True)
@@ -417,11 +374,6 @@ def run_evaluation(args) -> None:
                 f"episode={episode_idx} return={episode_return:.4f} "
                 f"length={episode_length} success={int(success)}"
             )
-            if delta_ctrl is not None:
-                ep_line += (
-                    f" ik_holds={ik_holds}"
-                    f" mean_track_err={mean_track_err:.4f}m"
-                )
             print(ep_line)
             if handover_diag["has_stage"]:
                 hold_count = max(1, int(handover_diag["hold_count"]))
@@ -454,14 +406,6 @@ def run_evaluation(args) -> None:
         f"mean_length={float(np.mean(lengths)):.2f} "
         f"success_rate={float(np.mean(successes)):.4f}"
     )
-    if delta_pose_episode_stats:
-        total_holds = sum(h for h, _ in delta_pose_episode_stats)
-        mean_err = float(np.mean([e for _, e in delta_pose_episode_stats]))
-        print(
-            "delta_pose_summary "
-            f"total_ik_holds={total_holds} "
-            f"mean_track_err={mean_err:.4f}m"
-        )
     if len(handover_diags) > 0:
         diag_count = float(len(handover_diags))
         stage_buckets = [0, 0, 0, 0, 0]

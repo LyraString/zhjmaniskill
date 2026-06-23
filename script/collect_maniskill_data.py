@@ -334,6 +334,14 @@ def run_collection(args) -> None:
         "control_freq": args.control_freq,
         "max_episode_steps": args.max_episode_steps,
     }
+    if args.collector == "scripted_delta_pose_expert":
+        delta_control_mode = "bimanual_pd_ee_delta_pose"
+        if runtime_kwargs["control_mode"] not in (None, "", delta_control_mode):
+            raise ValueError(
+                "scripted_delta_pose_expert requires "
+                f"--control-mode {delta_control_mode}; got {runtime_kwargs['control_mode']}"
+            )
+        runtime_kwargs["control_mode"] = delta_control_mode
     _resolved_action_type, resolved_control_mode = resolve_runtime_control_mode(
         action_type=runtime_kwargs["action_type"],
         control_mode=runtime_kwargs["control_mode"],
@@ -497,14 +505,14 @@ def run_collection(args) -> None:
                 )
                 delta_debug = solver.ctrl.delta_debug_summary()
                 actions_valid = _delta_pose_actions_valid(_recorder_actions(recorder))
-                ik_failure_count = int(delta_debug.get("ik_failure_count", 0))
+                controller_failure_count = int(delta_debug.get("controller_failure_count", 0))
                 qpos_fallback_count = int(delta_debug.get("qpos_fallback_count", 0))
                 if episode_length > 0 and not actions_valid:
                     status = f"{status}|delta_action_invalid"
                 should_save = (
                     episode_length > 0
                     and success
-                    and ik_failure_count == 0
+                    and controller_failure_count == 0
                     and qpos_fallback_count == 0
                     and actions_valid
                 )
@@ -512,7 +520,11 @@ def run_collection(args) -> None:
                     out_path = recorder.save_episode(saved_episode_idx)
                     metadata = {
                         "collector": "scripted_delta_pose_expert",
-                        "action_semantics": "delta_pose_world_current_gripper",
+                        "action_semantics": "delta_pose_actual",
+                        "rotation_representation": "euler_xyz",
+                        "translation_frame": "root_world_aligned",
+                        "gripper_semantics": "absolute",
+                        "control_mode": "bimanual_pd_ee_delta_pose",
                         "seed": int(reset_seed),
                         "length": int(episode_length),
                         "success": bool(success),
@@ -526,7 +538,7 @@ def run_collection(args) -> None:
                         f"saved {out_path} "
                         f"(seed={reset_seed}, length={episode_length}, "
                         f"success={int(success)}, "
-                        f"ik_failure_count={ik_failure_count}, "
+                        f"controller_failure_count={controller_failure_count}, "
                         f"qpos_fallback_count={qpos_fallback_count}, "
                         f"actions_valid={int(actions_valid)}, "
                         f"status={status})"
@@ -536,7 +548,7 @@ def run_collection(args) -> None:
                     print(
                         f"skipped scripted_delta_pose_expert attempt={attempted_episode_idx} "
                         f"(seed={reset_seed}, length={episode_length}, success={int(success)}, "
-                        f"ik_failure_count={ik_failure_count}, "
+                        f"controller_failure_count={controller_failure_count}, "
                         f"qpos_fallback_count={qpos_fallback_count}, "
                         f"actions_valid={int(actions_valid)}, "
                         f"status={status})"

@@ -8,6 +8,10 @@ import numpy as np
 import sapien
 import torch
 
+from mani_skill.agents.controllers.pd_ee_pose import (
+    PDEEPoseController,
+    PDEEPoseControllerConfig,
+)
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.utils import common
 from mani_skill.sensors.camera import CameraConfig
@@ -16,6 +20,45 @@ from mani_skill.utils.building.ground import build_ground
 from mani_skill.utils.structs.types import SimConfig
 
 from sim.maniskill.bimanual_embodiment import BimanualEmbodimentSpec
+
+
+class _StrictPDEEPoseController(PDEEPoseController):
+    """PDEE controller that never hides an IK failure as a zero joint target."""
+
+    def set_action(self, action):
+        action = self._preprocess_action(action)
+        self._step = 0
+        self._start_qpos = self.qpos
+
+        previous_pose = self._target_pose if self.config.use_target else self.ee_pose_at_base
+        self._target_pose = self.compute_target_pose(previous_pose, action)
+
+        # ManiSkill's CUDA differential IK currently performs one Jacobian update
+        # even when solver_iterations is configured. Iterate here against the same
+        # absolute target so a bounded Cartesian action is solved accurately.
+        solver_config = dict(self.config.delta_solver_config)
+        solver_iterations = int(solver_config.pop("solver_iterations", 1))
+        q0 = self.articulation.get_qpos()
+        target_qpos = None
+        for _ in range(max(1, solver_iterations)):
+            target_qpos = self.kinematics.compute_ik(
+                pose=self._target_pose,
+                q0=q0,
+                is_delta_pose=False,
+                current_pose=None,
+                solver_config=solver_config,
+            )
+            if target_qpos is None:
+                raise RuntimeError("PDEE inverse kinematics failed.")
+            if not torch.isfinite(target_qpos).all():
+                raise RuntimeError("PDEE inverse kinematics returned a non-finite joint target.")
+            q0 = target_qpos
+
+        self._target_qpos = target_qpos
+        if self.config.interpolate:
+            self._step_size = (self._target_qpos - self._start_qpos) / self._sim_steps
+        else:
+            self.set_drive_targets(self._target_qpos)
 
 
 class BaseBimanualEnv(BaseEnv):
@@ -27,6 +70,12 @@ class BaseBimanualEnv(BaseEnv):
     ARM_DOF = 6
     GRIPPER_OPEN_THRESHOLD = 0.8
     ACTION_DIM = 14
+    JOINT_POSITION_CONTROL_MODE = "bimanual_pd_joint_pos"
+    DELTA_POSE_CONTROL_MODE = "bimanual_pd_ee_delta_pose"
+    DELTA_POSITION_LIMIT = 0.015
+    DELTA_ROTATION_LIMIT = 0.10
+    DELTA_JOINT_STIFFNESS_SCALE = 8.0
+    DELTA_JOINT_DAMPING_SCALE = 3.0
     TABLE_LENGTH = 1.2
     TABLE_WIDTH = 0.7
     TABLE_HEIGHT = 0.74
@@ -52,9 +101,43 @@ class BaseBimanualEnv(BaseEnv):
         self.left_gripper_val = 0.0
         self.right_gripper_val = 0.0
         self._manual_gripper_drive_override: dict[int, float] = {}
+        self.left_delta_pose_controller = None
+        self.right_delta_pose_controller = None
+        self.delta_controller_failure_count = 0
+        self.last_delta_control_debug: dict[str, Any] = {}
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
-        action_low = np.asarray([-np.pi] * self.ARM_DOF + [0.0] + [-np.pi] * self.ARM_DOF + [0.0], dtype=np.float32)
-        action_high = np.asarray([np.pi] * self.ARM_DOF + [1.0] + [np.pi] * self.ARM_DOF + [1.0], dtype=np.float32)
+        if self._control_mode in (None, "", "continuous", self.JOINT_POSITION_CONTROL_MODE):
+            action_low = np.asarray(
+                [-np.pi] * self.ARM_DOF + [0.0] + [-np.pi] * self.ARM_DOF + [0.0],
+                dtype=np.float32,
+            )
+            action_high = np.asarray(
+                [np.pi] * self.ARM_DOF + [1.0] + [np.pi] * self.ARM_DOF + [1.0],
+                dtype=np.float32,
+            )
+        elif self._control_mode == self.DELTA_POSE_CONTROL_MODE:
+            arm_low = [
+                -self.DELTA_POSITION_LIMIT,
+                -self.DELTA_POSITION_LIMIT,
+                -self.DELTA_POSITION_LIMIT,
+                -self.DELTA_ROTATION_LIMIT,
+                -self.DELTA_ROTATION_LIMIT,
+                -self.DELTA_ROTATION_LIMIT,
+                0.0,
+            ]
+            arm_high = [
+                self.DELTA_POSITION_LIMIT,
+                self.DELTA_POSITION_LIMIT,
+                self.DELTA_POSITION_LIMIT,
+                self.DELTA_ROTATION_LIMIT,
+                self.DELTA_ROTATION_LIMIT,
+                self.DELTA_ROTATION_LIMIT,
+                1.0,
+            ]
+            action_low = np.asarray(arm_low + arm_low, dtype=np.float32)
+            action_high = np.asarray(arm_high + arm_high, dtype=np.float32)
+        else:
+            raise ValueError(f"Unsupported bimanual control mode: {self._control_mode}")
         self.single_action_space = gym.spaces.Box(
             low=action_low,
             high=action_high,
@@ -207,6 +290,43 @@ class BaseBimanualEnv(BaseEnv):
         self.right_gripper = self._get_gripper_joints(self.right_robot, arm_index=1)
         self._configure_robot_drives(self.left_arm_joints, self.left_gripper, arm_index=0)
         self._configure_robot_drives(self.right_arm_joints, self.right_gripper, arm_index=1)
+        if self._control_mode == self.DELTA_POSE_CONTROL_MODE:
+            self.left_delta_pose_controller = self._build_delta_pose_controller(arm_index=0)
+            self.right_delta_pose_controller = self._build_delta_pose_controller(arm_index=1)
+
+    def _build_delta_pose_controller(self, arm_index: int) -> PDEEPoseController:
+        stiffness, damping = self.embodiment_spec.joint_drive_params(arm_index)
+        assets = self.get_arm_planner_assets(arm_index)
+        config = PDEEPoseControllerConfig(
+            joint_names=self.get_arm_joint_names(arm_index),
+            pos_lower=-self.DELTA_POSITION_LIMIT,
+            pos_upper=self.DELTA_POSITION_LIMIT,
+            rot_lower=-self.DELTA_ROTATION_LIMIT,
+            rot_upper=self.DELTA_ROTATION_LIMIT,
+            stiffness=stiffness * self.DELTA_JOINT_STIFFNESS_SCALE,
+            damping=damping * self.DELTA_JOINT_DAMPING_SCALE,
+            ee_link=self.get_arm_move_group(arm_index),
+            urdf_path=assets["urdf_path"],
+            frame="root_translation:root_aligned_body_rotation",
+            use_delta=True,
+            use_target=False,
+            interpolate=False,
+            normalize_action=False,
+            delta_solver_config={
+                "type": "levenberg_marquardt",
+                "alpha": 1.0,
+                "solver_iterations": 8,
+            },
+        )
+        controller = _StrictPDEEPoseController(
+            config=config,
+            articulation=self.get_arm_robot(arm_index),
+            control_freq=self._control_freq,
+            sim_freq=self._sim_freq,
+            scene=self.scene,
+        )
+        controller.set_drive_property()
+        return controller
 
     def _get_arm_joints(self, robot, arm_index: int):
         return [
@@ -471,6 +591,11 @@ class BaseBimanualEnv(BaseEnv):
             self._initialize_robot_state(self.right_robot, env_idx, arm_index=1)
             self._set_gripper(torch.zeros(len(env_idx), device=self.device), arm_index=0, env_idx=env_idx)
             self._set_gripper(torch.zeros(len(env_idx), device=self.device), arm_index=1, env_idx=env_idx)
+            if self.left_delta_pose_controller is not None:
+                self.left_delta_pose_controller.reset()
+                self.right_delta_pose_controller.reset()
+                self.delta_controller_failure_count = 0
+                self.last_delta_control_debug = {}
 
     def _arm_joint_limits(self, robot, arm_joints, target_qpos: torch.Tensor):
         qlimits = robot.get_qlimits().to(device=target_qpos.device, dtype=target_qpos.dtype)
@@ -504,15 +629,69 @@ class BaseBimanualEnv(BaseEnv):
             parsed_action = common.to_tensor(action, device=self.device).to(torch.float32)
             if parsed_action.shape == self._orig_single_action_space.shape:
                 parsed_action = common.batch(parsed_action)
-            self._apply_arm_action(self.left_robot, self.left_arm_joints, parsed_action[:, 0:6])
-            self._set_gripper(parsed_action[:, 6], arm_index=0)
-            self._apply_arm_action(self.right_robot, self.right_arm_joints, parsed_action[:, 7:13])
-            self._set_gripper(parsed_action[:, 13], arm_index=1)
+            if parsed_action.shape != (self.num_envs, self.ACTION_DIM):
+                raise ValueError(
+                    f"Expected action shape {(self.num_envs, self.ACTION_DIM)}, got {tuple(parsed_action.shape)}"
+                )
+            if not torch.isfinite(parsed_action).all():
+                raise ValueError("Bimanual action contains non-finite values.")
+
+            if self._control_mode == self.DELTA_POSE_CONTROL_MODE:
+                low = torch.as_tensor(
+                    self.single_action_space.low,
+                    device=self.device,
+                    dtype=parsed_action.dtype,
+                )
+                high = torch.as_tensor(
+                    self.single_action_space.high,
+                    device=self.device,
+                    dtype=parsed_action.dtype,
+                )
+                if torch.any(parsed_action < low) or torch.any(parsed_action > high):
+                    raise ValueError(
+                        "Delta-pose action exceeds physical bounds; actions are not clipped implicitly."
+                    )
+                left_action = parsed_action[:, 0:6]
+                right_action = parsed_action[:, 7:13]
+                self.last_delta_control_debug = {
+                    "action": parsed_action.detach().clone(),
+                    "left_start_pose": self.left_delta_pose_controller.ee_pose_at_base.raw_pose.detach().clone(),
+                    "right_start_pose": self.right_delta_pose_controller.ee_pose_at_base.raw_pose.detach().clone(),
+                }
+                try:
+                    self.left_delta_pose_controller.set_action(left_action)
+                    self.right_delta_pose_controller.set_action(right_action)
+                except Exception:
+                    self.delta_controller_failure_count += 1
+                    raise
+                target_qpos = (
+                    self.left_delta_pose_controller._target_qpos,
+                    self.right_delta_pose_controller._target_qpos,
+                )
+                if any(value is None or not torch.isfinite(value).all() for value in target_qpos):
+                    self.delta_controller_failure_count += 1
+                    raise RuntimeError("Delta-pose controller produced an invalid joint target.")
+                self.last_delta_control_debug.update(
+                    {
+                        "left_target_qpos": target_qpos[0].detach().clone(),
+                        "right_target_qpos": target_qpos[1].detach().clone(),
+                    }
+                )
+                self._set_gripper(parsed_action[:, 6], arm_index=0)
+                self._set_gripper(parsed_action[:, 13], arm_index=1)
+            else:
+                self._apply_arm_action(self.left_robot, self.left_arm_joints, parsed_action[:, 0:6])
+                self._set_gripper(parsed_action[:, 6], arm_index=0)
+                self._apply_arm_action(self.right_robot, self.right_arm_joints, parsed_action[:, 7:13])
+                self._set_gripper(parsed_action[:, 13], arm_index=1)
             if self.gpu_sim_enabled:
                 self.scene._gpu_apply_all()
 
         self._before_control_step()
         for _ in range(self._sim_steps_per_control):
+            if self.left_delta_pose_controller is not None:
+                self.left_delta_pose_controller.before_simulation_step()
+                self.right_delta_pose_controller.before_simulation_step()
             self.scene.step()
         self._after_control_step()
         if self.gpu_sim_enabled:

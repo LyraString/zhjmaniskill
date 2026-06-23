@@ -2933,6 +2933,11 @@ class HandoverBlockSolver:
                 }
 
             if clamp_lift_distance is None:
+                clamp_lift_mode = (
+                    "native_delta_pose"
+                    if getattr(self.ctrl, "uses_delta_pose_actions", False)
+                    else "ik_qpos"
+                )
                 self.last_debug_info = {
                     "stage": "left_clamp_lift",
                     "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
@@ -2941,7 +2946,7 @@ class HandoverBlockSolver:
                         round(float(distance), 4)
                         for distance in self.LEFT_FIRST_GRASP_CLAMP_LIFT_FALLBACK_DISTANCES
                     ],
-                    "left_clamp_lift_mode": "ik_qpos",
+                    "left_clamp_lift_mode": clamp_lift_mode,
                     "left_clamp_lift_trace": clamp_lift_trace,
                     "left_ee_pose": np.asarray(self.ctrl.current_ee_pose(0), dtype=np.float64).round(4).tolist(),
                     "left_gripper_pose": np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64).round(4).tolist(),
@@ -2971,7 +2976,11 @@ class HandoverBlockSolver:
                 float(self.ctrl.current_gripper_value(0)),
                 4,
             )
-            self.first_pick_debug["post_clamp_lift_mode"] = "ik_qpos"
+            self.first_pick_debug["post_clamp_lift_mode"] = (
+                "native_delta_pose"
+                if getattr(self.ctrl, "uses_delta_pose_actions", False)
+                else "ik_qpos"
+            )
             self.first_pick_debug["post_clamp_lift_distance"] = round(
                 float(clamp_lift_distance),
                 4,
