@@ -9,6 +9,7 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import os
+import subprocess
 import hydra
 import torch
 from omegaconf import OmegaConf
@@ -42,6 +43,58 @@ def _resolve_amp_config(training_cfg) -> tuple[bool, torch.dtype]:
     else:
         raise ValueError(f"Unsupported training.amp.dtype: {dtype_name}")
     return enabled, dtype
+
+
+def _resolve_nvidia_smi_gpu_id(device: torch.device) -> str | None:
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible_devices:
+        first_device = visible_devices.split(",")[0].strip()
+        if first_device and first_device not in ("-1", "none", "None"):
+            return first_device
+    if device.type == "cuda":
+        return str(device.index if device.index is not None else torch.cuda.current_device())
+    return None
+
+
+def _query_gpu_system_metrics(device: torch.device) -> dict:
+    gpu_id = _resolve_nvidia_smi_gpu_id(device)
+    if gpu_id is None:
+        return {}
+
+    query = "utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu"
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id={gpu_id}",
+                f"--query-gpu={query}",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except Exception:
+        return {}
+
+    line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+    parts = [part.strip() for part in line.split(",")]
+    if len(parts) != 5:
+        return {}
+
+    try:
+        gpu_util, mem_used, mem_total, power_draw, temp = [float(part) for part in parts]
+    except ValueError:
+        return {}
+
+    return {
+        "system_gpu_util_percent": gpu_util,
+        "system_gpu_mem_used_mb": mem_used,
+        "system_gpu_mem_total_mb": mem_total,
+        "system_gpu_power_w": power_draw,
+        "system_gpu_temp_c": temp,
+    }
 
 
 class RobotWorkspace(BaseWorkspace):
@@ -284,6 +337,7 @@ class RobotWorkspace(BaseWorkspace):
                     # replace train_loss with epoch average
                     train_loss = np.mean(train_losses)
                     step_log["train_loss"] = train_loss
+                    step_log["train_loss_std"] = float(np.std(train_losses))
 
                     # ========= eval for this epoch ==========
                     policy = self.model
@@ -339,14 +393,23 @@ class RobotWorkspace(BaseWorkspace):
                             ):
                                 result = policy.predict_action(obs_dict)
                             pred_action = result["action_pred"]
-                            mse = torch.nn.functional.mse_loss(pred_action.float(), gt_action.float())
+                            pred_action_float = pred_action.float()
+                            gt_action_float = gt_action.float()
+                            mse = torch.nn.functional.mse_loss(pred_action_float, gt_action_float)
+                            mae = torch.nn.functional.l1_loss(pred_action_float, gt_action_float)
                             step_log["train_action_mse_error"] = mse.item()
+                            step_log["train_action_mae_error"] = mae.item()
                             del batch
                             del obs_dict
                             del gt_action
                             del result
                             del pred_action
+                            del pred_action_float
+                            del gt_action_float
                             del mse
+                            del mae
+
+                    step_log.update(_query_gpu_system_metrics(device))
 
                     # checkpoint
                     if ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
@@ -368,6 +431,23 @@ class RobotWorkspace(BaseWorkspace):
                                 float(step_log["train_action_mse_error"]),
                                 tb_epoch,
                             )
+                        if "train_loss_std" in step_log:
+                            tb_writer.add_scalar("epoch/train_loss_std", float(step_log["train_loss_std"]), tb_epoch)
+                        if "train_action_mae_error" in step_log:
+                            tb_writer.add_scalar(
+                                "epoch/train_action_mae_error",
+                                float(step_log["train_action_mae_error"]),
+                                tb_epoch,
+                            )
+                        for key in (
+                            "system_gpu_util_percent",
+                            "system_gpu_mem_used_mb",
+                            "system_gpu_mem_total_mb",
+                            "system_gpu_power_w",
+                            "system_gpu_temp_c",
+                        ):
+                            if key in step_log:
+                                tb_writer.add_scalar(f"system/{key.removeprefix('system_')}", float(step_log[key]), tb_epoch)
 
                     # ========= eval end for this epoch ==========
                     policy.train()

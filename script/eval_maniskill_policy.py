@@ -101,6 +101,37 @@ def _adapt_runtime_for_checkpoint_action(ckpt_cfg, runtime_kwargs: dict) -> None
         runtime_kwargs["action_type"] = str(checkpoint_action_type)
 
 
+def _new_action_clip_stats():
+    return {
+        "steps": 0,
+        "clipped_steps": 0,
+        "dims": 0,
+        "clipped_dims": 0,
+        "abs_sum": 0.0,
+        "abs_max": 0.0,
+    }
+
+
+def _clip_action_to_space(action, action_space, stats: dict):
+    action_np = np.asarray(action, dtype=np.float32)
+    low = np.asarray(action_space.low, dtype=np.float32)
+    high = np.asarray(action_space.high, dtype=np.float32)
+    clipped = np.clip(action_np, low, high)
+    diff = np.abs(clipped - action_np)
+
+    stats["steps"] += 1
+    stats["dims"] += int(diff.size)
+    clipped_mask = diff > 0.0
+    clipped_dims = int(np.count_nonzero(clipped_mask))
+    stats["clipped_dims"] += clipped_dims
+    if clipped_dims > 0:
+        stats["clipped_steps"] += 1
+        stats["abs_sum"] += float(diff[clipped_mask].sum())
+        stats["abs_max"] = max(stats["abs_max"], float(diff.max()))
+
+    return clipped
+
+
 def _to_bool_scalar(value) -> bool:
     if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "numpy"):
         value = value.detach().cpu().numpy()
@@ -292,6 +323,7 @@ def run_evaluation(args) -> None:
     lengths = []
     successes = []
     handover_diags = []
+    action_clip_stats = _new_action_clip_stats()
 
     try:
         for episode_idx in range(args.episodes):
@@ -335,6 +367,7 @@ def run_evaluation(args) -> None:
                 action_chunk = model.get_action()
 
                 for action in action_chunk:
+                    action = _clip_action_to_space(action, env.action_space, action_clip_stats)
                     result = env.step(
                         ActionSpec.from_value(action, action_type=resolved_runtime["action_type"])
                     )
@@ -406,6 +439,15 @@ def run_evaluation(args) -> None:
         f"mean_length={float(np.mean(lengths)):.2f} "
         f"success_rate={float(np.mean(successes)):.4f}"
     )
+    if action_clip_stats["steps"] > 0:
+        clipped_dims = max(1, int(action_clip_stats["clipped_dims"]))
+        print(
+            "action_clip_summary "
+            f"step_frac={action_clip_stats['clipped_steps'] / action_clip_stats['steps']:.6f} "
+            f"dim_frac={action_clip_stats['clipped_dims'] / max(1, action_clip_stats['dims']):.6f} "
+            f"abs_mean={action_clip_stats['abs_sum'] / clipped_dims:.6f} "
+            f"abs_max={action_clip_stats['abs_max']:.6f}"
+        )
     if len(handover_diags) > 0:
         diag_count = float(len(handover_diags))
         stage_buckets = [0, 0, 0, 0, 0]
