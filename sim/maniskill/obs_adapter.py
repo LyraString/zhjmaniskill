@@ -38,14 +38,14 @@ def _convert_value(value: Any) -> Any:
 
 
 def _to_xyz(pointcloud: Any) -> np.ndarray:
-    pointcloud_np = np.asarray(pointcloud)
+    pointcloud_np = np.asarray(_convert_value(pointcloud))
     if pointcloud_np.ndim >= 1 and pointcloud_np.shape[-1] >= 3:
         return pointcloud_np[..., :3].astype(np.float32, copy=False)
     return pointcloud_np.astype(np.float32, copy=False)
 
 
 def _squeeze_single_env(value: Any) -> np.ndarray:
-    value_np = np.asarray(value)
+    value_np = np.asarray(_convert_value(value))
     if value_np.ndim >= 1 and value_np.shape[0] == 1:
         value_np = value_np[0]
     return value_np
@@ -144,8 +144,8 @@ def _extract_world_xyz_from_camera(
     if "cam2world_gl" not in cam_param:
         return None
 
-    position = np.asarray(images["position"], dtype=np.float32)
-    cam2world = np.asarray(cam_param["cam2world_gl"], dtype=np.float32)
+    position = np.asarray(_convert_value(images["position"]), dtype=np.float32)
+    cam2world = np.asarray(_convert_value(cam_param["cam2world_gl"]), dtype=np.float32)
     segmentation = images.get("segmentation")
 
     if position.ndim >= 4 and position.shape[0] == 1:
@@ -153,7 +153,7 @@ def _extract_world_xyz_from_camera(
     if cam2world.ndim == 3 and cam2world.shape[0] == 1:
         cam2world = cam2world[0]
     if segmentation is not None:
-        segmentation = np.asarray(segmentation)
+        segmentation = np.asarray(_convert_value(segmentation))
         if segmentation.ndim >= 4 and segmentation.shape[0] == 1:
             segmentation = segmentation[0]
 
@@ -168,20 +168,22 @@ def _extract_world_xyz_from_camera(
     else:
         valid = np.ones(position_xyz.shape[:-1], dtype=bool)
 
-    points_xyzw = np.concatenate(
-        [
-            position_xyz.reshape(-1, 3),
-            valid.reshape(-1, 1).astype(np.float32),
-        ],
-        axis=-1,
-    )
-    world_xyzw = points_xyzw @ cam2world.T
-    xyz = world_xyzw[world_xyzw[:, 3] > 0, :3]
-    if xyz.shape[0] == 0:
+    valid_flat = valid.reshape(-1)
+    if not np.any(valid_flat):
         return None
+
+    camera_xyz = position_xyz.reshape(-1, 3)[valid_flat]
+    cam2world = np.asarray(cam2world, dtype=np.float32)
+    rotation = cam2world[:3, :3]
+    translation = cam2world[:3, 3]
+    xyz = (camera_xyz @ rotation.T) + translation
+
+    segmentation_flat = None
+    if segmentation is not None:
+        segmentation_flat = segmentation.reshape(-1)[valid_flat]
     xyz = _filter_segmentation_ids(
         xyz,
-        segmentation.reshape(-1) if segmentation is not None else None,
+        segmentation_flat,
         env_id=env_id,
     )
     if xyz.shape[0] == 0:
@@ -341,35 +343,65 @@ def _extract_agent_pos(payload: Mapping[str, Any]) -> np.ndarray | None:
     return None
 
 
+def _build_learner_payload(
+    payload: Mapping[str, Any],
+    *,
+    env_id: str | None,
+    sampling: str,
+    point_cloud_views: Any,
+) -> dict[str, Any]:
+    learner_payload: dict[str, Any] = {}
+    multiview_point_clouds = _extract_multiview_point_clouds_from_sensor_data(
+        payload,
+        point_cloud_views,
+        env_id=env_id,
+        sampling=sampling,
+    )
+    if multiview_point_clouds:
+        learner_payload.update(multiview_point_clouds)
+    else:
+        point_cloud = _extract_point_cloud(payload, env_id=env_id, sampling=sampling)
+        if point_cloud is not None:
+            learner_payload["point_cloud"] = point_cloud
+
+    agent_pos = _extract_agent_pos(payload)
+    if agent_pos is not None:
+        learner_payload["agent_pos"] = agent_pos
+    return learner_payload
+
+
 def convert_maniskill_obs(raw_obs: Any, metadata: dict[str, Any] | None = None) -> Observation:
     """Convert a raw ManiSkill observation into the shared ``Observation`` schema."""
+
+    env_id = None if metadata is None else metadata.get("env_id")
+    sampling = (
+        DEFAULT_POINT_CLOUD_SAMPLING
+        if metadata is None
+        else metadata.get("point_cloud_sampling", DEFAULT_POINT_CLOUD_SAMPLING)
+    )
+    point_cloud_views = None if metadata is None else metadata.get("point_cloud_views")
+
+    if isinstance(raw_obs, Mapping):
+        payload = _build_learner_payload(
+            raw_obs,
+            env_id=env_id,
+            sampling=sampling,
+            point_cloud_views=point_cloud_views,
+        )
+        if payload:
+            return Observation.from_mapping(payload, metadata=metadata)
 
     converted = _convert_value(raw_obs)
     if isinstance(converted, Mapping):
         payload = dict(converted)
-        env_id = None if metadata is None else metadata.get("env_id")
-        sampling = (
-            DEFAULT_POINT_CLOUD_SAMPLING
-            if metadata is None
-            else metadata.get("point_cloud_sampling", DEFAULT_POINT_CLOUD_SAMPLING)
-        )
-        point_cloud_views = None if metadata is None else metadata.get("point_cloud_views")
-        multiview_point_clouds = _extract_multiview_point_clouds_from_sensor_data(
+        learner_payload = _build_learner_payload(
             payload,
-            point_cloud_views,
             env_id=env_id,
             sampling=sampling,
+            point_cloud_views=point_cloud_views,
         )
-        if multiview_point_clouds:
-            payload.update(multiview_point_clouds)
-        else:
-            point_cloud = _extract_point_cloud(payload, env_id=env_id, sampling=sampling)
-            if point_cloud is not None:
-                payload["point_cloud"] = point_cloud
-
-        agent_pos = _extract_agent_pos(payload)
-        if agent_pos is not None:
-            payload["agent_pos"] = agent_pos
+        if learner_payload:
+            payload.update(learner_payload)
     else:
         payload = {"raw_obs": converted}
     return Observation.from_mapping(payload, metadata=metadata)
