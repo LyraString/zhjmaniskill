@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diffusion_policy"
+version = "0.1.0"
+description = "Flow Matching diffusion_policy package for RoboTwin"
+requires-python = ">=3.8"
+dependencies = [
+    "hydra-core==1.2.0",
+    "numba",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["diffusion_policy*"]
