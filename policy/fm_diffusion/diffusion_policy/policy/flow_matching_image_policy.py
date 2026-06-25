@@ -207,7 +207,10 @@ class FlowMatchingImagePolicy(BaseImagePolicy):
             this_nobs = dict_apply(nobs, lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
             # 重塑回 B, Do
-            global_cond = nobs_features.reshape(B, -1)
+            # torch.compile may return CUDA Graph-backed outputs that are
+            # overwritten by later compiled model invocations in the ODE loop.
+            # Clone here so global_cond has independent storage during sampling.
+            global_cond = nobs_features.reshape(B, -1).clone()
             # 动作的空数据
             cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)

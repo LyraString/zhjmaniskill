@@ -48,17 +48,17 @@ ema:
 
 dataloader:
   batch_size: 4
-  num_workers: 0
+  num_workers: 4
   shuffle: True
   pin_memory: True
-  persistent_workers: False
+  persistent_workers: True
 
 val_dataloader:
   batch_size: 4
-  num_workers: 0
+  num_workers: 4
   shuffle: False
   pin_memory: True
-  persistent_workers: False
+  persistent_workers: True
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -92,6 +92,13 @@ training:
   amp:
     enabled: False
     dtype: bf16
+
+  torch_compile:
+    enabled: True
+    mode: "max-autotune"
+    dynamic: False
+    fullgraph: False
+    compile_obs_encoder: False
 
 logging:
   project: flow_matching_policy_debug

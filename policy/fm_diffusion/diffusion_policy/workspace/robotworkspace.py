@@ -209,6 +209,43 @@ class RobotWorkspace(BaseWorkspace):
         if self.ema_model is not None:
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
+
+        # compile UNet backbone for operator fusion
+        tc_cfg = cfg.training.get("torch_compile", {})
+        if tc_cfg.get("enabled", False):
+            mode = tc_cfg.get("mode", "max-autotune")
+            dynamic = tc_cfg.get("dynamic", False)
+            fullgraph = tc_cfg.get("fullgraph", False)
+            print(f"[torch.compile] mode={mode}, dynamic={dynamic}, fullgraph={fullgraph}")
+            self.model.model = torch.compile(
+                self.model.model,
+                mode=mode,
+                dynamic=dynamic,
+                fullgraph=fullgraph,
+            )
+            if self.ema_model is not None:
+                self.ema_model.model = torch.compile(
+                    self.ema_model.model,
+                    mode=mode,
+                    dynamic=dynamic,
+                    fullgraph=fullgraph,
+                )
+            if tc_cfg.get("compile_obs_encoder", False) and hasattr(self.model, "obs_encoder"):
+                print("[torch.compile] compiling obs_encoder")
+                self.model.obs_encoder = torch.compile(
+                    self.model.obs_encoder,
+                    mode=mode,
+                    dynamic=dynamic,
+                    fullgraph=fullgraph,
+                )
+                if self.ema_model is not None and hasattr(self.ema_model, "obs_encoder"):
+                    self.ema_model.obs_encoder = torch.compile(
+                        self.ema_model.obs_encoder,
+                        mode=mode,
+                        dynamic=dynamic,
+                        fullgraph=fullgraph,
+                    )
+
         amp_enabled, amp_dtype = _resolve_amp_config(cfg.training)
         amp_enabled = bool(amp_enabled and device.type == "cuda")
         if amp_enabled:
@@ -496,6 +533,11 @@ class BatchSampler:
         return self.num_batch
 
 
+def _collate_identity(batch):
+    assert len(batch) == 1
+    return batch[0]
+
+
 def create_dataloader(
     dataset,
     *,
@@ -508,17 +550,28 @@ def create_dataloader(
 ):
     batch_sampler = BatchSampler(len(dataset), batch_size, shuffle=shuffle, seed=seed, drop_last=True)
 
-    def collate(x):
-        assert len(x) == 1
-        return x[0]
+    mp_context = None
+    if num_workers > 0:
+        import multiprocessing
+
+        mp_context = multiprocessing.get_context("spawn")
+        fm_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        existing_pythonpath = os.environ.get("PYTHONPATH", "")
+        if fm_root not in existing_pythonpath.split(os.pathsep):
+            os.environ["PYTHONPATH"] = (
+                os.pathsep.join([fm_root, existing_pythonpath])
+                if existing_pythonpath
+                else fm_root
+            )
 
     dataloader = DataLoader(
         dataset,
-        collate_fn=collate,
+        collate_fn=_collate_identity,
         sampler=batch_sampler,
         num_workers=num_workers,
-        pin_memory=False,
-        persistent_workers=persistent_workers,
+        pin_memory=pin_memory,
+        persistent_workers=bool(persistent_workers and num_workers > 0),
+        multiprocessing_context=mp_context,
     )
     return dataloader
 
