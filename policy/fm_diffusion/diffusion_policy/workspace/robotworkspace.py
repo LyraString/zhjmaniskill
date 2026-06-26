@@ -10,6 +10,7 @@ if __name__ == "__main__":
 
 import os
 import subprocess
+import logging
 import hydra
 import torch
 from omegaconf import OmegaConf
@@ -43,6 +44,19 @@ def _resolve_amp_config(training_cfg) -> tuple[bool, torch.dtype]:
     else:
         raise ValueError(f"Unsupported training.amp.dtype: {dtype_name}")
     return enabled, dtype
+
+
+def _suppress_torch_compile_logs() -> None:
+    for logger_name in (
+        "torch._dynamo",
+        "torch._inductor",
+        "torch._inductor.select_algorithm",
+        "torch.fx.experimental.symbolic_shapes",
+        "triton",
+        "triton.compiler",
+        "triton.runtime",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.ERROR)
 
 
 def _resolve_nvidia_smi_gpu_id(device: torch.device) -> str | None:
@@ -216,6 +230,8 @@ class RobotWorkspace(BaseWorkspace):
             mode = tc_cfg.get("mode", "max-autotune")
             dynamic = tc_cfg.get("dynamic", False)
             fullgraph = tc_cfg.get("fullgraph", False)
+            if tc_cfg.get("suppress_logs", True):
+                _suppress_torch_compile_logs()
             print(f"[torch.compile] mode={mode}, dynamic={dynamic}, fullgraph={fullgraph}")
             self.model.model = torch.compile(
                 self.model.model,

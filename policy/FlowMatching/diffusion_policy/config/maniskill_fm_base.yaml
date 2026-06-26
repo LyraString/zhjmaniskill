@@ -98,7 +98,8 @@ training:
     mode: "max-autotune"
     dynamic: False
     fullgraph: False
-    compile_obs_encoder: False
+    compile_obs_encoder: True
+    suppress_logs: True
 
 logging:
   project: flow_matching_policy_debug
