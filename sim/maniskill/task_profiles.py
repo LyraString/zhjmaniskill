@@ -42,6 +42,20 @@ UR5_V2_MULTIVIEW_POINT_CLOUD_VIEWS: list[dict[str, Any]] = [
     {"key": "right_wrist_point_cloud", "camera": "right_wrist_camera", "points": 512},
 ]
 
+UR5_REAL_LAYOUT_ARMS_DISTANCE = 0.50
+UR5_REAL_LAYOUT_BASE_Z = 0.74 + 0.84
+UR5_REAL_LAYOUT_BASE_Y = -0.65
+UR5_REAL_LAYOUT_ROBOT_POSE: list[list[float]] = [
+    # Quaternion is wxyz. The two base z-axes are mirrored in the separation-z
+    # plane with a 45 degree tilt from vertical.
+    [0.0, UR5_REAL_LAYOUT_BASE_Y, UR5_REAL_LAYOUT_BASE_Z, 0.9238795325, 0.0, -0.3826834324, 0.0],
+    [0.0, UR5_REAL_LAYOUT_BASE_Y, UR5_REAL_LAYOUT_BASE_Z, 0.9238795325, 0.0, 0.3826834324, 0.0],
+]
+UR5_REAL_LAYOUT_HOMESTATE: list[list[float]] = [
+    [0.5893980265, -2.9735174179, -1.7383480072, 0.8828423005, -0.4102165532, 1.3963156032],
+    [-0.3893829882, -0.1912880540, 1.7997839451, 1.5604257839, 0.3802834806, -0.8096333503],
+]
+
 
 MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
     "pickcube_smoke": {
@@ -142,6 +156,30 @@ MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
             "zarr_path": "data/HandoverBlockUR5-v2-smoke_npz-1.zarr",
         },
         "env_kwargs": {
+            "enable_wrist_cameras": True,
+        },
+    },
+    "handover_block_ur5_v2_real_layout_probe": {
+        "env_id": "HandoverBlockUR5-v2",
+        **DEFAULT_MANISKILL_RUNTIME,
+        "action_type": "continuous",
+        "robot_uids": "none",
+        "point_cloud_sampling": "fast",
+        "point_cloud_views": UR5_V2_MULTIVIEW_POINT_CLOUD_VIEWS,
+        "shape_meta": {
+            "head_point_cloud": [1024, 3],
+            "left_wrist_point_cloud": [512, 3],
+            "right_wrist_point_cloud": [512, 3],
+            "agent_pos": [14],
+            "action": [14],
+        },
+        "dataset": {
+            "zarr_path": "data/HandoverBlockUR5-v2-real_layout_probe.zarr",
+        },
+        "env_kwargs": {
+            "arms_distance": UR5_REAL_LAYOUT_ARMS_DISTANCE,
+            "robot_pose_override": UR5_REAL_LAYOUT_ROBOT_POSE,
+            "homestate_override": UR5_REAL_LAYOUT_HOMESTATE,
             "enable_wrist_cameras": True,
         },
     },
