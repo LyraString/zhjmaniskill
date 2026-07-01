@@ -92,6 +92,8 @@ class HandoverBlockSolver:
     LEFT_FIRST_GRASP_YAW_VARIANTS = (0.0,)
     REAL_LAYOUT_LEFT_GRASP_CONTACT_IDS = (1,)
     REAL_LAYOUT_LEFT_FIRST_GRASP_THETAS = (0.6, 0.3)
+    REAL_LAYOUT_RIGHT_HANDOVER_CONTACT_IDS = (6,)
+    REAL_LAYOUT_HANDOVER_TARGET_POSE = np.asarray([0.10, -0.34, 1.07], dtype=np.float64)
     LEFT_LIFT_DISTANCE = 0.16
     LEFT_HANDOVER_CLEARANCE_Z = 0.18
     LEFT_RELEASE_LIFT_DISTANCE = 0.0
@@ -214,10 +216,13 @@ class HandoverBlockSolver:
         return previous
 
     def _handover_target_pose(self) -> np.ndarray:
-        return np.asarray(
+        pose = np.asarray(
             getattr(self.base_env, "block_middle_pose", BLOCK_MIDDLE_POSE),
             dtype=np.float64,
-        )
+        ).copy()
+        if self._use_real_layout_right_handover():
+            pose[:3] = self.REAL_LAYOUT_HANDOVER_TARGET_POSE
+        return pose
 
     def _first_pick_pose_from_debug(self, *keys: str) -> np.ndarray | None:
         for key in keys:
@@ -582,6 +587,9 @@ class HandoverBlockSolver:
     def _use_real_layout_left_first_grasp(self) -> bool:
         return str(getattr(self.base_env, "expert_grasp_variant", "")) == "real_layout_v1"
 
+    def _use_real_layout_right_handover(self) -> bool:
+        return str(getattr(self.base_env, "expert_grasp_variant", "")) == "real_layout_v1"
+
     def _preferred_grasp_quat(self, arm_index: int) -> np.ndarray:
         config = self.base_env.embodiment_spec.left_config if arm_index == 0 else self.base_env.embodiment_spec.right_config
         perfect_direction = config.get("grasp_perfect_direction", ["front_right", "front_left"])
@@ -713,6 +721,20 @@ class HandoverBlockSolver:
                 )
             )
         return candidates
+
+    def _real_layout_right_handover_pre_pose_candidates_from_box_pose(
+        self,
+        box_pose: np.ndarray,
+        contact_id: int,
+        pre_distance: float,
+        arm_index: int,
+    ) -> list[np.ndarray]:
+        return self._right_end_grasp_pre_pose_candidates_from_box_pose(
+            box_pose,
+            contact_id,
+            pre_distance,
+            arm_index,
+        )
 
     def _get_handover_approach_pose(self, pre_grasp_pose: np.ndarray) -> np.ndarray:
         pose = np.asarray(pre_grasp_pose, dtype=np.float64).copy()
@@ -1014,8 +1036,19 @@ class HandoverBlockSolver:
         selection_options: list[dict[str, object]] = []
         preferred_quat = self._preferred_grasp_quat(1)
         preferred_top_down_quat = TOP_DOWN_PREFERRED_GRASP_QUATS[1]
+        use_real_layout = self._use_real_layout_right_handover()
+        contact_ids = (
+            self.REAL_LAYOUT_RIGHT_HANDOVER_CONTACT_IDS
+            if use_real_layout
+            else RIGHT_GRASP_CONTACT_IDS
+        )
+        pre_pose_candidates_builder = (
+            self._real_layout_right_handover_pre_pose_candidates_from_box_pose
+            if use_real_layout
+            else self._right_end_grasp_pre_pose_candidates_from_box_pose
+        )
 
-        for contact_id in RIGHT_GRASP_CONTACT_IDS:
+        for contact_id in contact_ids:
             candidate = self.ctrl.choose_grasp_candidate(
                 desired_pose=handover_box_pose,
                 arm_index=1,
@@ -1025,13 +1058,14 @@ class HandoverBlockSolver:
                 pose_builder=self._grasp_pose_from_box_pose,
                 preferred_quat=preferred_quat,
                 preferred_top_down_quat=preferred_top_down_quat,
-                pre_pose_candidates_builder=self._right_end_grasp_pre_pose_candidates_from_box_pose,
+                pre_pose_candidates_builder=pre_pose_candidates_builder,
                 selection_mode="auto",
             )
             if candidate is None:
                 selection_debug.append(
                     {
                         "contact_id": int(contact_id),
+                        "real_layout_right_handover": bool(use_real_layout),
                         "handover_candidate_found": False,
                         "handover_attempts": list(self.ctrl.last_grasp_attempts),
                     }
@@ -1042,6 +1076,7 @@ class HandoverBlockSolver:
                 selection_debug.append(
                     {
                         "contact_id": int(contact_id),
+                        "real_layout_right_handover": bool(use_real_layout),
                         "handover_candidate_found": True,
                         "handover_score": float(candidate.score),
                         "handover_path_length": int(candidate.path_length),
@@ -1081,6 +1116,7 @@ class HandoverBlockSolver:
             selection_debug.append(
                 {
                     "contact_id": int(contact_id),
+                    "real_layout_right_handover": bool(use_real_layout),
                     "handover_candidate_found": True,
                     "handover_score": float(candidate.score),
                     "handover_path_length": int(candidate.path_length),
