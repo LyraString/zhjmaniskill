@@ -81,6 +81,7 @@ class BaseWorkspace:
 
         for key, value in payload["state_dicts"].items():
             if key not in exclude_keys:
+                value = _unwrap_compiled_state_dict(value)
                 self.__dict__[key].load_state_dict(value, **kwargs)
         for key in include_keys:
             if key in payload["pickles"]:
@@ -136,3 +137,16 @@ def _copy_to_cpu(x):
         return [_copy_to_cpu(k) for k in x]
     else:
         return copy.deepcopy(x)
+
+
+def _unwrap_compiled_state_dict(state_dict):
+    """Remove torch.compile's `_orig_mod` wrapper prefix from checkpoint keys."""
+    if not isinstance(state_dict, dict):
+        return state_dict
+    marker = "._orig_mod."
+    if not any(isinstance(key, str) and marker in key for key in state_dict.keys()):
+        return state_dict
+    return {
+        key.replace(marker, ".") if isinstance(key, str) else key: value
+        for key, value in state_dict.items()
+    }
