@@ -35,6 +35,8 @@ class HandoverBlockUR5V2Env(HandoverBlockEnv):
 
     def __init__(self, *args, legacy_rng_compat: bool = False, **kwargs):
         super().__init__(*args, legacy_rng_compat=False, **kwargs)
+        self.block_middle_pose = list(V2_BLOCK_MIDDLE_POSE)
+        self.block_middle_pose[1] += float(self.object_y_offset)
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         super()._initialize_episode(env_idx, options)
@@ -59,8 +61,8 @@ class HandoverBlockUR5V2Env(HandoverBlockEnv):
             ).reshape(b)
 
             box_xyz = torch.zeros((b, 3), device=self.device, dtype=torch.float32)
-            box_xyz[:, 0] = box_x
-            box_xyz[:, 1] = box_y
+            box_xyz[:, 0] = box_x + float(self.box_x_offset)
+            box_xyz[:, 1] = box_y + float(self.object_y_offset)
             box_xyz[:, 2] = BOX_CENTER_Z
 
             yaw_half = yaw / 2.0
@@ -91,7 +93,7 @@ class HandoverBlockUR5V2Env(HandoverBlockEnv):
 
             target_xyz = torch.zeros((b, 3), device=self.device, dtype=torch.float32)
             target_xyz[:, 0] = target_x
-            target_xyz[:, 1] = target_y
+            target_xyz[:, 1] = target_y + float(self.object_y_offset)
             target_xyz[:, 2] = TARGET_CENTER_Z
             self.target_box.set_pose(Pose.create_from_pq(p=target_xyz))
             self._get_reward_stage()[env_idx.to(torch.long)] = 0

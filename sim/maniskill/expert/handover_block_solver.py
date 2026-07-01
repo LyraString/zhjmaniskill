@@ -90,6 +90,8 @@ class HandoverBlockSolver:
     LEFT_ROTATE_LIM = (-0.6, 0.6)
     RIGHT_ROTATE_LIM = (-0.6, 0.6)
     LEFT_FIRST_GRASP_YAW_VARIANTS = (0.0,)
+    REAL_LAYOUT_LEFT_GRASP_CONTACT_IDS = (1,)
+    REAL_LAYOUT_LEFT_FIRST_GRASP_THETAS = (0.6, 0.3)
     LEFT_LIFT_DISTANCE = 0.16
     LEFT_HANDOVER_CLEARANCE_Z = 0.18
     LEFT_RELEASE_LIFT_DISTANCE = 0.0
@@ -577,6 +579,9 @@ class HandoverBlockSolver:
             return float(rotate_lim[0]), float(rotate_lim[1])
         return self.LEFT_ROTATE_LIM if arm_index == 0 else self.RIGHT_ROTATE_LIM
 
+    def _use_real_layout_left_first_grasp(self) -> bool:
+        return str(getattr(self.base_env, "expert_grasp_variant", "")) == "real_layout_v1"
+
     def _preferred_grasp_quat(self, arm_index: int) -> np.ndarray:
         config = self.base_env.embodiment_spec.left_config if arm_index == 0 else self.base_env.embodiment_spec.right_config
         perfect_direction = config.get("grasp_perfect_direction", ["front_right", "front_left"])
@@ -652,6 +657,28 @@ class HandoverBlockSolver:
         candidates = []
         for theta in self.LEFT_FIRST_GRASP_YAW_VARIANTS:
             candidates.append(self._rotate_pose_about_world_z(base_pose, center_pose, float(theta)))
+        return candidates
+
+    def _real_layout_left_first_grasp_pre_pose_candidates_from_box_pose(
+        self,
+        box_pose: np.ndarray,
+        contact_id: int,
+        pre_distance: float,
+        arm_index: int,
+    ) -> list[np.ndarray]:
+        base_pose = self._grasp_pose_from_box_pose(box_pose, contact_id, pre_distance)
+        center_pose = self._box_contact_world_pose(box_pose, contact_id)
+        candidates = []
+        for theta in self.REAL_LAYOUT_LEFT_FIRST_GRASP_THETAS:
+            candidates.append(
+                self._rotate_pose_along_target_axis(
+                    base_pose,
+                    center_pose,
+                    axis=np.array([0.0, 1.0, 0.0], dtype=np.float64),
+                    theta=float(theta),
+                    towards=np.array([0.0, -1.0, 0.0], dtype=np.float64),
+                )
+            )
         return candidates
 
     def _right_end_grasp_pre_pose_candidates_from_box_pose(
@@ -2679,16 +2706,24 @@ class HandoverBlockSolver:
                         self.ctrl.last_status = "running"
                         self.ctrl.last_plan_debug = {}
 
+            left_first_grasp_contact_ids = LEFT_GRASP_CONTACT_IDS
+            left_first_grasp_candidates_builder = self._left_first_grasp_pre_pose_candidates_from_box_pose
+            if self._use_real_layout_left_first_grasp():
+                left_first_grasp_contact_ids = self.REAL_LAYOUT_LEFT_GRASP_CONTACT_IDS
+                left_first_grasp_candidates_builder = (
+                    self._real_layout_left_first_grasp_pre_pose_candidates_from_box_pose
+                )
+
             pick_candidate = self.ctrl.choose_grasp_candidate(
                 desired_pose=self._box_pose(),
                 arm_index=0,
-                contact_ids=LEFT_GRASP_CONTACT_IDS,
+                contact_ids=left_first_grasp_contact_ids,
                 pre_distance=self.PRE_GRASP_DISTANCE,
                 grasp_distance=self.LEFT_FIRST_GRASP_DISTANCE,
                 pose_builder=self._grasp_pose_from_box_pose,
                 preferred_quat=self._preferred_grasp_quat(0),
                 preferred_top_down_quat=TOP_DOWN_PREFERRED_GRASP_QUATS[0],
-                pre_pose_candidates_builder=self._left_first_grasp_pre_pose_candidates_from_box_pose,
+                pre_pose_candidates_builder=left_first_grasp_candidates_builder,
                 selection_mode="prefer_side",
                 max_grasp_plan_length=self.LEFT_FIRST_GRASP_MAX_GRASP_PLAN_LENGTH,
             )

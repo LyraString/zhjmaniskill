@@ -52,8 +52,17 @@ def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
 class HandoverBlockEnv(DualUR5WSGEnv):
     """Minimal ManiSkill port of RoboTwin handover_block scene and spatial success condition."""
 
-    def __init__(self, *args, legacy_rng_compat: bool = False, **kwargs):
+    def __init__(
+        self,
+        *args,
+        legacy_rng_compat: bool = False,
+        object_y_offset: float = 0.0,
+        box_x_offset: float = 0.0,
+        **kwargs,
+    ):
         self.legacy_rng_compat = bool(legacy_rng_compat)
+        self.object_y_offset = float(object_y_offset)
+        self.box_x_offset = float(box_x_offset)
         self.success_gate_enabled = True
         self.reward_stage = None
         super().__init__(*args, **kwargs)
@@ -76,7 +85,9 @@ class HandoverBlockEnv(DualUR5WSGEnv):
                 half_size=BOX_HALF_SIZE.tolist(),
                 material=sapien.render.RenderMaterial(base_color=[1.0, 0.0, 0.0, 1.0]),
             )
-        box_builder.set_initial_pose(sapien.Pose(p=[-0.15, 0.1, BOX_CENTER_Z]))
+        box_builder.set_initial_pose(
+            sapien.Pose(p=[-0.15 + self.box_x_offset, 0.1 + self.object_y_offset, BOX_CENTER_Z])
+        )
         self.box = box_builder.build(name="box")
 
         target_builder = self.scene.create_actor_builder()
@@ -86,7 +97,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
                 half_size=TARGET_HALF_SIZE.tolist(),
                 material=sapien.render.RenderMaterial(base_color=[0.0, 0.0, 1.0, 1.0]),
             )
-        target_builder.set_initial_pose(sapien.Pose(p=[0.18, 0.175, TARGET_CENTER_Z]))
+        target_builder.set_initial_pose(sapien.Pose(p=[0.18, 0.175 + self.object_y_offset, TARGET_CENTER_Z]))
         self.target_box = target_builder.build_kinematic(name="target_box")
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
@@ -125,7 +136,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
 
             box_xyz = torch.zeros((b, 3), device=self.device, dtype=torch.float32)
             box_xyz[:, 0] = box_x
-            box_xyz[:, 1] = box_y
+            box_xyz[:, 1] = box_y + float(self.object_y_offset)
             if box_z_np is None:
                 box_xyz[:, 2] = BOX_CENTER_Z
             else:
@@ -155,7 +166,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
 
             target_xyz = torch.zeros((b, 3), device=self.device, dtype=torch.float32)
             target_xyz[:, 0] = target_x
-            target_xyz[:, 1] = target_y
+            target_xyz[:, 1] = target_y + float(self.object_y_offset)
             if target_z_np is None:
                 target_xyz[:, 2] = TARGET_CENTER_Z
             else:
