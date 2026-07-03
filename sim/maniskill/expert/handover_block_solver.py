@@ -181,9 +181,13 @@ class HandoverBlockSolver:
     LEFT_RELEASE_CLEAR_WORLD_DELTA = np.asarray([0.0, -0.05, 0.04], dtype=np.float64)
     LEFT_RELEASE_CLEAR_LIFT_DELTA = np.asarray([0.0, 0.0, 0.15], dtype=np.float64)
     LEFT_RELEASE_CLEAR_RETREAT_DELTA = np.asarray([0.0, -0.25, 0.05], dtype=np.float64)
+    REAL_LAYOUT_LEFT_RELEASE_CLEAR_STAGES = (
+        ("left_release_clear_lift", np.asarray([0.0, 0.0, 0.05], dtype=np.float64)),
+    )
     LEFT_RELEASE_CLEAR_STEPS = 16
     LEFT_RELEASE_CLEAR_SETTLE_STEPS = 4
     LEFT_RELEASE_CLEAR_IK_THRESHOLD = 1e-2
+    REAL_LAYOUT_LEFT_RELEASE_CLEAR_IK_THRESHOLD = 6e-2
     LEFT_RELEASE_CLEAR_MIN_LIFT_DELTA = 0.035
     LEFT_RELEASE_CLEAR_LIFT_RETRY_DELTA = np.asarray([0.0, 0.0, 0.04], dtype=np.float64)
     LEFT_RELEASE_CLEAR_LIFT_MAX_ATTEMPTS = 2
@@ -589,6 +593,30 @@ class HandoverBlockSolver:
 
     def _use_real_layout_right_handover(self) -> bool:
         return str(getattr(self.base_env, "expert_grasp_variant", "")) == "real_layout_v1"
+
+    def _use_real_layout_left_release_clear(self) -> bool:
+        return str(getattr(self.base_env, "expert_grasp_variant", "")) == "real_layout_v1"
+
+    def _left_release_clear_stages(self) -> tuple[tuple[str, np.ndarray], ...]:
+        if self._use_real_layout_left_release_clear():
+            return tuple(
+                (str(stage), np.asarray(delta, dtype=np.float64).copy())
+                for stage, delta in self.REAL_LAYOUT_LEFT_RELEASE_CLEAR_STAGES
+            )
+        return (
+            ("left_release_clear_lift", np.asarray(self.LEFT_RELEASE_CLEAR_LIFT_DELTA, dtype=np.float64)),
+            ("left_release_clear_retreat", np.asarray(self.LEFT_RELEASE_CLEAR_RETREAT_DELTA, dtype=np.float64)),
+        )
+
+    def _left_release_clear_ik_threshold(self) -> float:
+        if self._use_real_layout_left_release_clear():
+            return float(self.REAL_LAYOUT_LEFT_RELEASE_CLEAR_IK_THRESHOLD)
+        return float(self.LEFT_RELEASE_CLEAR_IK_THRESHOLD)
+
+    def _return_left_home_after_handover(self) -> bool:
+        if self._use_real_layout_left_release_clear():
+            return False
+        return bool(self.RETURN_LEFT_HOME_AFTER_HANDOVER)
 
     def _preferred_grasp_quat(self, arm_index: int) -> np.ndarray:
         config = self.base_env.embodiment_spec.left_config if arm_index == 0 else self.base_env.embodiment_spec.right_config
@@ -1602,10 +1630,8 @@ class HandoverBlockSolver:
 
         left_release_before_clear_pose = np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64)
         left_release_clear_trace: list[dict[str, object]] = []
-        left_release_clear_stages = (
-            ("left_release_clear_lift", np.asarray(self.LEFT_RELEASE_CLEAR_LIFT_DELTA, dtype=np.float64)),
-            ("left_release_clear_retreat", np.asarray(self.LEFT_RELEASE_CLEAR_RETREAT_DELTA, dtype=np.float64)),
-        )
+        left_release_clear_stages = self._left_release_clear_stages()
+        left_release_clear_ik_threshold = self._left_release_clear_ik_threshold()
         for left_release_clear_stage, left_release_clear_delta in left_release_clear_stages:
             if float(np.linalg.norm(left_release_clear_delta)) <= 1e-8:
                 continue
@@ -1634,7 +1660,7 @@ class HandoverBlockSolver:
                     steps=self.LEFT_RELEASE_CLEAR_STEPS,
                     settle_steps=self.LEFT_RELEASE_CLEAR_SETTLE_STEPS,
                     fail_status=f"{left_release_clear_stage}_failed",
-                    ik_threshold=self.LEFT_RELEASE_CLEAR_IK_THRESHOLD,
+                    ik_threshold=left_release_clear_ik_threshold,
                 ):
                     return True, self.ctrl.steps_taken, self.ctrl.last_status
                 attempt_end_pose = np.asarray(self.ctrl.current_gripper_pose(0), dtype=np.float64)
@@ -1723,7 +1749,7 @@ class HandoverBlockSolver:
                 }
                 return False, self.ctrl.steps_taken, self.ctrl.last_status
 
-        if self.RETURN_LEFT_HOME_AFTER_HANDOVER:
+        if self._return_left_home_after_handover():
             if self.ctrl.back_to_origin(0, recorder, fail_status="left_back_to_origin_failed"):
                 return True, self.ctrl.steps_taken, self.ctrl.last_status
             if self.ctrl.last_status != "running":
