@@ -1,5 +1,6 @@
 import argparse
 import importlib
+import json
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -132,6 +133,122 @@ def _clip_action_to_space(action, action_space, stats: dict):
     return clipped
 
 
+def _new_action_trace():
+    return {
+        "episode": [],
+        "step": [],
+        "action": [],
+        "left_xyz_norm": [],
+        "left_rot_norm": [],
+        "left_gripper": [],
+        "right_xyz_norm": [],
+        "right_rot_norm": [],
+        "right_gripper": [],
+        "reward_stage": [],
+        "box_to_target": [],
+        "spatial_success": [],
+        "xy_aligned": [],
+        "z_aligned": [],
+        "right_gripper_open": [],
+        "right_ee_clear": [],
+        "box_static": [],
+        "success": [],
+    }
+
+
+def _append_action_trace(trace: dict, episode_idx: int, step: int, action: np.ndarray, info: Mapping) -> None:
+    action_np = np.asarray(action, dtype=np.float32).reshape(-1)
+    if action_np.shape[0] >= 14:
+        left_xyz = action_np[0:3]
+        left_rot = action_np[3:6]
+        left_gripper = float(action_np[6])
+        right_xyz = action_np[7:10]
+        right_rot = action_np[10:13]
+        right_gripper = float(action_np[13])
+    else:
+        left_xyz = np.zeros(3, dtype=np.float32)
+        left_rot = np.zeros(3, dtype=np.float32)
+        left_gripper = float("nan")
+        right_xyz = np.zeros(3, dtype=np.float32)
+        right_rot = np.zeros(3, dtype=np.float32)
+        right_gripper = float("nan")
+
+    trace["episode"].append(int(episode_idx))
+    trace["step"].append(int(step))
+    trace["action"].append(action_np.astype(np.float32, copy=True))
+    trace["left_xyz_norm"].append(float(np.linalg.norm(left_xyz)))
+    trace["left_rot_norm"].append(float(np.linalg.norm(left_rot)))
+    trace["left_gripper"].append(left_gripper)
+    trace["right_xyz_norm"].append(float(np.linalg.norm(right_xyz)))
+    trace["right_rot_norm"].append(float(np.linalg.norm(right_rot)))
+    trace["right_gripper"].append(right_gripper)
+    trace["reward_stage"].append(_to_float_scalar_or_none(info.get("reward_stage")))
+    trace["box_to_target"].append(_to_float_scalar_or_none(info.get("reward_box_to_target")))
+    for key in (
+        "spatial_success",
+        "xy_aligned",
+        "z_aligned",
+        "right_gripper_open",
+        "right_ee_clear",
+        "box_static",
+        "success",
+    ):
+        value = _to_bool_scalar_or_none(info.get(key))
+        trace[key].append(np.nan if value is None else float(bool(value)))
+
+
+def _save_action_trace(trace: dict, path: str) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    arrays = {}
+    for key, values in trace.items():
+        if key == "action":
+            arrays[key] = (
+                np.stack(values, axis=0).astype(np.float32)
+                if len(values) > 0
+                else np.zeros((0, 0), dtype=np.float32)
+            )
+        else:
+            arrays[key] = np.asarray(
+                [np.nan if value is None else value for value in values],
+                dtype=np.float32 if key not in {"episode", "step"} else np.int64,
+            )
+    np.savez_compressed(output_path, **arrays)
+
+    if arrays["action"].size == 0:
+        print(f"action_trace_saved path={output_path} steps=0")
+        return
+
+    summary = {
+        "path": str(output_path),
+        "steps": int(arrays["action"].shape[0]),
+        "left_xyz_norm_mean": float(np.nanmean(arrays["left_xyz_norm"])),
+        "left_xyz_norm_max": float(np.nanmax(arrays["left_xyz_norm"])),
+        "right_xyz_norm_mean": float(np.nanmean(arrays["right_xyz_norm"])),
+        "right_xyz_norm_max": float(np.nanmax(arrays["right_xyz_norm"])),
+        "left_rot_norm_mean": float(np.nanmean(arrays["left_rot_norm"])),
+        "right_rot_norm_mean": float(np.nanmean(arrays["right_rot_norm"])),
+        "right_gripper_mean": float(np.nanmean(arrays["right_gripper"])),
+    }
+    stage = arrays["reward_stage"]
+    stage4_mask = np.isfinite(stage) & (np.rint(stage).astype(np.int64) == 4)
+    if bool(np.any(stage4_mask)):
+        summary.update(
+            {
+                "stage4_steps": int(np.count_nonzero(stage4_mask)),
+                "stage4_right_xyz_norm_mean": float(np.nanmean(arrays["right_xyz_norm"][stage4_mask])),
+                "stage4_right_xyz_norm_max": float(np.nanmax(arrays["right_xyz_norm"][stage4_mask])),
+                "stage4_right_gripper_mean": float(np.nanmean(arrays["right_gripper"][stage4_mask])),
+                "stage4_right_open_frac": float(np.nanmean(arrays["right_gripper_open"][stage4_mask])),
+                "stage4_right_clear_frac": float(np.nanmean(arrays["right_ee_clear"][stage4_mask])),
+                "stage4_spatial_frac": float(np.nanmean(arrays["spatial_success"][stage4_mask])),
+            }
+        )
+    summary_path = output_path.with_suffix(".summary.json")
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    print(f"action_trace_saved path={output_path} summary={summary_path} steps={summary['steps']}")
+
+
 def _to_bool_scalar(value) -> bool:
     if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "numpy"):
         value = value.detach().cpu().numpy()
@@ -251,6 +368,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-freq", type=int, default=None)
     parser.add_argument("--save-video-dir", type=str, default=None)
     parser.add_argument("--video-fps", type=int, default=10)
+    parser.add_argument(
+        "--save-action-trace",
+        type=str,
+        default=None,
+        help="Optional .npz path for per-step action/stage diagnostics. Default is disabled.",
+    )
     return parser
 
 
@@ -324,6 +447,7 @@ def run_evaluation(args) -> None:
     successes = []
     handover_diags = []
     action_clip_stats = _new_action_clip_stats()
+    action_trace = _new_action_trace() if args.save_action_trace is not None else None
 
     try:
         for episode_idx in range(args.episodes):
@@ -371,6 +495,14 @@ def run_evaluation(args) -> None:
                     result = env.step(
                         ActionSpec.from_value(action, action_type=resolved_runtime["action_type"])
                     )
+                    if action_trace is not None:
+                        _append_action_trace(
+                            action_trace,
+                            episode_idx=episode_idx,
+                            step=episode_length,
+                            action=action,
+                            info=result.info,
+                        )
                     if _to_bool_scalar(result.info.get("success", False)):
                         success = True
 
@@ -496,6 +628,8 @@ def run_evaluation(args) -> None:
                 f"right_clear={final_success_sums['right_clear'] / failed_place_count:.3f} "
                 f"box_static={final_success_sums['box_static'] / failed_place_count:.3f}"
             )
+    if action_trace is not None:
+        _save_action_trace(action_trace, args.save_action_trace)
 
 
 def main(argv=None) -> None:
