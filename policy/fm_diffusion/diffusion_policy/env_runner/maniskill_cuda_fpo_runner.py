@@ -321,12 +321,10 @@ class ManiSkillCudaFPORunner:
             for seg_id in excluded_seg_ids:
                 valid = torch.logical_and(valid, segmentation != int(seg_id))
 
-        one = valid.to(dtype=torch.float32).unsqueeze(-1)
-        points_xyzw = torch.cat([xyz_flat, one], dim=-1)
-        world_xyzw = torch.bmm(points_xyzw, cam2world.transpose(1, 2))
-        world_xyz = world_xyzw[..., :3]
-        world_valid = world_xyzw[..., 3] > 0
-        return self._postprocess_batched_xyz(world_xyz, world_valid, obs_key=obs_key)
+        rotation = cam2world[:, :3, :3]
+        translation = cam2world[:, :3, 3]
+        world_xyz = torch.bmm(xyz_flat, rotation.transpose(1, 2)) + translation[:, None, :]
+        return self._postprocess_batched_xyz(world_xyz, valid, obs_key=obs_key)
 
     def _postprocess_batched_xyz(
         self,
@@ -346,6 +344,9 @@ class ManiSkillCudaFPORunner:
             xyz <= self.crop_max.view(1, 1, 3),
         ).all(dim=-1)
         keep = torch.logical_and(valid, inside_bounds)
+
+        if self.point_cloud_sampling in {"fast", "resize", "linspace"}:
+            return self._resize_batched_point_cloud(xyz, keep, obs_key=obs_key)
 
         clouds = []
         for env_id in range(self.num_envs):
@@ -397,3 +398,63 @@ class ManiSkillCudaFPORunner:
         pad_count = target_points - points.shape[0]
         pad = points[:1].expand(pad_count, -1)
         return torch.cat([points, pad], dim=0).to(dtype=torch.float32)
+
+    def _resize_batched_point_cloud(
+        self,
+        xyz: torch.Tensor,
+        keep: torch.Tensor,
+        *,
+        obs_key: str,
+    ) -> torch.Tensor:
+        """Batched equivalent of per-env linspace resize used by fast sampling."""
+        target_points = self.point_cloud_points[obs_key]
+        xyz = xyz.to(device=self.device, dtype=torch.float32).reshape(self.num_envs, -1, 3)
+        keep = keep.to(device=self.device, dtype=torch.bool).reshape(self.num_envs, -1)
+
+        num_source_points = xyz.shape[1]
+        if num_source_points == 0:
+            return torch.zeros(
+                (self.num_envs, target_points, 3),
+                device=self.device,
+                dtype=torch.float32,
+            )
+
+        counts = keep.sum(dim=1)
+        valid_env = counts > 0
+
+        # cumulative rank lets searchsorted map compacted point ranks back to
+        # original pixel order without looping over environments.
+        cumulative = torch.cumsum(keep.to(dtype=torch.int32), dim=1, dtype=torch.int32).contiguous()
+        point_rank = torch.arange(target_points, device=self.device, dtype=torch.int32).view(1, -1)
+
+        counts_i32 = counts.to(dtype=torch.int32).view(-1, 1)
+        enough_points = counts_i32 >= target_points
+
+        linspace_alpha = torch.linspace(
+            0.0,
+            1.0,
+            target_points,
+            device=self.device,
+            dtype=torch.float32,
+        ).view(1, -1)
+        linspace_rank = ((counts.to(dtype=torch.float32).view(-1, 1) - 1.0) * linspace_alpha).to(torch.int32)
+
+        padded_rank = torch.where(point_rank < counts_i32, point_rank, torch.zeros_like(point_rank))
+        desired_rank = torch.where(enough_points, linspace_rank, padded_rank)
+        desired_rank = torch.where(valid_env.view(-1, 1), desired_rank, torch.zeros_like(desired_rank))
+
+        gather_index = torch.searchsorted(
+            cumulative,
+            desired_rank + 1,
+            right=False,
+        ).clamp_(0, num_source_points - 1)
+        sampled = torch.gather(
+            xyz,
+            dim=1,
+            index=gather_index.to(dtype=torch.long).unsqueeze(-1).expand(-1, -1, 3),
+        )
+        return torch.where(
+            valid_env.view(-1, 1, 1),
+            sampled,
+            torch.zeros_like(sampled),
+        )
