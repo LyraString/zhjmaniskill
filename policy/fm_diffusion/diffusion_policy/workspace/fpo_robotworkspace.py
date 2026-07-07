@@ -213,13 +213,15 @@ def _create_identity_field_normalizer(dim: int) -> SingleFieldLinearNormalizer:
 
 def _create_identity_normalizer_from_shape_meta(shape_meta: dict) -> LinearNormalizer:
     obs_shape_meta = shape_meta["obs"]
-    point_cloud_dim = int(obs_shape_meta["point_cloud"]["shape"][-1])
-    agent_pos_dim = int(obs_shape_meta["agent_pos"]["shape"][0])
     action_dim = int(shape_meta["action"]["shape"][0])
 
     normalizer = LinearNormalizer()
-    normalizer["point_cloud"] = _create_identity_field_normalizer(point_cloud_dim)
-    normalizer["agent_pos"] = _create_identity_field_normalizer(agent_pos_dim)
+    for key, meta in obs_shape_meta.items():
+        shape = tuple(meta["shape"])
+        if meta.get("type") == "point_cloud":
+            normalizer[key] = _create_identity_field_normalizer(int(shape[-1]))
+        elif key == "agent_pos":
+            normalizer[key] = _create_identity_field_normalizer(int(shape[0]))
     normalizer["action"] = _create_identity_field_normalizer(action_dim)
     return normalizer
 
@@ -1272,6 +1274,8 @@ class RobotWorkspace(BaseWorkspace):
                         v = self.critic(critic_in).squeeze(-1)
 
                     actions = action_chunk[:, chunk_i].detach()
+                    if hasattr(env, "clip_actions"):
+                        actions = env.clip_actions(actions)
                     action_stats = actions.detach().to(device=device, dtype=torch.float32)
                     action_abs_max_steps.append(action_stats.abs().amax())
                     action_abs_mean_steps.append(action_stats.abs().mean())

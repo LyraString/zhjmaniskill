@@ -1,0 +1,33 @@
+defaults:
+  - maniskill_fpo_base
+  - task: maniskill_handover_block_ur5_v2_multiview_delta_pose_actual_task
+  - _self_
+
+name: maniskill_fpo_handover_ur5_v2_multiview_delta_pose_actual
+exp_name: handover_block_ur5_v2_multiview_delta_pose_actual
+
+n_action_steps: 1
+
+policy:
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.pointcloud_obs_encoder.MultiViewPointCloudObsEncoder
+    shape_meta: ${shape_meta}
+    pointnet_out_dim: 512
+    fusion_hidden_dim: 512
+    use_layernorm: True
+
+training:
+  preserve_ckpt_normalizer: True
+  init_actor_from_ema: True
+  load_optimizer_state: False
+  online_iters: 3000
+  timesteps_per_batch: 3200
+  max_timesteps_per_episode: 1500
+  n_updates_per_iteration: 2
+  num_minibatches: 2
+  num_envs: 32
+  checkpoint_every: 100
+  max_total_fpo_samples_per_call: 32
+  num_fpo_samples: 2
+  velocity_kl_coeff: 0.01
+  point_cloud_sampling: fast

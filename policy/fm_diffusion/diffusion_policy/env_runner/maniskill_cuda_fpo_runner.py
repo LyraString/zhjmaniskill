@@ -22,6 +22,12 @@ from sim.maniskill.obs_adapter import (
     DEFAULT_POINT_CLOUD_SAMPLING,
     ENV_POINT_CLOUD_EXCLUDED_SEG_IDS,
 )
+
+MULTIVIEW_POINT_CLOUD_CAMERAS = {
+    "head_point_cloud": "head_camera",
+    "left_wrist_point_cloud": "left_wrist_camera",
+    "right_wrist_point_cloud": "right_wrist_camera",
+}
 from sim.maniskill.task_profiles import (
     get_task_profile,
     resolve_runtime_control_mode,
@@ -98,14 +104,32 @@ class ManiSkillCudaFPORunner:
         self._episode_ids = [0 for _ in range(self.num_envs)]
 
         obs_meta = shape_meta["obs"]
-        self.point_cloud_points = int(obs_meta["point_cloud"]["shape"][0])
-        self.point_cloud_dim = int(obs_meta["point_cloud"]["shape"][-1])
+        self.point_cloud_shapes = {
+            key: tuple(meta["shape"])
+            for key, meta in obs_meta.items()
+            if meta.get("type") == "point_cloud"
+        }
+        if not self.point_cloud_shapes:
+            raise ValueError("ManiSkillCudaFPORunner requires at least one point-cloud obs key.")
+        self.point_cloud_keys = tuple(self.point_cloud_shapes.keys())
+        self.point_cloud_points = {
+            key: int(shape[0])
+            for key, shape in self.point_cloud_shapes.items()
+        }
+        self.point_cloud_dim = {
+            key: int(shape[-1])
+            for key, shape in self.point_cloud_shapes.items()
+        }
         self.agent_pos_dim = int(obs_meta["agent_pos"]["shape"][0])
         self.action_dim = int(shape_meta["action"]["shape"][0])
-        if self.point_cloud_dim != 3:
-            raise ValueError(f"Expected point_cloud dim 3, got {self.point_cloud_dim}.")
+        for key, point_cloud_dim in self.point_cloud_dim.items():
+            if point_cloud_dim != 3:
+                raise ValueError(f"Expected {key} dim 3, got {point_cloud_dim}.")
 
         make_kwargs = dict(env_kwargs)
+        if profile is not None:
+            for key, value in profile.get("env_kwargs", {}).items():
+                make_kwargs.setdefault(key, value)
         make_kwargs.setdefault("num_envs", self.num_envs)
         make_kwargs.setdefault("obs_mode", obs_mode or "pointcloud+state_dict")
         if runtime_control_mode is not None:
@@ -131,6 +155,17 @@ class ManiSkillCudaFPORunner:
 
         self.env = gym.make(self.env_id, **make_kwargs)
         self.device = torch.device(getattr(self.env.unwrapped, "device", "cpu"))
+        action_space = getattr(self.env.unwrapped, "single_action_space", self.env.action_space)
+        self.action_low = torch.as_tensor(
+            action_space.low,
+            device=self.device,
+            dtype=torch.float32,
+        ).reshape(1, self.action_dim)
+        self.action_high = torch.as_tensor(
+            action_space.high,
+            device=self.device,
+            dtype=torch.float32,
+        ).reshape(1, self.action_dim)
         self.crop_min = torch.as_tensor(
             DEFAULT_POINT_CLOUD_CROP_MIN,
             device=self.device,
@@ -184,14 +219,20 @@ class ManiSkillCudaFPORunner:
         raw_obs, reward, terminated, truncated, info = self.env.step(actions)
         return self.format_obs(raw_obs), reward, terminated, truncated, info
 
+    def clip_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        actions = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
+        return torch.minimum(torch.maximum(actions, self.action_low), self.action_high)
+
     def close(self) -> None:
         self.env.close()
 
     def format_obs(self, raw_obs: Mapping[str, Any]) -> dict[str, torch.Tensor]:
-        return {
-            "point_cloud": self._extract_point_cloud(raw_obs),
-            "agent_pos": self._extract_agent_pos(raw_obs),
+        obs = {
+            key: self._extract_point_cloud(raw_obs, obs_key=key)
+            for key in self.point_cloud_keys
         }
+        obs["agent_pos"] = self._extract_agent_pos(raw_obs)
+        return obs
 
     def _extract_agent_pos(self, raw_obs: Mapping[str, Any]) -> torch.Tensor:
         agent = raw_obs.get("agent")
@@ -210,39 +251,47 @@ class ManiSkillCudaFPORunner:
 
         raise KeyError("Raw ManiSkill obs has neither `agent.qpos` nor `state`.")
 
-    def _extract_point_cloud(self, raw_obs: Mapping[str, Any]) -> torch.Tensor:
-        point_cloud = self._extract_point_cloud_from_sensor_data(raw_obs)
+    def _camera_name_for_obs_key(self, obs_key: str) -> str:
+        if obs_key == "point_cloud":
+            return DEFAULT_POINT_CLOUD_PRIMARY_CAMERA
+        return MULTIVIEW_POINT_CLOUD_CAMERAS.get(obs_key, obs_key.removesuffix("_point_cloud"))
+
+    def _extract_point_cloud(self, raw_obs: Mapping[str, Any], *, obs_key: str) -> torch.Tensor:
+        point_cloud = self._extract_point_cloud_from_sensor_data(raw_obs, obs_key=obs_key)
         if point_cloud is not None:
             return point_cloud
 
         pointcloud = raw_obs.get("pointcloud")
-        if isinstance(pointcloud, Mapping) and "xyzw" in pointcloud:
+        if obs_key == "point_cloud" and isinstance(pointcloud, Mapping) and "xyzw" in pointcloud:
             xyzw = pointcloud["xyzw"].to(device=self.device, dtype=torch.float32)
             xyz = xyzw[..., :3]
             valid = xyzw[..., 3] > 0 if xyzw.shape[-1] >= 4 else None
-            return self._postprocess_batched_xyz(xyz.reshape(self.num_envs, -1, 3), valid)
+            return self._postprocess_batched_xyz(xyz.reshape(self.num_envs, -1, 3), valid, obs_key=obs_key)
 
-        direct_point_cloud = raw_obs.get("point_cloud")
+        direct_point_cloud = raw_obs.get(obs_key)
         if direct_point_cloud is not None:
             xyz = torch.as_tensor(direct_point_cloud, device=self.device, dtype=torch.float32)
-            return self._postprocess_batched_xyz(xyz.reshape(self.num_envs, -1, 3), None)
+            return self._postprocess_batched_xyz(xyz.reshape(self.num_envs, -1, 3), None, obs_key=obs_key)
 
         raise KeyError(
             "Raw ManiSkill obs has no supported point-cloud source. Expected "
-            "`sensor_data`, `pointcloud.xyzw`, or `point_cloud`."
+            f"`sensor_data`, `pointcloud.xyzw`, or `{obs_key}`."
         )
 
     def _extract_point_cloud_from_sensor_data(
         self,
         raw_obs: Mapping[str, Any],
+        *,
+        obs_key: str,
     ) -> torch.Tensor | None:
         sensor_data = raw_obs.get("sensor_data")
         sensor_param = raw_obs.get("sensor_param")
         if not isinstance(sensor_data, Mapping) or not isinstance(sensor_param, Mapping):
             return None
 
-        camera_data = sensor_data.get(DEFAULT_POINT_CLOUD_PRIMARY_CAMERA)
-        camera_param = sensor_param.get(DEFAULT_POINT_CLOUD_PRIMARY_CAMERA)
+        camera_name = self._camera_name_for_obs_key(obs_key)
+        camera_data = sensor_data.get(camera_name)
+        camera_param = sensor_param.get(camera_name)
         if not isinstance(camera_data, Mapping) or not isinstance(camera_param, Mapping):
             return None
         if "position" not in camera_data or "cam2world_gl" not in camera_param:
@@ -277,12 +326,14 @@ class ManiSkillCudaFPORunner:
         world_xyzw = torch.bmm(points_xyzw, cam2world.transpose(1, 2))
         world_xyz = world_xyzw[..., :3]
         world_valid = world_xyzw[..., 3] > 0
-        return self._postprocess_batched_xyz(world_xyz, world_valid)
+        return self._postprocess_batched_xyz(world_xyz, world_valid, obs_key=obs_key)
 
     def _postprocess_batched_xyz(
         self,
         xyz: torch.Tensor,
         valid: torch.Tensor | None,
+        *,
+        obs_key: str,
     ) -> torch.Tensor:
         xyz = xyz.to(device=self.device, dtype=torch.float32).reshape(self.num_envs, -1, 3)
         if valid is None:
@@ -299,18 +350,18 @@ class ManiSkillCudaFPORunner:
         clouds = []
         for env_id in range(self.num_envs):
             points = xyz[env_id][keep[env_id]]
-            clouds.append(self._sample_point_cloud(points))
+            clouds.append(self._sample_point_cloud(points, obs_key=obs_key))
         return torch.stack(clouds, dim=0)
 
-    def _sample_point_cloud(self, points: torch.Tensor) -> torch.Tensor:
+    def _sample_point_cloud(self, points: torch.Tensor, *, obs_key: str) -> torch.Tensor:
         if self.point_cloud_sampling in {"fast", "resize", "linspace"}:
-            return self._resize_point_cloud(points)
+            return self._resize_point_cloud(points, obs_key=obs_key)
 
-        sampled = self._farthest_point_sample(points)
-        return self._resize_point_cloud(sampled)
+        sampled = self._farthest_point_sample(points, obs_key=obs_key)
+        return self._resize_point_cloud(sampled, obs_key=obs_key)
 
-    def _farthest_point_sample(self, points: torch.Tensor) -> torch.Tensor:
-        target_points = self.point_cloud_points
+    def _farthest_point_sample(self, points: torch.Tensor, *, obs_key: str) -> torch.Tensor:
+        target_points = self.point_cloud_points[obs_key]
         num_points = points.shape[0]
         points = points.to(device=self.device, dtype=torch.float32)
         if num_points <= target_points:
@@ -329,8 +380,8 @@ class ManiSkillCudaFPORunner:
 
         return sampled
 
-    def _resize_point_cloud(self, points: torch.Tensor) -> torch.Tensor:
-        target_points = self.point_cloud_points
+    def _resize_point_cloud(self, points: torch.Tensor, *, obs_key: str) -> torch.Tensor:
+        target_points = self.point_cloud_points[obs_key]
         if points.shape[0] == 0:
             return torch.zeros((target_points, 3), device=self.device, dtype=torch.float32)
 

@@ -309,6 +309,7 @@ def run_replay_smoke(
         task_profile=task_profile,
         env_id=None,
     )
+    replay_task_name = resolved_profile_name or task_name
     runtime_kwargs = dict(runtime_overrides)
     if save_video_dir is not None and runtime_kwargs.get("render_mode") in (None, ""):
         runtime_kwargs["render_mode"] = "rgb_array"
@@ -317,14 +318,14 @@ def run_replay_smoke(
         control_mode=runtime_kwargs["control_mode"],
     )
     runtime_kwargs["control_mode"] = resolved_control_mode
-    _, resolved_runtime, _ = apply_task_profile(task_name, runtime_kwargs)
+    _, resolved_runtime, applied_profile_name = apply_task_profile(replay_task_name, runtime_kwargs)
 
     root = zarr.open(str(zarr_path), mode="r")
     action_arr, _ = _get_action_array(root["data"])
     episode_ends = np.asarray(root["meta"]["episode_ends"], dtype=np.int64)
     teacher_seeds = _load_teacher_seeds(teacher_seed_path)
 
-    env = ManiSkillTaskFactory().create_env(task_name=task_name, **resolved_runtime)
+    env = ManiSkillTaskFactory().create_env(task_name=replay_task_name, **resolved_runtime)
     video_dir = save_video_dir
     if video_dir is not None:
         video_dir.mkdir(parents=True, exist_ok=True)
@@ -429,7 +430,10 @@ def run_replay_smoke(
 
     ok = all(item["error"] is None for item in replayed)
     return {
-        "profile_name": resolved_profile_name,
+        "profile_name": applied_profile_name or resolved_profile_name,
+        "task_name": replay_task_name,
+        "action_type": resolved_runtime.get("action_type"),
+        "control_mode": resolved_runtime.get("control_mode"),
         "episodes_checked": len(replayed),
         "ok": ok,
         "results": replayed,
@@ -487,7 +491,11 @@ def print_report(schema_info: dict, replay_info: dict | None) -> None:
     print(f"Verdict: usable_for_training={checks['usable_for_training']}")
     if replay_info is not None:
         print("")
-        print(f"Replay smoke: ok={replay_info['ok']} episodes_checked={replay_info['episodes_checked']}")
+        print(
+            "Replay smoke: ok={ok} episodes_checked={episodes_checked} "
+            "task_name={task_name} profile={profile_name} "
+            "action_type={action_type} control_mode={control_mode}".format(**replay_info)
+        )
         for item in replay_info["results"]:
             print(
                 "  episode={episode_index} seed={seed} steps={steps_executed} "
