@@ -31,3 +31,12 @@ training:
   num_fpo_samples: 2
   velocity_kl_coeff: 0.01
   point_cloud_sampling: fast
+  enable_tf32: true
+  float32_matmul_precision: high
+  torch_compile:
+    enabled: true
+    mode: default
+    dynamic: false
+    fullgraph: false
+    suppress_logs: true
+    compile_obs_encoder: true

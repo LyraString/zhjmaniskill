@@ -11,6 +11,7 @@ if __name__ == "__main__":
 import os
 import io
 import contextlib
+import logging
 import hydra
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -65,6 +66,19 @@ def _safe_float(v, default=0.0):
         return float(v)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _suppress_torch_compile_logs() -> None:
+    for logger_name in (
+        "torch._dynamo",
+        "torch._inductor",
+        "torch._inductor.select_algorithm",
+        "torch.fx.experimental.symbolic_shapes",
+        "triton",
+        "triton.compiler",
+        "triton.runtime",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.ERROR)
 
 
 ONLINE_ROLLOUT_DIAG_KEYS = (
@@ -391,6 +405,69 @@ class RobotWorkspace(BaseWorkspace):
         # 设备迁移
         self.critic.to(device)
         optimizer_to(self.critic_optimizer, device)
+
+        if bool(getattr(cfg.training, "enable_tf32", False)) and device.type == "cuda":
+            matmul_precision = str(getattr(cfg.training, "float32_matmul_precision", "high"))
+            torch.set_float32_matmul_precision(matmul_precision)
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            tqdm.tqdm.write(f"[torch] TF32 enabled, float32_matmul_precision={matmul_precision}")
+
+        tc_cfg = cfg.training.get("torch_compile", {})
+        if bool(tc_cfg.get("enabled", False)):
+            if not hasattr(torch, "compile"):
+                raise RuntimeError("training.torch_compile.enabled=True requires torch.compile support.")
+            mode = str(tc_cfg.get("mode", "default"))
+            dynamic = bool(tc_cfg.get("dynamic", False))
+            fullgraph = bool(tc_cfg.get("fullgraph", False))
+            if bool(tc_cfg.get("suppress_logs", True)):
+                _suppress_torch_compile_logs()
+            tqdm.tqdm.write(
+                f"[torch.compile] FPO actor model mode={mode}, dynamic={dynamic}, fullgraph={fullgraph}"
+            )
+            self.model.model = torch.compile(
+                self.model.model,
+                mode=mode,
+                dynamic=dynamic,
+                fullgraph=fullgraph,
+            )
+            if self.ema_model is not None:
+                self.ema_model.model = torch.compile(
+                    self.ema_model.model,
+                    mode=mode,
+                    dynamic=dynamic,
+                    fullgraph=fullgraph,
+                )
+            if self.ref_model is not None:
+                self.ref_model.model = torch.compile(
+                    self.ref_model.model,
+                    mode=mode,
+                    dynamic=dynamic,
+                    fullgraph=fullgraph,
+                )
+
+            if bool(tc_cfg.get("compile_obs_encoder", False)) and hasattr(self.model, "obs_encoder"):
+                tqdm.tqdm.write("[torch.compile] FPO obs_encoder enabled")
+                self.model.obs_encoder = torch.compile(
+                    self.model.obs_encoder,
+                    mode=mode,
+                    dynamic=dynamic,
+                    fullgraph=fullgraph,
+                )
+                if self.ema_model is not None and hasattr(self.ema_model, "obs_encoder"):
+                    self.ema_model.obs_encoder = torch.compile(
+                        self.ema_model.obs_encoder,
+                        mode=mode,
+                        dynamic=dynamic,
+                        fullgraph=fullgraph,
+                    )
+                if self.ref_model is not None and hasattr(self.ref_model, "obs_encoder"):
+                    self.ref_model.obs_encoder = torch.compile(
+                        self.ref_model.obs_encoder,
+                        mode=mode,
+                        dynamic=dynamic,
+                        fullgraph=fullgraph,
+                    )
 
         # save batch for sampling
         train_sampling_batch = None
