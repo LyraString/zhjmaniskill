@@ -9,6 +9,13 @@ import dill
 import imageio.v2 as imageio
 import numpy as np
 import torch
+from mani_skill.utils.geometry.rotation_conversions import (
+    euler_angles_to_matrix,
+    matrix_to_euler_angles,
+    matrix_to_quaternion,
+    quaternion_multiply,
+    quaternion_to_matrix,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +48,12 @@ MULTIVIEW_POINT_CLOUD_SPECS = {
     "left_wrist_point_cloud": "left_wrist_camera",
     "right_wrist_point_cloud": "right_wrist_camera",
 }
+
+DELTA_POSE_CONTROL_MODE = "bimanual_pd_ee_delta_pose"
+DELTA_POSE_ARM_SPECS = (
+    ("left", slice(0, 6), 6, "left_delta_pose_controller"),
+    ("right", slice(7, 13), 13, "right_delta_pose_controller"),
+)
 
 
 def _shape_meta_obs_items(ckpt_cfg) -> list[tuple[str, object]]:
@@ -133,17 +146,168 @@ def _clip_action_to_space(action, action_space, stats: dict):
     return clipped
 
 
+def _quaternion_inverse_wxyz(quat: torch.Tensor) -> torch.Tensor:
+    norm_sq = torch.sum(quat * quat).clamp_min(1e-8)
+    return torch.cat([quat[0:1], -quat[1:]], dim=0) / norm_sq
+
+
+def _normalize_pose_wxyz(pose: torch.Tensor) -> torch.Tensor:
+    pose = pose.to(dtype=torch.float32)
+    quat = pose[3:7]
+    quat = quat / torch.linalg.norm(quat).clamp_min(1e-8)
+    return torch.cat([pose[0:3], quat], dim=0)
+
+
+def _target_pose_from_delta(current_pose: torch.Tensor, delta_action: torch.Tensor) -> torch.Tensor:
+    delta_pos = delta_action[0:3]
+    delta_rot = delta_action[3:6].reshape(1, 3)
+    delta_quat = matrix_to_quaternion(euler_angles_to_matrix(delta_rot, "XYZ"))[0]
+    target_pos = current_pose[0:3] + delta_pos
+    target_quat = quaternion_multiply(
+        delta_quat.reshape(1, 4),
+        current_pose[3:7].reshape(1, 4),
+    )[0]
+    return _normalize_pose_wxyz(torch.cat([target_pos, target_quat], dim=0))
+
+
+def _delta_action_from_target_pose(current_pose: torch.Tensor, target_pose: torch.Tensor) -> torch.Tensor:
+    delta_pos = target_pose[0:3] - current_pose[0:3]
+    delta_quat = quaternion_multiply(
+        target_pose[3:7].reshape(1, 4),
+        _quaternion_inverse_wxyz(current_pose[3:7]).reshape(1, 4),
+    )[0]
+    delta_rot = matrix_to_euler_angles(
+        quaternion_to_matrix(delta_quat.reshape(1, 4)),
+        "XYZ",
+    )[0]
+    return torch.cat([delta_pos, delta_rot], dim=0)
+
+
+class DeltaPoseHoldFilter:
+    """Eval-only postprocessor for suppressing open-arm delta-pose drift."""
+
+    def __init__(
+        self,
+        *,
+        mode: str,
+        gripper_threshold: float,
+        pos_threshold: float,
+        rot_threshold: float,
+    ) -> None:
+        self.mode = mode
+        self.gripper_threshold = float(gripper_threshold)
+        self.pos_threshold = float(pos_threshold)
+        self.rot_threshold = float(rot_threshold)
+        self.anchors = {arm_name: None for arm_name, *_rest in DELTA_POSE_ARM_SPECS}
+        self.stats = {
+            "steps": 0,
+            "arm_steps": 0,
+            "held": 0,
+            "committed": 0,
+            "closed_passthrough": 0,
+            "unavailable": 0,
+        }
+        self.last_decisions = {arm_name: "off" for arm_name, *_rest in DELTA_POSE_ARM_SPECS}
+
+    def reset_episode(self) -> None:
+        self.anchors = {arm_name: None for arm_name, *_rest in DELTA_POSE_ARM_SPECS}
+        self.last_decisions = {arm_name: "off" for arm_name, *_rest in DELTA_POSE_ARM_SPECS}
+
+    def _read_current_pose(self, env_backend, controller_attr: str) -> torch.Tensor | None:
+        inner_env = getattr(env_backend, "env", env_backend)
+        unwrapped = getattr(inner_env, "unwrapped", inner_env)
+        controller = getattr(unwrapped, controller_attr, None)
+        ee_pose = getattr(controller, "ee_pose_at_base", None)
+        raw_pose = getattr(ee_pose, "raw_pose", None)
+        if raw_pose is None:
+            return None
+        pose = raw_pose.detach()
+        if pose.ndim == 2:
+            pose = pose[0]
+        elif pose.ndim > 2:
+            pose = pose.reshape(-1, pose.shape[-1])[0]
+        if pose.shape[-1] != 7:
+            return None
+        return _normalize_pose_wxyz(pose)
+
+    def apply(self, action, env_backend) -> np.ndarray:
+        action_np = np.asarray(action, dtype=np.float32).copy()
+        if action_np.shape != (14,):
+            raise ValueError(
+                f"Delta-pose hold filter expects a 14D bimanual action, got {action_np.shape}."
+            )
+
+        self.stats["steps"] += 1
+        for arm_name, action_slice, gripper_idx, controller_attr in DELTA_POSE_ARM_SPECS:
+            self.last_decisions[arm_name] = "passthrough"
+            self.stats["arm_steps"] += 1
+            gripper_cmd = float(action_np[gripper_idx])
+            current_pose = None
+            if gripper_cmd <= self.gripper_threshold:
+                current_pose = self._read_current_pose(env_backend, controller_attr)
+                if current_pose is not None:
+                    self.anchors[arm_name] = current_pose
+                self.last_decisions[arm_name] = "closed_passthrough"
+                self.stats["closed_passthrough"] += 1
+                continue
+
+            delta_np = action_np[action_slice]
+            pos_norm = float(np.linalg.norm(delta_np[0:3]))
+            rot_norm = float(np.linalg.norm(delta_np[3:6]))
+            is_small_delta = pos_norm <= self.pos_threshold and rot_norm <= self.rot_threshold
+
+            if self.mode == "deadband":
+                if is_small_delta:
+                    action_np[action_slice] = 0.0
+                    self.last_decisions[arm_name] = "held"
+                    self.stats["held"] += 1
+                else:
+                    self.last_decisions[arm_name] = "committed"
+                    self.stats["committed"] += 1
+                continue
+
+            current_pose = self._read_current_pose(env_backend, controller_attr)
+            if current_pose is None:
+                self.last_decisions[arm_name] = "unavailable"
+                self.stats["unavailable"] += 1
+                continue
+            if self.anchors[arm_name] is None:
+                self.anchors[arm_name] = current_pose
+
+            delta_action = torch.as_tensor(delta_np, device=current_pose.device, dtype=torch.float32)
+            if is_small_delta:
+                held_delta = _delta_action_from_target_pose(current_pose, self.anchors[arm_name])
+                action_np[action_slice] = held_delta.detach().cpu().numpy().astype(np.float32)
+                self.last_decisions[arm_name] = "held"
+                self.stats["held"] += 1
+            else:
+                self.anchors[arm_name] = _target_pose_from_delta(current_pose, delta_action)
+                self.last_decisions[arm_name] = "committed"
+                self.stats["committed"] += 1
+
+        return action_np
+
+
 def _new_action_trace():
     return {
         "episode": [],
         "step": [],
         "action": [],
+        "raw_action": [],
+        "filtered_action": [],
+        "clip_delta": [],
         "left_xyz_norm": [],
         "left_rot_norm": [],
         "left_gripper": [],
         "right_xyz_norm": [],
         "right_rot_norm": [],
         "right_gripper": [],
+        "raw_left_gripper": [],
+        "raw_right_gripper": [],
+        "filtered_left_gripper": [],
+        "filtered_right_gripper": [],
+        "left_filter_decision": [],
+        "right_filter_decision": [],
         "reward_stage": [],
         "box_to_target": [],
         "spatial_success": [],
@@ -156,8 +320,42 @@ def _new_action_trace():
     }
 
 
-def _append_action_trace(trace: dict, episode_idx: int, step: int, action: np.ndarray, info: Mapping) -> None:
+FILTER_DECISION_CODES = {
+    "off": 0,
+    "passthrough": 1,
+    "closed_passthrough": 2,
+    "held": 3,
+    "committed": 4,
+    "unavailable": 5,
+}
+
+
+def _action_or_nan(action) -> np.ndarray:
+    if action is None:
+        return np.full((14,), np.nan, dtype=np.float32)
     action_np = np.asarray(action, dtype=np.float32).reshape(-1)
+    if action_np.shape[0] == 14:
+        return action_np.astype(np.float32, copy=True)
+    padded = np.full((14,), np.nan, dtype=np.float32)
+    padded[: min(14, action_np.shape[0])] = action_np[: min(14, action_np.shape[0])]
+    return padded
+
+
+def _append_action_trace(
+    trace: dict,
+    episode_idx: int,
+    step: int,
+    action: np.ndarray,
+    info: Mapping,
+    *,
+    raw_action=None,
+    filtered_action=None,
+    filter_decisions: Mapping[str, str] | None = None,
+) -> None:
+    action_np = np.asarray(action, dtype=np.float32).reshape(-1)
+    raw_action_np = _action_or_nan(raw_action)
+    filtered_action_np = _action_or_nan(filtered_action)
+    clipped_action_np = _action_or_nan(action)
     if action_np.shape[0] >= 14:
         left_xyz = action_np[0:3]
         left_rot = action_np[3:6]
@@ -176,12 +374,26 @@ def _append_action_trace(trace: dict, episode_idx: int, step: int, action: np.nd
     trace["episode"].append(int(episode_idx))
     trace["step"].append(int(step))
     trace["action"].append(action_np.astype(np.float32, copy=True))
+    trace["raw_action"].append(raw_action_np)
+    trace["filtered_action"].append(filtered_action_np)
+    trace["clip_delta"].append(clipped_action_np - filtered_action_np)
     trace["left_xyz_norm"].append(float(np.linalg.norm(left_xyz)))
     trace["left_rot_norm"].append(float(np.linalg.norm(left_rot)))
     trace["left_gripper"].append(left_gripper)
     trace["right_xyz_norm"].append(float(np.linalg.norm(right_xyz)))
     trace["right_rot_norm"].append(float(np.linalg.norm(right_rot)))
     trace["right_gripper"].append(right_gripper)
+    trace["raw_left_gripper"].append(float(raw_action_np[6]))
+    trace["raw_right_gripper"].append(float(raw_action_np[13]))
+    trace["filtered_left_gripper"].append(float(filtered_action_np[6]))
+    trace["filtered_right_gripper"].append(float(filtered_action_np[13]))
+    filter_decisions = filter_decisions or {}
+    trace["left_filter_decision"].append(
+        FILTER_DECISION_CODES.get(str(filter_decisions.get("left", "off")), -1)
+    )
+    trace["right_filter_decision"].append(
+        FILTER_DECISION_CODES.get(str(filter_decisions.get("right", "off")), -1)
+    )
     trace["reward_stage"].append(_to_float_scalar_or_none(info.get("reward_stage")))
     trace["box_to_target"].append(_to_float_scalar_or_none(info.get("reward_box_to_target")))
     for key in (
@@ -202,7 +414,7 @@ def _save_action_trace(trace: dict, path: str) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     arrays = {}
     for key, values in trace.items():
-        if key == "action":
+        if key in {"action", "raw_action", "filtered_action", "clip_delta"}:
             arrays[key] = (
                 np.stack(values, axis=0).astype(np.float32)
                 if len(values) > 0
@@ -211,7 +423,11 @@ def _save_action_trace(trace: dict, path: str) -> None:
         else:
             arrays[key] = np.asarray(
                 [np.nan if value is None else value for value in values],
-                dtype=np.float32 if key not in {"episode", "step"} else np.int64,
+                dtype=(
+                    np.int64
+                    if key in {"episode", "step", "left_filter_decision", "right_filter_decision"}
+                    else np.float32
+                ),
             )
     np.savez_compressed(output_path, **arrays)
 
@@ -374,6 +590,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional .npz path for per-step action/stage diagnostics. Default is disabled.",
     )
+    parser.add_argument(
+        "--delta-pose-hold-mode",
+        choices=("off", "deadband", "anchor"),
+        default="off",
+        help="Eval-only filter for suppressing open-arm drift in delta-pose control.",
+    )
+    parser.add_argument("--delta-pose-hold-gripper-threshold", type=float, default=0.95)
+    parser.add_argument("--delta-pose-hold-pos-threshold", type=float, default=0.002)
+    parser.add_argument("--delta-pose-hold-rot-threshold", type=float, default=0.02)
     return parser
 
 
@@ -437,6 +662,24 @@ def run_evaluation(args) -> None:
         task_name=runtime_task_name,
         **resolved_runtime,
     )
+    delta_pose_hold_filter = None
+    if args.delta_pose_hold_mode != "off":
+        runtime_action_type = str(resolved_runtime.get("action_type") or "")
+        runtime_control_mode = str(resolved_runtime.get("control_mode") or resolved_control_mode or "")
+        if DELTA_POSE_CONTROL_MODE in (runtime_action_type, runtime_control_mode):
+            delta_pose_hold_filter = DeltaPoseHoldFilter(
+                mode=args.delta_pose_hold_mode,
+                gripper_threshold=args.delta_pose_hold_gripper_threshold,
+                pos_threshold=args.delta_pose_hold_pos_threshold,
+                rot_threshold=args.delta_pose_hold_rot_threshold,
+            )
+        else:
+            print(
+                "delta_pose_hold_filter disabled "
+                f"mode={args.delta_pose_hold_mode} "
+                f"action_type={runtime_action_type} "
+                f"control_mode={runtime_control_mode}"
+            )
 
     video_dir = Path(args.save_video_dir) if args.save_video_dir is not None else None
     if video_dir is not None:
@@ -452,6 +695,8 @@ def run_evaluation(args) -> None:
     try:
         for episode_idx in range(args.episodes):
             obs = env.reset(seed=args.seed + episode_idx)
+            if delta_pose_hold_filter is not None:
+                delta_pose_hold_filter.reset_episode()
             adapter.reset_model(model)
             encoded_obs = adapter.encode_obs(dict(obs.data))
             missing_obs_keys = [
@@ -491,7 +736,13 @@ def run_evaluation(args) -> None:
                 action_chunk = model.get_action()
 
                 for action in action_chunk:
-                    action = _clip_action_to_space(action, env.action_space, action_clip_stats)
+                    raw_action = np.asarray(action, dtype=np.float32).copy()
+                    filtered_action = raw_action
+                    filter_decisions = None
+                    if delta_pose_hold_filter is not None:
+                        filtered_action = delta_pose_hold_filter.apply(raw_action, env)
+                        filter_decisions = dict(delta_pose_hold_filter.last_decisions)
+                    action = _clip_action_to_space(filtered_action, env.action_space, action_clip_stats)
                     result = env.step(
                         ActionSpec.from_value(action, action_type=resolved_runtime["action_type"])
                     )
@@ -502,6 +753,9 @@ def run_evaluation(args) -> None:
                             step=episode_length,
                             action=action,
                             info=result.info,
+                            raw_action=raw_action,
+                            filtered_action=filtered_action,
+                            filter_decisions=filter_decisions,
                         )
                     if _to_bool_scalar(result.info.get("success", False)):
                         success = True
@@ -579,6 +833,21 @@ def run_evaluation(args) -> None:
             f"dim_frac={action_clip_stats['clipped_dims'] / max(1, action_clip_stats['dims']):.6f} "
             f"abs_mean={action_clip_stats['abs_sum'] / clipped_dims:.6f} "
             f"abs_max={action_clip_stats['abs_max']:.6f}"
+        )
+    if delta_pose_hold_filter is not None:
+        stats = delta_pose_hold_filter.stats
+        print(
+            "delta_pose_hold_summary "
+            f"mode={delta_pose_hold_filter.mode} "
+            f"steps={stats['steps']} "
+            f"arm_steps={stats['arm_steps']} "
+            f"held={stats['held']} "
+            f"committed={stats['committed']} "
+            f"closed_passthrough={stats['closed_passthrough']} "
+            f"unavailable={stats['unavailable']} "
+            f"gripper_threshold={delta_pose_hold_filter.gripper_threshold:.4f} "
+            f"pos_threshold={delta_pose_hold_filter.pos_threshold:.6f} "
+            f"rot_threshold={delta_pose_hold_filter.rot_threshold:.6f}"
         )
     if len(handover_diags) > 0:
         diag_count = float(len(handover_diags))
