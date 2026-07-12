@@ -19,6 +19,11 @@ eval_videos/
 assets/*
 !assets/_download.py
 !assets/files
+!assets/embodiments/
+assets/embodiments/*
+!assets/embodiments/ur5-wsg/
+assets/embodiments/ur5-wsg/*
+!assets/embodiments/ur5-wsg/ur5_wsg_real_layout.srdf
 
 policy/weights/*
 

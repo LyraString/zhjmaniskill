@@ -26,6 +26,7 @@ class DualUR5WSGEnv(BaseBimanualEnv):
         robot_pose_override=None,
         homestate_override=None,
         static_camera_list_override=None,
+        planner_srdf_override=None,
         **kwargs,
     ):
         embodiment_spec = BimanualEmbodimentSpec.from_robot_dirs(
@@ -40,6 +41,8 @@ class DualUR5WSGEnv(BaseBimanualEnv):
                 config["homestate"] = deepcopy(homestate_override)
             if static_camera_list_override is not None:
                 config["static_camera_list"] = deepcopy(static_camera_list_override)
+            if planner_srdf_override is not None:
+                config["srdf_path"] = str(planner_srdf_override)
         super().__init__(
             *args,
             embodiment_spec=embodiment_spec,

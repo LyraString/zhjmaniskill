@@ -80,19 +80,21 @@ class HandoverBlockUR5V2Env(HandoverBlockEnv):
             box_q = box_q / torch.linalg.norm(box_q, dim=-1, keepdim=True)
             self.box.set_pose(Pose.create_from_pq(p=box_xyz, q=box_q))
 
+            target_x_range = self.target_x_range_override or V2_TARGET_X_RANGE
+            target_y_range = self.target_y_range_override or V2_TARGET_Y_RANGE
             target_x = torch.as_tensor(
-                episode_rng.uniform(*V2_TARGET_X_RANGE),
+                episode_rng.uniform(*target_x_range),
                 device=self.device,
                 dtype=torch.float32,
             ).reshape(b)
             target_y = torch.as_tensor(
-                episode_rng.uniform(*V2_TARGET_Y_RANGE),
+                episode_rng.uniform(*target_y_range),
                 device=self.device,
                 dtype=torch.float32,
             ).reshape(b)
 
             target_xyz = torch.zeros((b, 3), device=self.device, dtype=torch.float32)
-            target_xyz[:, 0] = target_x
+            target_xyz[:, 0] = target_x + float(self.target_x_offset)
             target_xyz[:, 1] = target_y + float(self.object_y_offset)
             target_xyz[:, 2] = TARGET_CENTER_Z
             self.target_box.set_pose(Pose.create_from_pq(p=target_xyz))

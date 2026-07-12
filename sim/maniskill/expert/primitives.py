@@ -1376,11 +1376,18 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
     DELTA_ROTATION_EPS = 1e-9
     DEFAULT_TRANSLATION_STEP = 0.015
     DEFAULT_ROTATION_STEP = 0.10
-    POSITION_CORRECTION_GAIN = 1.0
+    POSITION_CORRECTION_GAIN = 1.5
     ROTATION_CORRECTION_GAIN = 1.0
-    POSE_POSITION_TOLERANCE = 0.005
+    POSE_POSITION_TOLERANCE = 0.010
     POSE_ROTATION_TOLERANCE = 0.05
     MAX_WAYPOINT_TRACKING_STEPS = 32
+    PLAN_WAYPOINT_POSITION_TOLERANCE = 0.015
+    PLAN_WAYPOINT_ROTATION_TOLERANCE = 0.10
+    PLAN_WAYPOINT_MAX_POSITION_ERROR = 0.05
+    PLAN_WAYPOINT_MAX_ROTATION_ERROR = 0.25
+    MAX_PLAN_WAYPOINT_TRACKING_STEPS = 6
+    PLAN_CARTESIAN_TRANSLATION_STEP = 0.015
+    PLAN_CARTESIAN_ROTATION_STEP = 0.10
     ACTION_BOUND_EPS = 1e-6
     uses_delta_pose_actions = True
 
@@ -1404,6 +1411,7 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         self.controller_failure_count = 0
         self.qpos_fallback_count = 0
         self.waypoint_nonconvergence_count = 0
+        self.plan_waypoint_lag_count = 0
 
     def capture_extra_state(self) -> dict[str, Any]:
         return {
@@ -1419,6 +1427,7 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
             "controller_failure_count": int(self.controller_failure_count),
             "qpos_fallback_count": int(self.qpos_fallback_count),
             "waypoint_nonconvergence_count": int(self.waypoint_nonconvergence_count),
+            "plan_waypoint_lag_count": int(self.plan_waypoint_lag_count),
         }
 
     def restore_extra_state(self, state: dict[str, Any]) -> None:
@@ -1438,12 +1447,13 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         self.waypoint_nonconvergence_count = int(
             state.get("waypoint_nonconvergence_count", 0)
         )
+        self.plan_waypoint_lag_count = int(state.get("plan_waypoint_lag_count", 0))
 
     def delta_debug_summary(self) -> dict[str, float | int | str]:
         return {
             "action_semantics": "delta_pose_actual",
             "rotation_representation": "euler_xyz",
-            "translation_frame": "root_world_aligned",
+            "translation_frame": "root_aligned",
             "gripper_semantics": "absolute",
             "control_mode": "bimanual_pd_ee_delta_pose",
             "translation_action_limit": float(self.DEFAULT_TRANSLATION_STEP),
@@ -1456,6 +1466,7 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
             "controller_failure_count": int(self.controller_failure_count),
             "qpos_fallback_count": int(self.qpos_fallback_count),
             "waypoint_nonconvergence_count": int(self.waypoint_nonconvergence_count),
+            "plan_waypoint_lag_count": int(self.plan_waypoint_lag_count),
         }
 
     def _failed_result(self):
@@ -1550,6 +1561,15 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
             current_ee_pose = self.current_ee_pose(arm_index)
             target_ee_pose = self.gripper_pose_to_planner_pose(
                 arm_index, target_gripper_pose
+            )
+            world_to_root = np.linalg.inv(
+                pose_to_matrix(self.base_env.get_arm_root_pose_array(arm_index))
+            )
+            current_ee_pose = matrix_to_pose(
+                world_to_root @ pose_to_matrix(current_ee_pose)
+            )
+            target_ee_pose = matrix_to_pose(
+                world_to_root @ pose_to_matrix(target_ee_pose)
             )
             delta_pos = self._bounded_vector(
                 self.POSITION_CORRECTION_GAIN
@@ -1692,12 +1712,14 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         if not converged:
             self.waypoint_nonconvergence_count += 1
             self.last_plan_debug = {
-                "warning": "delta_pose_final_waypoint_not_converged",
+                "reason": "delta_pose_final_waypoint_not_converged",
                 "arm_index": int(arm_index),
                 "position_error": float(position_error),
                 "rotation_error": float(rotation_error),
                 "target_gripper_pose": target_gripper_pose.round(6).tolist(),
             }
+            self.last_status = fail_status
+            return False
         if settle_steps > 0:
             for _ in range(int(settle_steps)):
                 grippers = {} if gripper is None else {int(arm_index): float(gripper)}
@@ -1743,13 +1765,142 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         gripper: float | None = None,
     ) -> bool:
         positions = np.asarray(plan_result.get("position", []), dtype=np.float64)
-        steps = max(1, int(len(positions)))
+        if positions.ndim != 2 or len(positions) == 0:
+            self.last_status = "delta_pose_plan_has_no_joint_path"
+            self.last_plan_debug = {
+                "arm_index": int(arm_index),
+                "position_shape": list(positions.shape),
+            }
+            return False
+
+        planner = self.planners[int(arm_index)]
+        pinocchio_model = planner.pinocchio_model
+        move_group = str(self.base_env.get_arm_move_group(int(arm_index)))
+        link_names = list(pinocchio_model.get_link_names())
+        if move_group not in link_names:
+            self.last_status = "delta_pose_plan_fk_link_missing"
+            self.last_plan_debug = {
+                "arm_index": int(arm_index),
+                "move_group": move_group,
+            }
+            return False
+
+        arm_dof = int(self.current_qpos(int(arm_index)).shape[0])
+        if positions.shape[1] < arm_dof:
+            self.last_status = "delta_pose_plan_qpos_shape_mismatch"
+            self.last_plan_debug = {
+                "arm_index": int(arm_index),
+                "position_shape": list(positions.shape),
+                "arm_dof": arm_dof,
+            }
+            return False
+
+        # MPlib supplies only the collision-free IK branch. The environment
+        # still receives and records native actual-relative Cartesian actions.
+        full_qpos = self.current_full_qpos(int(arm_index)).copy()
+        root_matrix = pose_to_matrix(self.base_env.get_arm_root_pose_array(int(arm_index)))
+        move_group_index = link_names.index(move_group)
+        grippers = {} if gripper is None else {int(arm_index): float(gripper)}
+        try:
+            planned_gripper_poses: list[np.ndarray] = []
+            for arm_qpos in positions:
+                full_qpos[:arm_dof] = arm_qpos[:arm_dof]
+                pinocchio_model.compute_forward_kinematics(full_qpos)
+                local_ee_pose = np.asarray(
+                    pinocchio_model.get_link_pose(move_group_index),
+                    dtype=np.float64,
+                ).reshape(7)
+                world_ee_pose = matrix_to_pose(root_matrix @ pose_to_matrix(local_ee_pose))
+                waypoint_gripper_pose = self.planner_pose_to_gripper_pose(
+                    int(arm_index), world_ee_pose
+                )
+                planned_gripper_poses.append(waypoint_gripper_pose)
+
+            # Joint-space plans can contain Cartesian jumps larger than one
+            # native delta action. Densify them before tracking so the recorded
+            # action remains bounded and the differential IK stays on the
+            # collision-free branch selected by MPlib.
+            dense_gripper_poses: list[np.ndarray] = []
+            segment_start = self.current_gripper_pose(int(arm_index)).copy()
+            for waypoint_gripper_pose in planned_gripper_poses:
+                position_distance, rotation_distance = self._pose_error(
+                    segment_start,
+                    waypoint_gripper_pose,
+                )
+                segment_steps = max(
+                    1,
+                    int(np.ceil(position_distance / self.PLAN_CARTESIAN_TRANSLATION_STEP)),
+                    int(np.ceil(rotation_distance / self.PLAN_CARTESIAN_ROTATION_STEP)),
+                )
+                dense_gripper_poses.extend(
+                    self._interpolate_gripper_poses(
+                        segment_start,
+                        waypoint_gripper_pose,
+                        segment_steps,
+                    )
+                )
+                segment_start = waypoint_gripper_pose
+
+            for waypoint_index, waypoint_gripper_pose in enumerate(dense_gripper_poses):
+                converged = False
+                for _ in range(self.MAX_PLAN_WAYPOINT_TRACKING_STEPS):
+                    result, success = self._step_target_gripper_poses(
+                        {int(arm_index): waypoint_gripper_pose}, grippers, recorder
+                    )
+                    if success:
+                        self.last_status = "success"
+                        return True
+                    if self.last_status != "running":
+                        return False
+                    if result.terminated or result.truncated:
+                        self.last_status = "terminated_during_delta_pose_plan_tracking"
+                        return False
+                    position_error, rotation_error = self._pose_error(
+                        self.current_gripper_pose(int(arm_index)),
+                        waypoint_gripper_pose,
+                    )
+                    if (
+                        position_error <= self.PLAN_WAYPOINT_POSITION_TOLERANCE
+                        and rotation_error <= self.PLAN_WAYPOINT_ROTATION_TOLERANCE
+                    ):
+                        converged = True
+                        break
+                if not converged:
+                    if (
+                        position_error > self.PLAN_WAYPOINT_MAX_POSITION_ERROR
+                        or rotation_error > self.PLAN_WAYPOINT_MAX_ROTATION_ERROR
+                    ):
+                        self.waypoint_nonconvergence_count += 1
+                        self.last_status = "delta_pose_plan_waypoint_not_converged"
+                        self.last_plan_debug = {
+                            "arm_index": int(arm_index),
+                            "waypoint_index": int(waypoint_index),
+                            "waypoint_count": int(len(dense_gripper_poses)),
+                            "source_waypoint_count": int(len(planned_gripper_poses)),
+                            "position_error": float(position_error),
+                            "rotation_error": float(rotation_error),
+                            "target_gripper_pose": waypoint_gripper_pose.round(6).tolist(),
+                        }
+                        return False
+                    self.plan_waypoint_lag_count += 1
+        except (IndexError, RuntimeError, ValueError) as exc:
+            self.last_status = "delta_pose_plan_fk_failed"
+            self.last_plan_debug = {
+                "arm_index": int(arm_index),
+                "reason": f"{type(exc).__name__}:{exc}",
+            }
+            return False
+        finally:
+            pinocchio_model.compute_forward_kinematics(
+                self.current_full_qpos(int(arm_index))
+            )
+
         return self._move_arm_to_gripper_pose(
             arm_index,
             target_gripper_pose,
             recorder,
             gripper=gripper,
-            steps=steps,
+            steps=1,
             fail_status="delta_pose_plan_to_gripper_pose_failed",
         )
 

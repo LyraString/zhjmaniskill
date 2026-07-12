@@ -58,14 +58,37 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         legacy_rng_compat: bool = False,
         object_y_offset: float = 0.0,
         box_x_offset: float = 0.0,
+        target_x_offset: float = 0.0,
+        target_x_range_override=None,
+        target_y_range_override=None,
         **kwargs,
     ):
         self.legacy_rng_compat = bool(legacy_rng_compat)
         self.object_y_offset = float(object_y_offset)
         self.box_x_offset = float(box_x_offset)
+        self.target_x_offset = float(target_x_offset)
+        self.target_x_range_override = self._validate_optional_range(
+            target_x_range_override,
+            name="target_x_range_override",
+        )
+        self.target_y_range_override = self._validate_optional_range(
+            target_y_range_override,
+            name="target_y_range_override",
+        )
         self.success_gate_enabled = True
         self.reward_stage = None
         super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _validate_optional_range(value, *, name: str) -> tuple[float, float] | None:
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(f"{name} must contain exactly two values.")
+        lower, upper = float(value[0]), float(value[1])
+        if lower > upper:
+            raise ValueError(f"{name} lower bound must not exceed its upper bound.")
+        return lower, upper
 
     def _load_scene(self, options: dict):
         super()._load_scene(options)
@@ -97,7 +120,15 @@ class HandoverBlockEnv(DualUR5WSGEnv):
                 half_size=TARGET_HALF_SIZE.tolist(),
                 material=sapien.render.RenderMaterial(base_color=[0.0, 0.0, 1.0, 1.0]),
             )
-        target_builder.set_initial_pose(sapien.Pose(p=[0.18, 0.175 + self.object_y_offset, TARGET_CENTER_Z]))
+        target_builder.set_initial_pose(
+            sapien.Pose(
+                p=[
+                    0.18 + self.target_x_offset,
+                    0.175 + self.object_y_offset,
+                    TARGET_CENTER_Z,
+                ]
+            )
+        )
         self.target_box = target_builder.build_kinematic(name="target_box")
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
@@ -157,15 +188,17 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             box_q = box_q / torch.linalg.norm(box_q, dim=-1, keepdim=True)
             self.box.set_pose(Pose.create_from_pq(p=box_xyz, q=box_q))
 
-            target_x_np = episode_rng.uniform(0.10, 0.25)
-            target_y_np = episode_rng.uniform(0.15, 0.20)
+            target_x_range = self.target_x_range_override or (0.10, 0.25)
+            target_y_range = self.target_y_range_override or (0.15, 0.20)
+            target_x_np = episode_rng.uniform(*target_x_range)
+            target_y_np = episode_rng.uniform(*target_y_range)
             target_z_np = episode_rng.uniform(TARGET_CENTER_Z, TARGET_CENTER_Z) if self.legacy_rng_compat else None
 
             target_x = torch.as_tensor(target_x_np, device=self.device, dtype=torch.float32).reshape(b)
             target_y = torch.as_tensor(target_y_np, device=self.device, dtype=torch.float32).reshape(b)
 
             target_xyz = torch.zeros((b, 3), device=self.device, dtype=torch.float32)
-            target_xyz[:, 0] = target_x
+            target_xyz[:, 0] = target_x + float(self.target_x_offset)
             target_xyz[:, 1] = target_y + float(self.object_y_offset)
             if target_z_np is None:
                 target_xyz[:, 2] = TARGET_CENTER_Z

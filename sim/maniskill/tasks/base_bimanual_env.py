@@ -97,6 +97,12 @@ class BaseBimanualEnv(BaseEnv):
         **kwargs,
     ):
         self.enable_wrist_cameras = bool(kwargs.pop("enable_wrist_cameras", False))
+        self.clamp_gripper_drive_targets = bool(
+            kwargs.pop("clamp_gripper_drive_targets", False)
+        )
+        self.disable_arm_self_collisions = bool(
+            kwargs.pop("disable_arm_self_collisions", False)
+        )
         self.workspace_table_y = float(kwargs.pop("workspace_table_y", 0.0))
         self.expert_grasp_variant = str(kwargs.pop("expert_grasp_variant", ""))
         self.embodiment_spec = embodiment_spec
@@ -286,6 +292,13 @@ class BaseBimanualEnv(BaseEnv):
         self.workspace_table = table_builder.build_static(name="workspace_table")
         self.left_robot = self._load_robot(arm_index=0, name="left_embodiment")
         self.right_robot = self._load_robot(arm_index=1, name="right_embodiment")
+        if self.disable_arm_self_collisions:
+            # Use distinct bits so each arm keeps colliding with the other arm,
+            # the objects, and the scene while ignoring only its own mesh overlap.
+            for link in self.left_robot.get_links():
+                link.set_collision_group_bit(group=2, bit_idx=28, bit=1)
+            for link in self.right_robot.get_links():
+                link.set_collision_group_bit(group=2, bit_idx=27, bit=1)
         self.left_arm_joints = self._get_arm_joints(self.left_robot, arm_index=0)
         self.right_arm_joints = self._get_arm_joints(self.right_robot, arm_index=1)
         self.left_gripper = self._get_gripper_joints(self.left_robot, arm_index=0)
@@ -556,6 +569,27 @@ class BaseBimanualEnv(BaseEnv):
             [real_gripper_val * sign + offset for _, sign, offset in joints],
             dim=1,
         )
+        if self.clamp_gripper_drive_targets:
+            clamped_targets = []
+            for column, (joint, _, _) in enumerate(joints):
+                limits = joint.get_limits().to(
+                    device=drive_targets.device,
+                    dtype=drive_targets.dtype,
+                )
+                if limits.ndim == 1:
+                    limits = limits.unsqueeze(0)
+                if env_idx is not None and limits.shape[0] == self.num_envs:
+                    limits = limits[env_idx]
+                if limits.shape[0] == 1 and target_envs > 1:
+                    limits = limits.expand(target_envs, -1)
+                clamped_targets.append(
+                    torch.clamp(
+                        drive_targets[:, column],
+                        min=limits[:, 0],
+                        max=limits[:, 1],
+                    )
+                )
+            drive_targets = torch.stack(clamped_targets, dim=1)
         articulation = joint_objs[0].articulation
         articulation.set_joint_drive_targets(drive_targets, joints=joint_objs)
         articulation.set_joint_drive_velocity_targets(

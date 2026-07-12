@@ -91,9 +91,11 @@ class HandoverBlockSolver:
     RIGHT_ROTATE_LIM = (-0.6, 0.6)
     LEFT_FIRST_GRASP_YAW_VARIANTS = (0.0,)
     REAL_LAYOUT_LEFT_GRASP_CONTACT_IDS = (1,)
-    REAL_LAYOUT_LEFT_FIRST_GRASP_THETAS = (0.6, 0.3)
-    REAL_LAYOUT_RIGHT_HANDOVER_CONTACT_IDS = (6,)
-    REAL_LAYOUT_HANDOVER_TARGET_POSE = np.asarray([0.10, -0.34, 1.07], dtype=np.float64)
+    REAL_LAYOUT_LEFT_FIRST_GRASP_THETAS = (0.45,)
+    REAL_LAYOUT_DELTA_LEFT_FIRST_GRASP_DISTANCE = 0.0
+    REAL_LAYOUT_RIGHT_HANDOVER_CONTACT_IDS = (4,)
+    REAL_LAYOUT_RIGHT_HANDOVER_GRASP_DISTANCE = 0.0
+    REAL_LAYOUT_HANDOVER_TARGET_POSE = np.asarray([0.15, -0.30, 1.15], dtype=np.float64)
     LEFT_LIFT_DISTANCE = 0.16
     LEFT_HANDOVER_CLEARANCE_Z = 0.18
     LEFT_RELEASE_LIFT_DISTANCE = 0.0
@@ -594,6 +596,18 @@ class HandoverBlockSolver:
     def _use_real_layout_right_handover(self) -> bool:
         return str(getattr(self.base_env, "expert_grasp_variant", "")) == "real_layout_v1"
 
+    def _right_handover_grasp_distance(self) -> float:
+        if self._use_real_layout_right_handover():
+            return float(self.REAL_LAYOUT_RIGHT_HANDOVER_GRASP_DISTANCE)
+        return float(self.RIGHT_HANDOVER_GRASP_DISTANCE)
+
+    def _left_first_grasp_distance(self) -> float:
+        if self._use_real_layout_left_first_grasp() and bool(
+            getattr(self.ctrl, "uses_delta_pose_actions", False)
+        ):
+            return float(self.REAL_LAYOUT_DELTA_LEFT_FIRST_GRASP_DISTANCE)
+        return float(self.LEFT_FIRST_GRASP_DISTANCE)
+
     def _use_real_layout_left_release_clear(self) -> bool:
         return str(getattr(self.base_env, "expert_grasp_variant", "")) == "real_layout_v1"
 
@@ -1082,7 +1096,7 @@ class HandoverBlockSolver:
                 arm_index=1,
                 contact_ids=(int(contact_id),),
                 pre_distance=self.HANDOVER_PRE_GRASP_DISTANCE,
-                grasp_distance=self.RIGHT_HANDOVER_GRASP_DISTANCE,
+                grasp_distance=self._right_handover_grasp_distance(),
                 pose_builder=self._grasp_pose_from_box_pose,
                 preferred_quat=preferred_quat,
                 preferred_top_down_quat=preferred_top_down_quat,
@@ -1477,7 +1491,7 @@ class HandoverBlockSolver:
                 arm_index=1,
                 contact_ids=(handover_candidate.contact_id,),
                 pre_grasp_dis=self.HANDOVER_PRE_GRASP_DISTANCE,
-                grasp_dis=self.RIGHT_HANDOVER_GRASP_DISTANCE,
+                grasp_dis=self._right_handover_grasp_distance(),
                 pose_builder=self._grasp_pose_from_box_pose,
                 preferred_quat=self._preferred_grasp_quat(1),
                 preferred_top_down_quat=TOP_DOWN_PREFERRED_GRASP_QUATS[1],
@@ -2781,7 +2795,7 @@ class HandoverBlockSolver:
                 arm_index=0,
                 contact_ids=left_first_grasp_contact_ids,
                 pre_distance=self.PRE_GRASP_DISTANCE,
-                grasp_distance=self.LEFT_FIRST_GRASP_DISTANCE,
+                grasp_distance=self._left_first_grasp_distance(),
                 pose_builder=self._grasp_pose_from_box_pose,
                 preferred_quat=self._preferred_grasp_quat(0),
                 preferred_top_down_quat=TOP_DOWN_PREFERRED_GRASP_QUATS[0],

@@ -352,17 +352,32 @@ def run_collection(args) -> None:
     profile_runtime_key = resolved_profile_name or runtime_task_name
     _, resolved_runtime, _profile_name = apply_task_profile(profile_runtime_key, runtime_kwargs)
     save_dir = REPO_ROOT / "data" / runtime_task_name / args.task_config
-    env = ManiSkillTaskFactory().create_env(
-        task_name=runtime_task_name,
-        **resolved_runtime,
-    )
     video_dir = _resolve_repo_path(args.save_video_dir)
-    recorder = VideoTrajectoryRecorder(
-        ManiSkillTrajectoryRecorder(save_dir),
-        env_backend=env,
-        video_dir=video_dir,
-        video_fps=args.video_fps,
+
+    def create_runtime():
+        runtime_env = ManiSkillTaskFactory().create_env(
+            task_name=runtime_task_name,
+            **resolved_runtime,
+        )
+        runtime_recorder = VideoTrajectoryRecorder(
+            ManiSkillTrajectoryRecorder(save_dir),
+            env_backend=runtime_env,
+            video_dir=video_dir,
+            video_fps=args.video_fps,
+        )
+        return runtime_env, runtime_recorder
+
+    env, recorder = create_runtime()
+    # Reusing the real-layout SAPIEN/MPlib state makes later attempts depend on
+    # the preceding placement rollout, so isolate each scripted attempt.
+    recreate_real_layout_scripted_runtime = (
+        resolved_profile_name == "handover_block_ur5_v2_real_layout_probe"
     )
+
+    def recreate_runtime() -> None:
+        nonlocal env, recorder
+        env.close()
+        env, recorder = create_runtime()
 
     def maybe_render() -> None:
         if getattr(env, "render_mode", None) == "human":
@@ -398,6 +413,9 @@ def run_collection(args) -> None:
             while saved_episode_idx < args.episode_num and (
                 args.max_attempts is None or attempted_episode_idx < int(args.max_attempts)
             ):
+                if recreate_real_layout_scripted_runtime and attempted_episode_idx > 0:
+                    recreate_runtime()
+                    solver = HandoverBlockSolver(env)
                 reset_seed = args.seed + attempted_episode_idx
                 obs = env.reset(seed=reset_seed)
                 recorder.start_episode(dict(obs.data))
@@ -495,6 +513,9 @@ def run_collection(args) -> None:
             while saved_episode_idx < args.episode_num and (
                 args.max_attempts is None or attempted_episode_idx < int(args.max_attempts)
             ):
+                if recreate_real_layout_scripted_runtime and attempted_episode_idx > 0:
+                    recreate_runtime()
+                    solver = HandoverBlockSolver(env, ctrl_cls=DeltaPoseMotionPrimitives)
                 reset_seed = args.seed + attempted_episode_idx
                 obs = env.reset(seed=reset_seed)
                 recorder.start_episode(dict(obs.data))
@@ -522,7 +543,7 @@ def run_collection(args) -> None:
                         "collector": "scripted_delta_pose_expert",
                         "action_semantics": "delta_pose_actual",
                         "rotation_representation": "euler_xyz",
-                        "translation_frame": "root_world_aligned",
+                        "translation_frame": "root_aligned",
                         "gripper_semantics": "absolute",
                         "control_mode": "bimanual_pd_ee_delta_pose",
                         "seed": int(reset_seed),
