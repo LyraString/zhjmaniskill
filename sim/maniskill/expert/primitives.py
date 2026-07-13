@@ -213,6 +213,10 @@ class FixedRateMotionPrimitives:
     def restore_extra_state(self, state: dict[str, Any]) -> None:
         return None
 
+    def freeze_current_arm_target(self, arm_index: int) -> None:
+        arm_index = int(arm_index)
+        self.commanded_arm_qpos[arm_index] = self.current_qpos(arm_index).copy()
+
     def _build_planner(self, arm_index: int) -> mplib.Planner:
         assets = self.base_env.get_arm_planner_assets(arm_index)
         ensure_convex_collision_meshes(assets["urdf_path"])
@@ -1295,10 +1299,10 @@ class FixedRateMotionPrimitives:
             # Stop arm drift while the fingers close. If the hand is still too
             # far from contact, the task-level grasp validation should reject
             # the sample instead of letting the arm push the object around.
-            self.commanded_arm_qpos[int(arm_index)] = self.current_qpos(int(arm_index)).copy()
+            self.freeze_current_arm_target(int(arm_index))
             for paired_arm_index in (pre_close_paired_gripper_arm_index, paired_close_gripper_arm_index):
                 if paired_arm_index is not None:
-                    self.commanded_arm_qpos[int(paired_arm_index)] = self.current_qpos(int(paired_arm_index)).copy()
+                    self.freeze_current_arm_target(int(paired_arm_index))
         if (
             pre_close_paired_gripper_arm_index is not None
             and pre_close_paired_gripper_pos is not None
@@ -1448,6 +1452,14 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
             state.get("waypoint_nonconvergence_count", 0)
         )
         self.plan_waypoint_lag_count = int(state.get("plan_waypoint_lag_count", 0))
+
+    def freeze_current_arm_target(self, arm_index: int) -> None:
+        arm_index = int(arm_index)
+        super().freeze_current_arm_target(arm_index)
+        self.desired_gripper_pose[arm_index] = self.current_gripper_pose(arm_index).copy()
+
+    def _use_strict_plan_waypoint_tracking(self) -> bool:
+        return str(getattr(self.base_env, "expert_grasp_variant", "")) == "real_layout_v1"
 
     def delta_debug_summary(self) -> dict[str, float | int | str]:
         return {
@@ -1718,8 +1730,9 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
                 "rotation_error": float(rotation_error),
                 "target_gripper_pose": target_gripper_pose.round(6).tolist(),
             }
-            self.last_status = fail_status
-            return False
+            if self._use_strict_plan_waypoint_tracking():
+                self.last_status = fail_status
+                return False
         if settle_steps > 0:
             for _ in range(int(settle_steps)):
                 grippers = {} if gripper is None else {int(arm_index): float(gripper)}
@@ -1765,6 +1778,15 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         gripper: float | None = None,
     ) -> bool:
         positions = np.asarray(plan_result.get("position", []), dtype=np.float64)
+        if not self._use_strict_plan_waypoint_tracking():
+            return self._move_arm_to_gripper_pose(
+                arm_index,
+                target_gripper_pose,
+                recorder,
+                gripper=gripper,
+                steps=max(1, int(len(positions))),
+                fail_status="delta_pose_plan_to_gripper_pose_failed",
+            )
         if positions.ndim != 2 or len(positions) == 0:
             self.last_status = "delta_pose_plan_has_no_joint_path"
             self.last_plan_debug = {

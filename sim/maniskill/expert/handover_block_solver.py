@@ -1526,6 +1526,12 @@ class HandoverBlockSolver:
         if success:
             return True, self.ctrl.steps_taken, self.ctrl.last_status
 
+        if getattr(self.ctrl, "uses_delta_pose_actions", False):
+            # Contact can shift both end effectors while the right gripper closes.
+            # Hold the achieved transfer pose instead of pulling toward stale targets.
+            self.ctrl.freeze_current_arm_target(0)
+            self.ctrl.freeze_current_arm_target(1)
+
         if self.RIGHT_HANDOVER_DUAL_HOLD_STEPS > 0:
             if self.ctrl.hold_pose(
                 recorder,
