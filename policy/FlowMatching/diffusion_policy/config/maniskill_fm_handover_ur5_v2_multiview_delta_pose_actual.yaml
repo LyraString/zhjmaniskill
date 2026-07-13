@@ -27,6 +27,8 @@ training:
   gradient_accumulate_every: 2
   rollout_every: 50
   checkpoint_every: 100
+  val_every: 25
+  max_val_steps: 10
   sample_every: 5
   amp:
     enabled: True

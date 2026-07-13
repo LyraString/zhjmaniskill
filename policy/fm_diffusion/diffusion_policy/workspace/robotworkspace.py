@@ -46,6 +46,38 @@ def _resolve_amp_config(training_cfg) -> tuple[bool, torch.dtype]:
     return enabled, dtype
 
 
+def _action_prediction_metrics(pred_action: torch.Tensor, gt_action: torch.Tensor) -> dict:
+    if pred_action.shape != gt_action.shape:
+        raise ValueError(
+            "Action metrics require matching prediction and target shapes, got "
+            f"prediction={tuple(pred_action.shape)} target={tuple(gt_action.shape)}"
+        )
+    if pred_action.shape[-1] != 14:
+        return {}
+
+    pred_action = pred_action.float()
+    gt_action = gt_action.float()
+    translation_dims = (0, 1, 2, 7, 8, 9)
+    rotation_dims = (3, 4, 5, 10, 11, 12)
+    gripper_dims = (6, 13)
+
+    translation_mae = torch.nn.functional.l1_loss(
+        pred_action[..., translation_dims], gt_action[..., translation_dims]
+    )
+    rotation_mae = torch.nn.functional.l1_loss(
+        pred_action[..., rotation_dims], gt_action[..., rotation_dims]
+    )
+    gripper_accuracy = (
+        (pred_action[..., gripper_dims] >= 0.5)
+        == (gt_action[..., gripper_dims] >= 0.5)
+    ).float().mean()
+    return {
+        "val_action_translation_mae_m": translation_mae.item(),
+        "val_action_rotation_mae_rad": rotation_mae.item(),
+        "val_gripper_accuracy": gripper_accuracy.item(),
+    }
+
+
 def _suppress_torch_compile_logs() -> None:
     for logger_name in (
         "torch._dynamo",
@@ -408,6 +440,7 @@ class RobotWorkspace(BaseWorkspace):
                     if (self.epoch % cfg.training.val_every) == 0:
                         with torch.no_grad():
                             val_losses = list()
+                            val_sampling_batch = None
                             with tqdm.tqdm(
                                     val_dataloader,
                                     desc=f"Validation epoch {self.epoch}",
@@ -416,6 +449,8 @@ class RobotWorkspace(BaseWorkspace):
                             ) as tepoch:
                                 for batch_idx, batch in enumerate(tepoch):
                                     batch = dataset.postprocess(batch, device)
+                                    if val_sampling_batch is None:
+                                        val_sampling_batch = batch
                                     with torch.autocast(
                                         device_type=device.type,
                                         dtype=amp_dtype,
@@ -430,6 +465,12 @@ class RobotWorkspace(BaseWorkspace):
                                 val_loss = torch.mean(torch.tensor(val_losses)).item()
                                 # log epoch average validation loss
                                 step_log["val_loss"] = val_loss
+                            if val_sampling_batch is not None:
+                                result = policy.predict_action(val_sampling_batch["obs"])
+                                step_log.update(_action_prediction_metrics(
+                                    result["action_pred"],
+                                    val_sampling_batch["action"],
+                                ))
 
                     # run diffusion sampling on a training batch
                     if (self.epoch % cfg.training.sample_every) == 0:
@@ -439,12 +480,7 @@ class RobotWorkspace(BaseWorkspace):
                             obs_dict = batch["obs"]
                             gt_action = batch["action"]
 
-                            with torch.autocast(
-                                device_type=device.type,
-                                dtype=amp_dtype,
-                                enabled=amp_enabled,
-                            ):
-                                result = policy.predict_action(obs_dict)
+                            result = policy.predict_action(obs_dict)
                             pred_action = result["action_pred"]
                             pred_action_float = pred_action.float()
                             gt_action_float = gt_action.float()
@@ -478,6 +514,13 @@ class RobotWorkspace(BaseWorkspace):
                         tb_writer.add_scalar("epoch/train_loss", float(step_log["train_loss"]), tb_epoch)
                         if "val_loss" in step_log:
                             tb_writer.add_scalar("epoch/val_loss", float(step_log["val_loss"]), tb_epoch)
+                        for key in (
+                            "val_action_translation_mae_m",
+                            "val_action_rotation_mae_rad",
+                            "val_gripper_accuracy",
+                        ):
+                            if key in step_log:
+                                tb_writer.add_scalar(f"epoch/{key}", float(step_log[key]), tb_epoch)
                         if "train_action_mse_error" in step_log:
                             tb_writer.add_scalar(
                                 "epoch/train_action_mse_error",
