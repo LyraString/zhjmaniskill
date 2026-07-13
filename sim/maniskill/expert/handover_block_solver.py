@@ -181,8 +181,9 @@ class HandoverBlockSolver:
     LEFT_RELEASE_OPEN_SMOOTH_STEPS = 16
     LEFT_RELEASE_OPEN_SETTLE_STEPS = 10
     LEFT_RELEASE_CLEAR_WORLD_DELTA = np.asarray([0.0, -0.05, 0.04], dtype=np.float64)
+    LEFT_RELEASE_CLEAR_SEPARATE_DELTA = np.asarray([0.0, -0.05, 0.0], dtype=np.float64)
     LEFT_RELEASE_CLEAR_LIFT_DELTA = np.asarray([0.0, 0.0, 0.15], dtype=np.float64)
-    LEFT_RELEASE_CLEAR_RETREAT_DELTA = np.asarray([0.0, -0.25, 0.05], dtype=np.float64)
+    LEFT_RELEASE_CLEAR_RETREAT_DELTA = np.asarray([0.0, -0.20, 0.05], dtype=np.float64)
     REAL_LAYOUT_LEFT_RELEASE_CLEAR_STAGES = (
         ("left_release_clear_lift", np.asarray([0.0, 0.0, 0.05], dtype=np.float64)),
     )
@@ -618,6 +619,7 @@ class HandoverBlockSolver:
                 for stage, delta in self.REAL_LAYOUT_LEFT_RELEASE_CLEAR_STAGES
             )
         return (
+            ("left_release_clear_separate", np.asarray(self.LEFT_RELEASE_CLEAR_SEPARATE_DELTA, dtype=np.float64)),
             ("left_release_clear_lift", np.asarray(self.LEFT_RELEASE_CLEAR_LIFT_DELTA, dtype=np.float64)),
             ("left_release_clear_retreat", np.asarray(self.LEFT_RELEASE_CLEAR_RETREAT_DELTA, dtype=np.float64)),
         )
