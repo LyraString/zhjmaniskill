@@ -193,6 +193,14 @@ class RobotWorkspace(BaseWorkspace):
                     print(f"Resuming from checkpoint {lastest_ckpt_path}")
                     self.load_checkpoint(path=lastest_ckpt_path)
 
+        # Optimizer checkpoints also contain runtime implementation flags. Reapply
+        # the current config so an older checkpoint cannot silently disable fused AdamW.
+        if "fused" in cfg.optimizer:
+            fused = bool(cfg.optimizer.fused)
+            self.optimizer.defaults["fused"] = fused
+            for param_group in self.optimizer.param_groups:
+                param_group["fused"] = fused
+
         # configure dataset
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)

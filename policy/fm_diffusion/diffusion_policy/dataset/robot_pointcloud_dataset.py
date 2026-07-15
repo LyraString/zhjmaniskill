@@ -142,6 +142,7 @@ class RobotMultiViewPointCloudDataset(BaseImageDataset):
         self,
         zarr_path,
         horizon=1,
+        obs_steps=None,
         pad_before=0,
         pad_after=0,
         seed=42,
@@ -169,13 +170,25 @@ class RobotMultiViewPointCloudDataset(BaseImageDataset):
         )
         self.train_mask = train_mask
         self.horizon = horizon
+        self.obs_steps = horizon if obs_steps is None else int(obs_steps)
+        if not 1 <= self.obs_steps <= self.horizon:
+            raise ValueError(
+                f"obs_steps must be in [1, {self.horizon}], got {self.obs_steps}."
+            )
         self.pad_before = pad_before
         self.pad_after = pad_after
 
         self.batch_size = batch_size
         sequence_length = self.sampler.sequence_length
         self.buffers = {
-            k: np.zeros((batch_size, sequence_length, *v.shape[1:]), dtype=v.dtype)
+            k: np.zeros(
+                (
+                    batch_size,
+                    self.obs_steps if k != "action" else sequence_length,
+                    *v.shape[1:],
+                ),
+                dtype=v.dtype,
+            )
             for k, v in self.sampler.replay_buffer.items()
         }
         self.buffers_torch = {k: torch.from_numpy(v) for k, v in self.buffers.items()}
@@ -208,10 +221,10 @@ class RobotMultiViewPointCloudDataset(BaseImageDataset):
 
     def _sample_to_data(self, sample):
         obs = {
-            "agent_pos": sample["state"].astype(np.float32),
+            "agent_pos": sample["state"][:self.obs_steps].astype(np.float32),
         }
         for key in self.POINT_CLOUD_KEYS:
-            obs[key] = sample[key].astype(np.float32)
+            obs[key] = sample[key][:self.obs_steps].astype(np.float32)
 
         return {
             "obs": obs,
@@ -223,18 +236,29 @@ class RobotMultiViewPointCloudDataset(BaseImageDataset):
             raise NotImplementedError
         elif isinstance(idx, int):
             sample = self.sampler.sample_sequence(idx)
+            for key in (*self.POINT_CLOUD_KEYS, "state"):
+                sample[key] = sample[key][:self.obs_steps]
             sample = dict_apply(sample, torch.from_numpy)
             return sample
         elif isinstance(idx, np.ndarray):
             assert len(idx) == self.batch_size
             for k, v in self.sampler.replay_buffer.items():
-                batch_sample_sequence(
-                    self.buffers[k],
-                    v,
-                    self.sampler.indices,
-                    idx,
-                    self.sampler.sequence_length,
-                )
+                if k == "action":
+                    batch_sample_sequence(
+                        self.buffers[k],
+                        v,
+                        self.sampler.indices,
+                        idx,
+                        self.sampler.sequence_length,
+                    )
+                else:
+                    batch_sample_sequence_prefix(
+                        self.buffers[k],
+                        v,
+                        self.sampler.indices,
+                        idx,
+                        self.obs_steps,
+                    )
             return self.buffers_torch
         else:
             raise ValueError(idx)
@@ -271,6 +295,39 @@ _batch_sample_sequence_sequential = numba.jit(_batch_sample_sequence, nopython=T
 _batch_sample_sequence_parallel = numba.jit(_batch_sample_sequence, nopython=True, parallel=True)
 
 
+def _batch_sample_sequence_prefix(
+    data: np.ndarray,
+    input_arr: np.ndarray,
+    indices: np.ndarray,
+    idx: np.ndarray,
+    prefix_length: int,
+):
+    for i in numba.prange(len(idx)):
+        buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx = indices[idx[i]]
+        prefix_start_idx = min(sample_start_idx, prefix_length)
+        prefix_end_idx = min(sample_end_idx, prefix_length)
+
+        if prefix_start_idx > 0:
+            data[i, :prefix_start_idx] = input_arr[buffer_start_idx]
+        if prefix_end_idx > prefix_start_idx:
+            source_end_idx = buffer_start_idx + prefix_end_idx - prefix_start_idx
+            data[i, prefix_start_idx:prefix_end_idx] = input_arr[buffer_start_idx:source_end_idx]
+        if prefix_end_idx < prefix_length:
+            data[i, prefix_end_idx:] = input_arr[buffer_end_idx - 1]
+
+
+_batch_sample_sequence_prefix_sequential = numba.jit(
+    _batch_sample_sequence_prefix,
+    nopython=True,
+    parallel=False,
+)
+_batch_sample_sequence_prefix_parallel = numba.jit(
+    _batch_sample_sequence_prefix,
+    nopython=True,
+    parallel=True,
+)
+
+
 def batch_sample_sequence(
     data: np.ndarray,
     input_arr: np.ndarray,
@@ -284,3 +341,18 @@ def batch_sample_sequence(
         _batch_sample_sequence_parallel(data, input_arr, indices, idx, sequence_length)
     else:
         _batch_sample_sequence_sequential(data, input_arr, indices, idx, sequence_length)
+
+
+def batch_sample_sequence_prefix(
+    data: np.ndarray,
+    input_arr: np.ndarray,
+    indices: np.ndarray,
+    idx: np.ndarray,
+    prefix_length: int,
+):
+    batch_size = len(idx)
+    assert data.shape == (batch_size, prefix_length, *input_arr.shape[1:])
+    if batch_size >= 16 and data.nbytes >= 2**20:
+        _batch_sample_sequence_prefix_parallel(data, input_arr, indices, idx, prefix_length)
+    else:
+        _batch_sample_sequence_prefix_sequential(data, input_arr, indices, idx, prefix_length)

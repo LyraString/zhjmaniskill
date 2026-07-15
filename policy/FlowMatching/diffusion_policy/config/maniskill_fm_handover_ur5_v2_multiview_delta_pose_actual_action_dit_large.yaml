@@ -8,6 +8,10 @@ exp_name: handover_block_ur5_v2_multiview_delta_pose_actual_action_dit_large_fm
 
 n_action_steps: 1
 
+task:
+  dataset:
+    obs_steps: ${dataset_obs_steps}
+
 policy:
   obs_encoder:
     _target_: diffusion_policy.model.vision.pointcloud_obs_encoder.MultiViewPointCloudSpatialTokenObsEncoder
@@ -30,6 +34,9 @@ policy:
     num_heads: 12
     mlp_ratio: 4.0
     dropout: 0.0
+
+optimizer:
+  fused: True
 
 dataloader:
   batch_size: 128
