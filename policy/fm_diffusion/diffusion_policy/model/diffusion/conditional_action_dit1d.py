@@ -147,6 +147,8 @@ class ConditionalBimanualActionDiT1D(nn.Module):
         view_feature_dim: int = 512,
         num_views: int = 3,
         view_tokens_per_view: int = 1,
+        view_token_counts: tuple[int, ...] | None = None,
+        use_spatial_token_embedding: bool = True,
         num_arms: int = 2,
         proprio_dim_per_arm: int = 7,
         condition_depth: int = 0,
@@ -189,9 +191,21 @@ class ConditionalBimanualActionDiT1D(nn.Module):
                 "hidden_dim must be divisible by the positive condition_num_heads."
             )
 
+        if view_token_counts is None:
+            resolved_view_token_counts = (view_tokens_per_view,) * num_views
+        else:
+            resolved_view_token_counts = tuple(int(count) for count in view_token_counts)
+            if len(resolved_view_token_counts) != num_views:
+                raise ValueError(
+                    f"Expected {num_views} view token counts, got "
+                    f"{len(resolved_view_token_counts)}."
+                )
+            if any(count <= 0 for count in resolved_view_token_counts):
+                raise ValueError("Every view token count must be positive.")
+
         action_dim_per_arm = input_dim // num_arms
         expected_obs_feature_dim = (
-            num_views * view_tokens_per_view * view_feature_dim
+            sum(resolved_view_token_counts) * view_feature_dim
             + num_arms * proprio_dim_per_arm
         )
         if obs_feature_dim != expected_obs_feature_dim:
@@ -207,6 +221,7 @@ class ConditionalBimanualActionDiT1D(nn.Module):
         self.view_feature_dim = view_feature_dim
         self.num_views = num_views
         self.view_tokens_per_view = view_tokens_per_view
+        self.view_token_counts = resolved_view_token_counts
         self.num_arms = num_arms
         self.action_dim_per_arm = action_dim_per_arm
         self.proprio_dim_per_arm = proprio_dim_per_arm
@@ -219,9 +234,29 @@ class ConditionalBimanualActionDiT1D(nn.Module):
         self.action_time_embedding = nn.Embedding(horizon, hidden_dim)
         self.obs_time_embedding = nn.Embedding(n_obs_steps, hidden_dim)
         self.view_embedding = nn.Embedding(num_views, hidden_dim)
-        self.spatial_token_embedding = nn.Embedding(view_tokens_per_view, hidden_dim)
+        self.spatial_token_embedding = (
+            nn.Embedding(max(resolved_view_token_counts), hidden_dim)
+            if use_spatial_token_embedding
+            else None
+        )
         self.arm_embedding = nn.Embedding(num_arms, hidden_dim)
         self.token_type_embedding = nn.Embedding(3, hidden_dim)
+
+        view_ids = []
+        spatial_token_ids = []
+        for view_index, token_count in enumerate(resolved_view_token_counts):
+            view_ids.extend([view_index] * token_count)
+            spatial_token_ids.extend(range(token_count))
+        self.register_buffer(
+            "_view_ids",
+            torch.tensor(view_ids, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_spatial_token_ids",
+            torch.tensor(spatial_token_ids, dtype=torch.long),
+            persistent=False,
+        )
 
         self.flow_time_embedding = nn.Sequential(
             SinusoidalPosEmb(hidden_dim),
@@ -298,15 +333,13 @@ class ConditionalBimanualActionDiT1D(nn.Module):
             self.n_obs_steps,
             self.obs_feature_dim,
         )
-        view_feature_size = (
-            self.num_views * self.view_tokens_per_view * self.view_feature_dim
-        )
+        total_view_tokens = sum(self.view_token_counts)
+        view_feature_size = total_view_tokens * self.view_feature_dim
         view_values = frame_features[..., :view_feature_size]
         view_values = view_values.reshape(
             batch_size,
             self.n_obs_steps,
-            self.num_views,
-            self.view_tokens_per_view,
+            total_view_tokens,
             self.view_feature_dim,
         )
         proprio_values = frame_features[..., view_feature_size:]
@@ -318,24 +351,16 @@ class ConditionalBimanualActionDiT1D(nn.Module):
         )
 
         obs_time_ids = torch.arange(self.n_obs_steps, device=global_cond.device)
-        view_ids = torch.arange(self.num_views, device=global_cond.device)
-        spatial_token_ids = torch.arange(
-            self.view_tokens_per_view,
-            device=global_cond.device,
-        )
         arm_ids = torch.arange(self.num_arms, device=global_cond.device)
 
         view_tokens = self.view_projection(view_values)
-        view_tokens = view_tokens + self.obs_time_embedding(obs_time_ids)[None, :, None, None, :]
-        view_tokens = view_tokens + self.view_embedding(view_ids)[None, None, :, None, :]
-        view_tokens = view_tokens + self.spatial_token_embedding(spatial_token_ids)[None, None, None, :, :]
-        view_tokens = view_tokens + self.token_type_embedding.weight[0][None, None, None, None, :]
-        view_tokens = view_tokens.reshape(
-            batch_size,
-            self.n_obs_steps,
-            self.num_views * self.view_tokens_per_view,
-            self.hidden_dim,
-        )
+        view_tokens = view_tokens + self.obs_time_embedding(obs_time_ids)[None, :, None, :]
+        view_tokens = view_tokens + self.view_embedding(self._view_ids)[None, None, :, :]
+        if self.spatial_token_embedding is not None:
+            view_tokens = view_tokens + self.spatial_token_embedding(
+                self._spatial_token_ids
+            )[None, None, :, :]
+        view_tokens = view_tokens + self.token_type_embedding.weight[0][None, None, None, :]
 
         proprio_tokens = self.proprio_projection(proprio_values)
         proprio_tokens = proprio_tokens + self.obs_time_embedding(obs_time_ids)[None, :, None, :]

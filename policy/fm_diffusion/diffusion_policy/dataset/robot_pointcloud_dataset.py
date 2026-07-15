@@ -10,7 +10,7 @@ from diffusion_policy.common.sampler import (
     get_val_mask,
     downsample_mask,
 )
-from diffusion_policy.model.common.normalizer import LinearNormalizer
+from diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 
 
@@ -149,6 +149,7 @@ class RobotMultiViewPointCloudDataset(BaseImageDataset):
         val_ratio=0.0,
         batch_size=128,
         max_train_episodes=None,
+        normalize_point_clouds=True,
     ):
 
         super().__init__()
@@ -177,6 +178,7 @@ class RobotMultiViewPointCloudDataset(BaseImageDataset):
             )
         self.pad_before = pad_before
         self.pad_after = pad_after
+        self.normalize_point_clouds = bool(normalize_point_clouds)
 
         self.batch_size = batch_size
         sequence_length = self.sampler.sequence_length
@@ -210,10 +212,14 @@ class RobotMultiViewPointCloudDataset(BaseImageDataset):
             "action": self.replay_buffer["action"],
             "agent_pos": self.replay_buffer["state"],
         }
-        for key in self.POINT_CLOUD_KEYS:
-            data[key] = self.replay_buffer[key]
+        if self.normalize_point_clouds:
+            for key in self.POINT_CLOUD_KEYS:
+                data[key] = self.replay_buffer[key]
         normalizer = LinearNormalizer()
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
+        if not self.normalize_point_clouds:
+            for key in self.POINT_CLOUD_KEYS:
+                normalizer[key] = SingleFieldLinearNormalizer.create_identity()
         return normalizer
 
     def __len__(self) -> int:

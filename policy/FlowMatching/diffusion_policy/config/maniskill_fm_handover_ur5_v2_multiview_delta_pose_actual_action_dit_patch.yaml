@@ -1,0 +1,67 @@
+defaults:
+  - maniskill_fm_base
+  - task: maniskill_handover_block_ur5_v2_multiview_delta_pose_actual_task
+  - _self_
+
+name: maniskill_fm_handover_ur5_v2_multiview_delta_pose_actual_action_dit_patch
+exp_name: handover_block_ur5_v2_multiview_delta_pose_actual_action_dit_patch_fm
+
+n_action_steps: 1
+
+task:
+  dataset:
+    obs_steps: ${dataset_obs_steps}
+    normalize_point_clouds: False
+
+policy:
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.pointcloud_obs_encoder.MultiViewPointCloudPatchTokenObsEncoder
+    shape_meta: ${shape_meta}
+    pointnet_out_dim: 512
+    point_feature_dim: 256
+    view_token_counts: [12, 6, 6]
+    neighbors_per_patch: 32
+    ignore_zero_points: True
+    use_layernorm: True
+  denoiser_type: action_dit
+  action_dit:
+    view_feature_dim: 512
+    num_views: 3
+    view_token_counts: [12, 6, 6]
+    use_spatial_token_embedding: False
+    num_arms: 2
+    proprio_dim_per_arm: 7
+    condition_depth: 4
+    condition_num_heads: 12
+    hidden_dim: 768
+    depth: 12
+    num_heads: 12
+    mlp_ratio: 4.0
+    dropout: 0.0
+
+optimizer:
+  fused: True
+
+dataloader:
+  batch_size: 128
+  num_workers: 0
+  persistent_workers: False
+
+val_dataloader:
+  batch_size: 128
+  num_workers: 0
+  persistent_workers: False
+
+training:
+  num_epochs: 500
+  gradient_accumulate_every: 1
+  rollout_every: 50
+  checkpoint_every: 100
+  val_every: 25
+  max_val_steps: 5
+  sample_every: 10
+  amp:
+    enabled: True
+    dtype: bf16
+  torch_compile:
+    mode: reduce-overhead
