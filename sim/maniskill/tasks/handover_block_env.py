@@ -30,6 +30,7 @@ REWARD_RIGHT_GRASP_DIST = 0.18
 REWARD_TARGET_NEAR_DIST = 0.08
 REWARD_LEFT_CLEAR_DIST = 0.18
 REWARD_GRIPPER_CLOSED_THRESHOLD = 0.25
+REWARD_GRIPPER_OPEN_THRESHOLD = 0.95
 REWARD_BOX_LIFT_Z = BOX_CENTER_Z + 0.025
 REWARD_DROP_Z = TARGET_CENTER_Z + 0.02
 
@@ -312,6 +313,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         left_gripper_val = self._get_gripper_state_tensor(arm_index=0).squeeze(-1)
         right_gripper_val = self._get_gripper_state_tensor(arm_index=1).squeeze(-1)
         left_closed = left_gripper_val < REWARD_GRIPPER_CLOSED_THRESHOLD
+        left_released = left_gripper_val > REWARD_GRIPPER_OPEN_THRESHOLD
         right_closed = right_gripper_val < REWARD_GRIPPER_CLOSED_THRESHOLD
         box_lifted = box_pos[:, 2] > REWARD_BOX_LIFT_Z
         box_dropped = box_pos[:, 2] < REWARD_DROP_Z
@@ -320,12 +322,13 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         left_holding = left_closed & (left_to_box < REWARD_LEFT_GRASP_DIST) & box_lifted
         handover_ready = box_to_handover < REWARD_HANDOVER_DIST
         right_holding = right_closed & (right_to_box < REWARD_RIGHT_GRASP_DIST)
+        handover_complete = right_holding & left_released & left_clear
         target_near = box_to_target < REWARD_TARGET_NEAR_DIST
 
         next_stage = stage.clone()
         next_stage = torch.where((next_stage == 0) & left_holding, torch.ones_like(next_stage), next_stage)
         next_stage = torch.where((next_stage == 1) & handover_ready, torch.full_like(next_stage, 2), next_stage)
-        next_stage = torch.where((next_stage == 2) & right_holding, torch.full_like(next_stage, 3), next_stage)
+        next_stage = torch.where((next_stage == 2) & handover_complete, torch.full_like(next_stage, 3), next_stage)
         next_stage = torch.where((next_stage == 3) & target_near, torch.full_like(next_stage, 4), next_stage)
         self.reward_stage = next_stage
         stage = next_stage
@@ -346,6 +349,11 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         handover_reward = torch.exp(-6.0 * box_to_handover)
         right_reach_reward = torch.exp(-8.0 * right_to_box)
         right_grasp_reward = right_closed.to(torch.float32) * (right_to_box < REWARD_RIGHT_GRASP_DIST).to(torch.float32)
+        stage2_left_transfer_reward = torch.where(
+            right_holding,
+            0.25 * left_released.to(torch.float32) + 0.25 * left_clear.to(torch.float32),
+            0.5 * left_closed.to(torch.float32),
+        )
         target_reward = torch.exp(-10.0 * box_to_target)
         final_release_reward = (
             info["right_gripper_open"].to(torch.float32)
@@ -356,7 +364,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         reward = reward + stage0.to(torch.float32) * (left_reach_reward + 0.5 * left_grasp_reward)
         reward = reward + stage1.to(torch.float32) * (1.0 + 2.0 * handover_reward + 0.5 * left_closed.to(torch.float32))
         reward = reward + stage2.to(torch.float32) * (
-            2.0 + right_reach_reward + 0.5 * right_grasp_reward + 0.5 * left_closed.to(torch.float32)
+            2.0 + right_reach_reward + 0.5 * right_grasp_reward + stage2_left_transfer_reward
         )
         reward = reward + stage3.to(torch.float32) * (
             3.0 + 3.0 * target_reward + 0.5 * right_closed.to(torch.float32) + 0.5 * left_clear.to(torch.float32)
@@ -377,5 +385,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             reward_box_lifted=box_lifted,
             reward_left_holding=left_holding,
             reward_right_holding=right_holding,
+            reward_left_released=left_released,
+            reward_handover_complete=handover_complete,
         )
         return reward
