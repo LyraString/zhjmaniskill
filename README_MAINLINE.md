@@ -1,284 +1,266 @@
-# ManiSkill Bimanual Manipulation Mainline
+<div align="center">
 
-This repository contains a ManiSkill-based training pipeline for bimanual robotic
-manipulation built on the [RoboTwin 2.0](https://robotwin-platform.github.io/)
-platform. We target fixed-frequency joint-position control with Flow Matching
-pretraining and FPO online fine-tuning. The primary task is **HandoverBlock**, a
-dual-arm handover task where the left arm grasps a block from the table, transfers
-it to the right arm at a designated handover pose, and the right arm places it on
-a target.
+# Multiview Bimanual Flow Matching
 
-## Setup
+**A ManiSkill-first research pipeline for multiview point-cloud-conditioned
+bimanual manipulation**
 
-```bash
-conda activate zhjrl
-cd /home/idiot/zhj/RoboTwin
+[Method](#method) | [Quick Start](#quick-start) | [Training](#flow-matching-pretraining) |
+[Evaluation](#evaluation) | [FPO](#fpo-online-fine-tuning) | [Reproducibility](#reproducibility)
+
+</div>
+
+This branch develops a bimanual manipulation pipeline around the
+`HandoverBlockUR5-v2` task. The current experimental path combines three
+world-frame point clouds, native actual-relative end-effector delta-pose
+control, Flow Matching behavior cloning, and optional FPO online fine-tuning.
+
+> **Research status.** This is an active research branch built on top of
+> [RoboTwin 2.0](https://robotwin-platform.github.io/) and
+> [ManiSkill 3](https://maniskill.readthedocs.io/). It is not the upstream
+> RoboTwin repository. Patch-token Action DiT and real-robot-layout support are
+> experimental; fixed-seed benchmark results and downloadable checkpoints are
+> not yet released.
+
+## Highlights
+
+- **Native delta-pose control.** The environment executes the same 14-D
+  actual-relative action that is recorded in the dataset and predicted at
+  evaluation time.
+- **Three-view 3D observations.** A head camera and two wrist cameras are
+  transformed into a common world frame and sampled independently.
+- **Spatial patch tokens.** The experimental encoder retains 12 head-camera
+  tokens and 6 tokens from each wrist camera instead of collapsing every view
+  immediately to one global vector.
+- **Action DiT denoiser.** A condition Transformer fuses visual, temporal, and
+  proprioceptive tokens; a 12-block Action DiT predicts the Flow Matching
+  velocity field over a bimanual action chunk.
+- **End-to-end research workflow.** The repository contains expert collection,
+  NPZ-to-Zarr conversion, FM pretraining, rollout diagnostics, and CUDA-vector
+  FPO fine-tuning.
+- **Baseline preservation.** Existing single-view, shared-PointNet multiview,
+  joint-position, and U-Net paths remain available for controlled comparisons.
+
+## Method
+
+### System overview
+
+<p align="center">
+  <img src="./action_dit_patch_architecture.png" width="100%" alt="Multiview patch-token Action DiT architecture">
+</p>
+
+The timing annotation in the figure is an internal single-step training profile,
+not a task success rate. Runtime depends on GPU, precision, compilation mode,
+batch size, and thermal state.
+
+### Task and data contract
+
+`HandoverBlockUR5-v2` requires the left UR5 arm to pick up a block, transfer it
+to the right arm, and place it on a target. The current multiview delta-pose
+dataset uses the following schema:
+
+| Key | Shape per step | Semantics |
+| --- | ---: | --- |
+| `head_point_cloud` | `[1024, 3]` | Head-camera XYZ transformed to world coordinates |
+| `left_wrist_point_cloud` | `[512, 3]` | Left wrist-camera XYZ transformed to world coordinates |
+| `right_wrist_point_cloud` | `[512, 3]` | Right wrist-camera XYZ transformed to world coordinates |
+| `agent_pos` | `[14]` | Current left/right arm joint and gripper state |
+| `action` | `[14]` | Actual-relative bimanual delta pose and absolute gripper commands |
+
+The action is ordered as:
+
+```text
+[left_dx, left_dy, left_dz, left_droll, left_dpitch, left_dyaw, left_gripper,
+ right_dx, right_dy, right_dz, right_droll, right_dpitch, right_dyaw, right_gripper]
 ```
 
-The environment uses `CUDA_VISIBLE_DEVICES` for GPU assignment. Physics and
-rendering backends must target the same device.
+For each `env.step()`, translation and Euler XYZ rotation deltas are interpreted
+relative to the current measured end-effector pose at the start of that control
+step. Translation uses the robot-root-aligned frame, gripper commands are
+absolute, and the native controller enforces per-axis limits of `0.015 m` and
+`0.10 rad`. The default simulation and control frequencies are 200 Hz and 20 Hz.
 
-## Repository Structure
+### Multiview patch-token encoder
 
-| Path | Description |
+For each observation time step:
+
+1. The three cameras are transformed into the same world coordinate frame.
+2. The point clouds remain separate; they are not concatenated at point level.
+3. Local neighborhoods are selected around 12/6/6 patch centers for
+   head/left-wrist/right-wrist views.
+4. A local PointNet maps each patch to a 512-D token.
+5. The 14-D proprioceptive state is split into one 7-D token per arm.
+
+This produces 26 condition tokens per observation step. With three observation
+steps, the current model receives 78 condition tokens.
+
+### Condition Transformer
+
+The Condition Transformer is an observation encoder, not the action generator.
+It contains four self-attention blocks at width 768. These blocks exchange
+information across cameras, arms, and observation times while preserving all 78
+tokens as a condition memory.
+
+### Action DiT and Flow Matching
+
+The training horizon is eight steps. Each bimanual action step is split into a
+left-arm token and a right-arm token, producing 16 noisy action tokens. The
+12-block Action DiT uses:
+
+- self-attention among action tokens;
+- cross-attention from action queries to the 78 condition-memory tokens;
+- Flow Matching time conditioning;
+- a final projection back to the 14-D action sequence.
+
+The current patch configuration has approximately 212 million trainable
+parameters. During closed-loop evaluation, `n_action_steps=1`: the policy
+re-observes the environment after every executed action even though it predicts
+an eight-step training horizon.
+
+## Repository layout
+
+| Path | Purpose |
 | --- | --- |
-| `sim/maniskill/tasks/` | ManiSkill task environments (`HandoverBlock-v1`, `HandoverBlockUR5-v2`) |
-| `sim/maniskill/expert/` | Scripted expert solver and motion primitives |
-| `sim/maniskill/task_profiles.py` | Centralized runtime defaults per task profile |
-| `script/collect_maniskill_data.py` | Data collection CLI (scripted expert, manual intervention, legacy replay) |
-| `script/eval_maniskill_policy.py` | Policy evaluation CLI |
-| `script/check_maniskill_dataset.py` | Zarr validation and replay diagnostics |
-| `script/handover/` | Stage-wise diagnostic probes for the handover task |
-| `policy/FlowMatching/` | Flow Matching pretraining |
-| `policy/FPO/` | FPO online fine-tuning |
-| `policy/fm_diffusion/` | Shared policy and workspace modules |
-| `runners/` | CUDA batched rollout runners for multi-environment training |
-| `core/` | Abstract interfaces (action/observation schemas, env backends) |
-| `legacy/robotwin/` | RoboTwin legacy runtime compatibility adapters |
-| `data/` | Raw `.npz` episode directories |
-| `policy/FlowMatching/data/` | Processed Flow Matching `.zarr` datasets |
-| `policy/FPO/data/` | FPO datasets and outputs |
+| `sim/maniskill/tasks/` | ManiSkill environments and native bimanual controllers |
+| `sim/maniskill/expert/` | Scripted expert solver and delta-pose motion primitives |
+| `sim/maniskill/obs_adapter.py` | Learner-facing point-cloud and proprioception extraction |
+| `sim/maniskill/task_profiles.py` | Centralized observation, control, and task profiles |
+| `data/converters/` | Raw episode to Zarr conversion |
+| `script/collect_maniskill_data.py` | Expert and intervention data collection |
+| `script/eval_maniskill_policy.py` | FM/FPO closed-loop evaluation and video export |
+| `script/check_maniskill_dataset.py` | Dataset validation and dynamics replay diagnostics |
+| `script/handover/` | Stage-specific task probes and visualization tools |
+| `policy/fm_diffusion/` | Shared datasets, encoders, policies, workspaces, and runners |
+| `policy/FlowMatching/` | Flow Matching configurations and training entry point |
+| `policy/FPO/` | FPO configurations and online fine-tuning entry point |
+| `legacy/robotwin/` | Legacy RoboTwin runtime compatibility layer |
 
-## Task Environments
+## Quick Start
 
-### HandoverBlock-v1
+### Requirements
 
-The original ManiSkill port of the RoboTwin handover block task with Dual UR5-WSG
-arms. Box spawns on the left side of the table; the target is on the right.
+- Linux with an NVIDIA GPU
+- CUDA-compatible PyTorch
+- Python 3.10 (the validated development environment uses Conda `zhjrl`)
+- ManiSkill 3 / SAPIEN and the planner dependencies listed in
+  `requirements.txt`
 
-- Action space: 14-D absolute joint positions (6-D left arm + 1-D left gripper + 6-D right arm + 1-D right gripper)
-- Observation: point cloud `[512, 3]` + robot state `[14]`
-- Control frequency: 20 Hz
-- Task profile: `handover_block_native_smoke`
+```bash
+git clone <repository-url>
+cd RoboTwin
 
-### HandoverBlockUR5-v2
+conda create -n zhjrl python=3.10 -y
+conda activate zhjrl
+python -m pip install -r requirements.txt
+python -m pip install -e policy/fm_diffusion
+```
 
-A narrower spawn/goal region variant optimized for UR5 workspace reachability.
-Otherwise identical interface to HandoverBlock-v1.
+`requirements.txt` is currently a pinned workstation snapshot. Before an
+external release, private editable URLs and machine-local package references
+must be removed or replaced with public packages.
 
-- Task profile: `handover_block_ur5_v2_smoke`
-- Box spawn range: x ∈ [-0.12, -0.09], y ∈ [0.07, 0.11]
-- Target range: x ∈ [0.08, 0.16], y ∈ [0.11, 0.19]
-- Handover pose: [0.02, 0.11, 0.92]
-
-## Data Collection
-
-### Scripted Expert
-
-The scripted expert uses a multi-stage planner-based solver that executes:
-
-1. Left arm first grasp and lift
-2. Left arm move to handover pose
-3. Right arm static-receiver handover grasp
-4. Right arm carry to target and place
+### Collect multiview delta-pose demonstrations
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python script/collect_maniskill_data.py \
-  HandoverBlockUR5-v2 handover_block_ur5_v2_collect 50 \
-  --task-profile handover_block_ur5_v2_smoke \
-  --collector scripted_expert \
-  --seed 108 \
-  --max-attempts 200 \
+  HandoverBlockUR5-v2 delta_mv_actual_100_v1 100 \
+  --task-profile handover_block_ur5_v2_multiview_delta_pose_actual \
+  --collector scripted_delta_pose_expert \
+  --seed 33550336 \
+  --max-attempts 500 \
   --max-episode-steps 900 \
-  --sim-backend physx_cuda:0 \
+  --sim-backend physx_cuda \
+  --render-backend sapien_cuda \
   --save-only-success
 ```
 
-**Positional arguments:**
+Raw episodes are written to:
 
-| Arg | Description |
-| --- | --- |
-| `HandoverBlockUR5-v2` | ManiSkill environment ID |
-| `handover_block_ur5_v2_collect` | Output subdirectory under `data/HandoverBlockUR5-v2/` |
-| `50` | Number of successful episodes to collect |
+```text
+data/HandoverBlockUR5-v2/delta_mv_actual_100_v1/
+```
 
-**Key options:**
+The delta-pose collector only saves episodes that complete the task, contain
+finite in-range actions, and report zero controller failures and zero qpos
+fallbacks. Dataset replay is still a dynamics diagnostic rather than a guarantee
+of bitwise deterministic contact behavior.
 
-| Option | Description |
-| --- | --- |
-| `--task-profile` | Pre-registered profile with default obs/action/reward settings |
-| `--collector` | Collection strategy: `scripted_expert`, `policy_manual_intervention`, `legacy_replay`, `random` |
-| `--seed` | Base reset seed; each attempt increments by 1 |
-| `--max-attempts` | Cap on total episodes (including failures) before giving up |
-| `--max-episode-steps` | Max steps per episode before automatic truncation |
-| `--sim-backend` | `physx_cpu` or `physx_cuda[:<device_id>]` |
-| `--save-only-success` | Skip saving failed episodes; successful ones are also action-replay-validated |
-| `--debug-scripted-expert` | Print solver debug info (grasp candidate selection, placement decisions) |
-| `--save-video-dir` | If set, save an `.mp4` video per episode alongside the `.npz` |
-| `--video-fps` | Frame rate for saved videos (default 10) |
-
-Successful episodes are automatically action-replay-validated before saving. Each
-episode produces an `episode<N>.npz` and `episode<N>.json` metadata file under
-`data/HandoverBlockUR5-v2/<task_config>/data/`.
-
-## Data Processing
-
-Convert raw `.npz` episodes to Flow Matching zarr format:
+### Convert episodes to Zarr
 
 ```bash
 python policy/FlowMatching/process_data.py \
   --backend maniskill \
-  HandoverBlockUR5-v2 handover_block_ur5_v2_collect 50
+  HandoverBlockUR5-v2 delta_mv_actual_100_v1 100
 ```
 
-**Positional arguments:**
+The generated dataset is placed at:
 
-| Arg | Description |
-| --- | --- |
-| `HandoverBlockUR5-v2` | Environment ID matching the data directory under `data/` |
-| `handover_block_ur5_v2_collect` | Subdirectory name under `data/<env_id>/` |
-| `50` | Expected number of episodes (validates that the directory has at least this many) |
+```text
+policy/FlowMatching/data/HandoverBlockUR5-v2-delta_mv_actual_100_v1-100.zarr
+```
 
-**Key options:**
+Static-frame filtering is optional and disabled by default. Do not enable
+`--filter-static` when reproducing an unfiltered baseline.
 
-| Option | Description |
-| --- | --- |
-| `--backend` | `maniskill` for this pipeline (`legacy` for old RoboTwin HDF5 data) |
-| `--filter-static` | Remove near-static frames (gripper unchanged, action/state below eps) |
-| `--static-action-eps` | Action change threshold for static-frame detection (default 0.05) |
-| `--static-state-eps` | State change threshold for static-frame detection (default 0.05) |
-| `--static-gripper-eps` | Gripper change threshold for static-frame detection (default 1e-3) |
-| `--static-keep-boundary` | Frames to keep before/after each transition to avoid over-trimming |
-| `--output-suffix` | Appended to the output zarr name (e.g., `clean` produces `...-clean.zarr`) |
-
-Output: `policy/FlowMatching/data/HandoverBlockUR5-v2-handover_block_ur5_v2_collect-50.zarr`
-
-Validate a zarr dataset:
+### Validate a dataset
 
 ```bash
 python script/check_maniskill_dataset.py \
-  /path/to/dataset.zarr \
-  --task-profile handover_block_ur5_v2_smoke \
-  --smoke-replay --replay-episodes 3 --replay-steps 1000 \
-  --sim-backend physx_cuda:0 --render-backend sapien_cuda:0 \
-  --save-video-dir /tmp/replay_videos
+  policy/FlowMatching/data/HandoverBlockUR5-v2-delta_mv_actual_100_v1-100.zarr \
+  --task-profile handover_block_ur5_v2_multiview_delta_pose_actual \
+  --smoke-replay \
+  --replay-episodes 3 \
+  --replay-steps 900 \
+  --sim-backend physx_cuda \
+  --render-backend sapien_cuda \
+  --save-video-dir tmp/handover/dataset_replay
 ```
 
-| Option | Description |
-| --- | --- |
-| `--smoke-replay` | Replay saved actions in the environment to check validity |
-| `--replay-episodes` | Number of episodes to replay (default 3) |
-| `--replay-steps` | Max steps per replay episode |
-| `--save-video-dir` | Save replay videos for visual inspection |
+## Flow Matching pretraining
 
-## Training
-
-### Flow Matching Pretraining
+### Patch-token Action DiT
 
 ```bash
 cd policy/FlowMatching
 
-bash train_fm.sh 42 0 \
+bash train_fm.sh 114514 0 \
   --backend maniskill \
-  --config-name maniskill_fm_handover_native_teacher \
+  --config-name maniskill_fm_handover_ur5_v2_multiview_delta_pose_actual_action_dit_patch \
   -- \
   task.dataset.zarr_path=/path/to/dataset.zarr \
-  exp_name=handover_block_ur5_v2_50_fm \
+  task.maniskill.zarr_path=/path/to/dataset.zarr \
+  exp_name=delta_mv_actual_patch_dit_fm \
+  training.checkpoint_run_name=delta_mv_actual_patch_dit-114514 \
   training.resume=False \
-  training.checkpoint_run_name=handover_block_ur5_v2_50-42 \
-  training.num_epochs=3000 \
+  training.num_epochs=1000 \
   training.checkpoint_every=100 \
-  training.rollout_every=50 \
-  training.sample_every=50 \
   logging.mode=offline
 ```
 
-**Script arguments:**
+The positional arguments to `train_fm.sh` are the random seed and physical GPU
+ID. Checkpoints are saved under:
 
-| Arg | Description |
-| --- | --- |
-| `42` | Random seed for training |
-| `0` | Physical GPU ID (sets `CUDA_VISIBLE_DEVICES` internally) |
-
-**Key options (passed after `--`):**
-
-| Option | Description |
-| --- | --- |
-| `task.dataset.zarr_path` | Path to the processed `.zarr` training dataset |
-| `exp_name` | Experiment name used in log directory naming |
-| `training.resume` | `True` to continue from an existing checkpoint, `False` for fresh training |
-| `training.checkpoint_run_name` | Subdirectory under `checkpoints/` for this run |
-| `training.num_epochs` | Total training epochs |
-| `training.checkpoint_every` | Save a checkpoint every N epochs |
-| `training.rollout_every` | Run an evaluation rollout every N epochs |
-| `training.sample_every` | Log sample predictions every N epochs |
-| `logging.mode` | `offline` for disk-only logging, `online` for W&B or similar |
-
-Checkpoints are saved under `policy/FlowMatching/checkpoints/<run_name>/<epoch>.ckpt`.
-Monitor training with:
-
-```bash
-tensorboard --logdir policy/FlowMatching/data/outputs --port 16006
+```text
+policy/FlowMatching/checkpoints/<checkpoint_run_name>/<epoch>.ckpt
 ```
 
-### FPO Online Fine-Tuning
-
-Start from a converged Flow Matching checkpoint:
+Training logs are written below `policy/FlowMatching/data/outputs/` and can be
+inspected with:
 
 ```bash
-cd policy/FPO
-
-bash train_fpo.sh 42 0 \
-  /path/to/pretrained_fm.ckpt \
-  --backend maniskill \
-  --task-profile handover_block_ur5_v2_smoke \
-  --config-name maniskill_fpo_handover_native \
-  -- \
-  training.resume=True \
-  training.num_envs=96 \
-  training.timesteps_per_batch=73728 \
-  training.num_fpo_samples=4 \
-  training.max_total_fpo_samples_per_call=384 \
-  training.n_updates_per_iteration=1 \
-  training.num_minibatches=64 \
-  training.gamma=0.995 \
-  training.lmbda=0.99 \
-  training.clip_coef=0.01 \
-  training.clamp_logratio=0.2 \
-  training.rho_max=2.0 \
-  training.max_grad_norm=0.5 \
-  training.max_timesteps_per_episode=1000 \
-  training.sim_backend=physx_cuda \
-  training.render_backend=sapien_cuda \
-  logging.mode=offline \
-  training.point_cloud_sampling=fast
+tensorboard --logdir policy/FlowMatching/data/outputs \
+  --port 16006 --host 127.0.0.1
 ```
 
-**Script arguments:**
+### Main comparison configurations
 
-| Arg | Description |
-| --- | --- |
-| `42` | Random seed |
-| `0` | Physical GPU ID |
-| `/path/to/pretrained_fm.ckpt` | Path to the Flow Matching checkpoint to initialize from |
-
-**Key training options (passed after `--`):**
-
-| Option | Description |
-| --- | --- |
-| `training.num_envs` | Number of parallel simulation environments |
-| `training.timesteps_per_batch` | Total environment steps collected per batch; steps/env = `timesteps_per_batch / num_envs` |
-| `training.num_fpo_samples` | Number of online samples per policy call (higher = more exploration) |
-| `training.n_updates_per_iteration` | Number of PPO-style updates per collected batch |
-| `training.num_minibatches` | Minibatch count for actor/critic updates (increase if OOM) |
-| `training.gamma` / `training.lmbda` | Discount factor and GAE lambda |
-| `training.clip_coef` | PPO clipping epsilon — lower = more conservative update |
-| `training.clamp_logratio` | Cap on the log-ratio between new and old policy |
-| `training.rho_max` | Max importance sampling ratio before clipping |
-| `training.max_grad_norm` | Global gradient norm clipping |
-| `training.max_timesteps_per_episode` | Max steps per rollout episode before truncation |
-| `training.point_cloud_sampling` | `fast` (GPU FPS) or `random` — point cloud downsampling method |
-
-Key stability indicators in TensorBoard:
-
-| Metric | Warning Sign |
-| --- | --- |
-| `clipped_ratio_frac` | Approaching 1.0: actor update too aggressive |
-| `rollout_action_abs_max` | Jumping from ~1-2 to 5+: policy likely diverging |
-| `rho_mean` | Large spikes: ratio instability |
-
-If FPO diverges early, reduce `clip_coef`, `clamp_logratio`, and `rho_max`
-before increasing data volume.
+| Configuration | Observation encoder | Denoiser | Status |
+| --- | --- | --- | --- |
+| `maniskill_fm_handover_native_teacher` | Single-view PointNet | 1D U-Net | Preserved baseline |
+| `maniskill_fm_handover_ur5_v2_multiview` | Shared PointNet + feature fusion | 1D U-Net | Multiview joint-action baseline |
+| `maniskill_fm_handover_ur5_v2_multiview_delta_pose_actual` | Shared PointNet + feature fusion | 1D U-Net | Multiview native delta-pose baseline |
+| `maniskill_fm_handover_ur5_v2_multiview_delta_pose_actual_action_dit_large` | Global multiview features | Action DiT | Experimental |
+| `maniskill_fm_handover_ur5_v2_multiview_delta_pose_actual_action_dit_patch` | 12/6/6 patch tokens | Action DiT | Current experimental path |
 
 ## Evaluation
 
@@ -287,53 +269,100 @@ CUDA_VISIBLE_DEVICES=0 python script/eval_maniskill_policy.py \
   flowmatching \
   /path/to/checkpoint.ckpt \
   HandoverBlockUR5-v2 \
-  --task-profile handover_block_ur5_v2_smoke \
-  --episodes 50 \
-  --seed 0 \
-  --max-episode-steps 1000 \
+  --task-profile handover_block_ur5_v2_multiview_delta_pose_actual \
+  --episodes 100 \
+  --seed 999 \
+  --max-episode-steps 1500 \
   --sim-backend physx_cuda \
   --render-backend sapien_cuda \
-  --save-video-dir /home/idiot/zhj/RoboTwin/eval_videos/checkpoint_name \
+  --save-video-dir tmp/handover/eval_patch_dit \
   --video-fps 10
 ```
 
-**Positional arguments:**
+Use the same checkpoint, seeds, episode count, time limit, control profile, and
+hold-filter setting for model comparisons. In addition to success rate, inspect
+stage transitions, truncation rate, final box-to-target error, action magnitude,
+and rollout videos.
 
-| Arg | Description |
-| --- | --- |
-| `flowmatching` | Policy kind: `flowmatching` or `fpo` |
-| `/path/to/checkpoint.ckpt` | Path to the checkpoint to evaluate |
-| `HandoverBlockUR5-v2` | Environment ID |
+The evaluator provides optional deployment-side drift diagnostics:
 
-**Key options:**
+```text
+--delta-pose-hold-mode {off,deadband,anchor}
+```
 
-| Option | Description |
-| --- | --- |
-| `--episodes` | Number of evaluation episodes |
-| `--seed` | Starting seed (incremented per episode) |
-| `--max-episode-steps` | Max steps per episode |
-| `--save-video-dir` | Save rollout videos for visual inspection (strongly recommended) |
-| `--video-fps` | Frame rate of saved videos |
+The default is `off`. `deadband` and `anchor` change executed actions and must be
+reported as separate evaluation conditions; they are not part of the trained
+policy.
 
-For FPO checkpoints, replace `flowmatching` with `fpo`. Always inspect rollout
-videos alongside scalar success rates; unstable policies may satisfy isolated
-reward signals while producing poor physical behavior.
+## FPO online fine-tuning
 
-## Reproducibility Checklist
+The CUDA FPO runner supports the shared-PointNet multiview actual-delta pipeline.
+Patch-token Action DiT checkpoint compatibility has not yet been validated and
+should not be assumed from the FM configuration alone.
 
-For each experiment, record:
+```bash
+cd policy/FPO
 
-- Dataset zarr path and generation command
-- Raw `.npz` source directories
-- Base checkpoint path (for FPO)
-- Exact train/eval commands with seeds and GPU assignments
-- TensorBoard log directory
-- Evaluation videos
-- Success rate and qualitative observations
+bash train_fpo.sh 114514 0 \
+  /path/to/pretrained_fm.ckpt \
+  --backend maniskill \
+  --config-name maniskill_fpo_handover_ur5_v2_multiview_delta_pose_actual \
+  -- \
+  training.resume=True \
+  training.online_iters=300 \
+  training.num_envs=96 \
+  training.timesteps_per_batch=73728 \
+  training.num_fpo_samples=4 \
+  training.max_total_fpo_samples_per_call=384 \
+  training.n_updates_per_iteration=1 \
+  training.num_minibatches=32 \
+  training.max_timesteps_per_episode=1500 \
+  training.sim_backend=physx_cuda \
+  training.render_backend=sapien_cuda \
+  training.point_cloud_sampling=fast \
+  logging.mode=offline
+```
 
-## Citation
+Track success and stage metrics together with ratio clipping, action magnitude,
+KL-related statistics, and gradient norms. A faster rollout is not by itself
+evidence of a better policy.
 
-If you use upstream RoboTwin components, cite the original works:
+## Reproducibility
+
+For every experiment, retain:
+
+- Git commit and branch name;
+- raw episode directory and processed Zarr path;
+- task profile and full Hydra overrides;
+- action semantics, coordinate frame, units, control frequency, and horizon;
+- random seeds and train/validation episode split;
+- checkpoint name, EMA usage, precision, and `torch.compile` settings;
+- fixed-seed evaluation command, scalar metrics, action traces, and videos;
+- GPU model, driver/CUDA versions, and runtime profiling conditions.
+
+Large datasets, checkpoints, videos, and `tmp/` diagnostics are intentionally not
+tracked by Git. Never infer an experiment configuration from a checkpoint folder
+name alone; the serialized Hydra configuration is the source of truth.
+
+## Current scope and limitations
+
+- The current research target is one bimanual handover task; multi-task claims
+  are outside the validated scope.
+- The 12/6/6 patch allocation and Action DiT scale are experimental design
+  choices, not established optima.
+- Dynamics replay can diverge at contact events even when collection succeeded;
+  inspect robot and object state traces before attributing failure to action
+  semantics.
+- The real-layout profile is simulation-side work in progress and must not be
+  treated as a validated real-robot controller.
+- Eval-side hold filters suppress inactive-arm drift but do not repair gripper
+  timing or action errors learned by the policy.
+- FPO support for the Patch Action DiT path remains to be validated.
+
+## Citation and acknowledgements
+
+This branch uses RoboTwin task assets and ManiSkill simulation infrastructure.
+Please cite the corresponding upstream projects when using this code.
 
 ```bibtex
 @article{chen2025robotwin,
@@ -346,15 +375,18 @@ If you use upstream RoboTwin components, cite the original works:
   year={2025}
 }
 
-@InProceedings{Mu_2025_CVPR,
-  author    = {Mu, Yao and Chen, Tianxing and Chen, Zanxin and Peng, Shijia and
-               Lan, Zhiqian and Gao, Zeyu and Liang, Zhixuan and Yu, Qiaojun and
-               Zou, Yude and Xu, Mingkun and Lin, Lunkai and Xie, Zhiqiang and
-               Ding, Mingyu and Luo, Ping},
-  title     = {RoboTwin: Dual-Arm Robot Benchmark with Generative Digital Twins},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and
-               Pattern Recognition (CVPR)},
-  year      = {2025},
-  pages     = {27649-27660}
+@article{taomaniskill3,
+  title={ManiSkill3: GPU Parallelized Robotics Simulation and Rendering for
+         Generalizable Embodied AI},
+  author={Tao, Stone and Xiang, Fanbo and Shukla, Arth and Qin, Yuzhe and
+          Hinrichsen, Xander and Yuan, Xiaodi and Bao, Chen and Lin, Xinsong and
+          Liu, Yulin and others},
+  journal={Robotics: Science and Systems},
+  year={2025}
 }
 ```
+
+## License
+
+This repository is released under the [MIT License](./LICENSE). Third-party
+components and assets retain their original licenses.
