@@ -81,6 +81,18 @@ def _suppress_torch_compile_logs() -> None:
         logging.getLogger(logger_name).setLevel(logging.ERROR)
 
 
+def _resolve_actor_amp_config(training_cfg, device) -> tuple[bool, torch.dtype]:
+    amp_cfg = training_cfg.get("actor_amp", {})
+    enabled = bool(amp_cfg.get("enabled", False)) and device.type == "cuda"
+    dtype_name = str(amp_cfg.get("dtype", "bf16")).lower()
+    if dtype_name not in ("bf16", "bfloat16"):
+        raise ValueError(
+            "FPO actor AMP currently supports only BF16; "
+            f"got training.actor_amp.dtype={dtype_name!r}."
+        )
+    return enabled, torch.bfloat16
+
+
 ONLINE_ROLLOUT_DIAG_KEYS = (
     "rollout_action_abs_max",
     "rollout_action_abs_mean",
@@ -412,6 +424,13 @@ class RobotWorkspace(BaseWorkspace):
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             tqdm.tqdm.write(f"[torch] TF32 enabled, float32_matmul_precision={matmul_precision}")
+
+        actor_amp_enabled, actor_amp_dtype = _resolve_actor_amp_config(cfg.training, device)
+        if actor_amp_enabled:
+            tqdm.tqdm.write(
+                f"[AMP] FPO actor update autocast enabled: dtype={actor_amp_dtype}; "
+                "PPO reductions and critic remain FP32"
+            )
 
         tc_cfg = cfg.training.get("torch_compile", {})
         if bool(tc_cfg.get("enabled", False)):
@@ -843,6 +862,49 @@ class RobotWorkspace(BaseWorkspace):
         
         return gc
 
+    def _append_critic_stage_one_hot(self, critic_input, reward_stage):
+        stage_cfg = getattr(self.cfg.training, "critic_stage_conditioning", None)
+        if stage_cfg is None or not bool(getattr(stage_cfg, "enabled", False)):
+            return critic_input
+
+        if critic_input.ndim != 2:
+            raise ValueError(
+                "Stage-conditioned critic input must have shape [batch, features], "
+                f"got {tuple(critic_input.shape)}."
+            )
+        num_stages = int(getattr(stage_cfg, "num_stages", 5))
+        if num_stages <= 0:
+            raise ValueError("training.critic_stage_conditioning.num_stages must be positive.")
+
+        stage = torch.as_tensor(
+            reward_stage,
+            device=critic_input.device,
+            dtype=torch.float32,
+        ).reshape(-1)
+        if stage.numel() == 1 and critic_input.shape[0] != 1:
+            stage = stage.expand(critic_input.shape[0])
+        if stage.numel() != critic_input.shape[0]:
+            raise ValueError(
+                "Reward stage batch size must match critic input: "
+                f"stage={stage.numel()}, critic={critic_input.shape[0]}."
+            )
+        if not torch.isfinite(stage).all():
+            raise ValueError("Reward stage contains NaN or Inf values.")
+
+        stage_id = stage.round().to(dtype=torch.long)
+        if not torch.allclose(stage, stage_id.to(dtype=stage.dtype), atol=1e-4, rtol=0.0):
+            raise ValueError("Reward stage must contain integer-valued stage IDs.")
+        if torch.any((stage_id < 0) | (stage_id >= num_stages)):
+            raise ValueError(
+                f"Reward stage IDs must be within [0, {num_stages - 1}]."
+            )
+
+        stage_one_hot = F.one_hot(stage_id, num_classes=num_stages).to(
+            device=critic_input.device,
+            dtype=critic_input.dtype,
+        )
+        return torch.cat([critic_input, stage_one_hot], dim=-1)
+
     def _load_capo_coupling_model(self, capo_cfg, device):
         ckpt_path = getattr(capo_cfg, "coupling_ckpt_path", None)
         if ckpt_path in (None, ""):
@@ -1044,7 +1106,18 @@ class RobotWorkspace(BaseWorkspace):
     
     def collect_rollout(self, env, device):
         num_envs = int(getattr(self.cfg.training, "num_envs", 1))
-        if str(getattr(self.cfg.training, "env_backend", "robotwin_legacy")) == "maniskill" and num_envs > 1:
+        env_backend = str(getattr(self.cfg.training, "env_backend", "robotwin_legacy"))
+        stage_cfg = getattr(self.cfg.training, "critic_stage_conditioning", None)
+        stage_conditioning_enabled = (
+            stage_cfg is not None and bool(getattr(stage_cfg, "enabled", False))
+        )
+        if stage_conditioning_enabled and not (env_backend == "maniskill" and num_envs > 1):
+            raise RuntimeError(
+                "Stage-conditioned critic currently requires the ManiSkill CUDA vector "
+                "rollout path with training.num_envs > 1."
+            )
+
+        if env_backend == "maniskill" and num_envs > 1:
             return self.collect_rollout_maniskill_cuda_vector(env, device, num_envs)
         elif num_envs <= 1:
             return self.collect_rollout_single(env, device)
@@ -1345,9 +1418,13 @@ class RobotWorkspace(BaseWorkspace):
 
                     with torch.inference_mode():
                         if chunk_i == 0:
-                            critic_in = out["global_cond"]
+                            critic_base = out["global_cond"]
                         else:
-                            critic_in = self._build_critic_input_from_obs(obs_hist)
+                            critic_base = self._build_critic_input_from_obs(obs_hist)
+                        critic_in = self._append_critic_stage_one_hot(
+                            critic_base,
+                            fpo_reward_stage,
+                        )
                         v = self.critic(critic_in).squeeze(-1)
 
                     actions = action_chunk[:, chunk_i].detach()
@@ -1391,9 +1468,12 @@ class RobotWorkspace(BaseWorkspace):
 
                     if finished_env_ids:
                         with torch.inference_mode():
-                            last_v_all = self.critic(
-                                self._build_critic_input_from_obs(next_obs_hist)
-                            ).squeeze(-1)
+                            next_critic_base = self._build_critic_input_from_obs(next_obs_hist)
+                            next_critic_in = self._append_critic_stage_one_hot(
+                                next_critic_base,
+                                fpo_reward_stage,
+                            )
+                            last_v_all = self.critic(next_critic_in).squeeze(-1)
                         bootstrap_steps.append(last_v_all.detach().to(device=device, dtype=torch.float32))
                         for env_id in finished_env_ids:
                             ep_len_totals.append(ep_steps[env_id])
@@ -1492,9 +1572,12 @@ class RobotWorkspace(BaseWorkspace):
 
             if any(ep_step > 0 for ep_step in ep_steps):
                 with torch.inference_mode():
-                    last_v_all = self.critic(
-                        self._build_critic_input_from_obs(obs_hist)
-                    ).squeeze(-1)
+                    final_critic_base = self._build_critic_input_from_obs(obs_hist)
+                    final_critic_in = self._append_critic_stage_one_hot(
+                        final_critic_base,
+                        fpo_reward_stage,
+                    )
+                    last_v_all = self.critic(final_critic_in).squeeze(-1)
                 final_bootstrap = last_v_all.detach().to(device=device, dtype=torch.float32)
                 for env_id, ep_step in enumerate(ep_steps):
                     if ep_step > 0:
@@ -1978,6 +2061,7 @@ class RobotWorkspace(BaseWorkspace):
 
     def update_fpo_chunked_from_rollout(self, rollout, device):
         cfg_t = self.cfg.training
+        actor_amp_enabled, actor_amp_dtype = _resolve_actor_amp_config(cfg_t, device)
         clip_coef = float(cfg_t.clip_coef)
         n_updates = int(cfg_t.n_updates_per_iteration)
         max_grad_norm = float(getattr(cfg_t, "max_grad_norm", 1.0))
@@ -2081,25 +2165,36 @@ class RobotWorkspace(BaseWorkspace):
                     "local_cond": None,
                     "global_cond": flat_global,
                 }
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=actor_amp_dtype,
+                    enabled=actor_amp_enabled,
+                ):
+                    if velocity_kl_coeff > 0.0:
+                        curr, pred_v, velocity_mask = self.model.compute_cfm_loss_with_fixed_noise_t(
+                            postdict,
+                            flat_naction,
+                            flat_eps,
+                            flat_t,
+                            return_per_sample=True,
+                            postdict=True,
+                            return_pred_v=True,
+                        )
+                    else:
+                        curr = self.model.compute_cfm_loss_with_fixed_noise_t(
+                            postdict,
+                            flat_naction,
+                            flat_eps,
+                            flat_t,
+                            return_per_sample=True,
+                            postdict=True,
+                        )
+
+                # Keep PPO ratios and reductions in FP32 even when the actor
+                # forward/backward activations use BF16 autocast.
+                curr = curr.float()
                 if velocity_kl_coeff > 0.0:
-                    curr, pred_v, velocity_mask = self.model.compute_cfm_loss_with_fixed_noise_t(
-                        postdict,
-                        flat_naction,
-                        flat_eps,
-                        flat_t,
-                        return_per_sample=True,
-                        postdict=True,
-                        return_pred_v=True,
-                    )
-                else:
-                    curr = self.model.compute_cfm_loss_with_fixed_noise_t(
-                        postdict,
-                        flat_naction,
-                        flat_eps,
-                        flat_t,
-                        return_per_sample=True,
-                        postdict=True,
-                    )
+                    pred_v = pred_v.float()
 
                 logratio = (flat_init - curr).reshape(B, N)
                 if clamp_logratio is not None:
@@ -2139,7 +2234,11 @@ class RobotWorkspace(BaseWorkspace):
                 if velocity_kl_coeff > 0.0:
                     # pred_v comes from the CFM loss forward above; only the
                     # frozen reference policy needs another forward here.
-                    with torch.no_grad():
+                    with torch.no_grad(), torch.autocast(
+                        device_type=device.type,
+                        dtype=actor_amp_dtype,
+                        enabled=actor_amp_enabled,
+                    ):
                         ref_v, _ = self.ref_model.compute_cfm_velocity_with_fixed_noise_t(
                             postdict,
                             flat_naction,
@@ -2147,6 +2246,7 @@ class RobotWorkspace(BaseWorkspace):
                             flat_t,
                             postdict=True,
                         )
+                    ref_v = ref_v.float()
                     velocity_mask = velocity_mask.to(dtype=pred_v.dtype)
                     velocity_kl_per_sample = ((pred_v - ref_v).pow(2) * velocity_mask).reshape(B * N, -1).sum(dim=1)
                     velocity_kl_den = velocity_mask.reshape(B * N, -1).sum(dim=1).clamp_min(1.0)
@@ -2203,6 +2303,7 @@ class RobotWorkspace(BaseWorkspace):
             return self.update_fpo_chunked_from_rollout(rollout, device)
 
         cfg_t = self.cfg.training
+        actor_amp_enabled, actor_amp_dtype = _resolve_actor_amp_config(cfg_t, device)
         clip_coef = float(cfg_t.clip_coef)
         n_updates = int(cfg_t.n_updates_per_iteration)
         max_grad_norm = float(getattr(cfg_t, "max_grad_norm", 1.0))
@@ -2294,14 +2395,20 @@ class RobotWorkspace(BaseWorkspace):
                     "global_cond": flat_global,
                 }
 
-                curr = self.model.compute_cfm_loss_with_fixed_noise_t(
-                    postdict,
-                    flat_naction,
-                    flat_eps,
-                    flat_t,
-                    return_per_sample=True,
-                    postdict=True,
-                )  # [B*N]
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=actor_amp_dtype,
+                    enabled=actor_amp_enabled,
+                ):
+                    curr = self.model.compute_cfm_loss_with_fixed_noise_t(
+                        postdict,
+                        flat_naction,
+                        flat_eps,
+                        flat_t,
+                        return_per_sample=True,
+                        postdict=True,
+                    )  # [B*N]
+                curr = curr.float()
 
                 logratio = (flat_init - curr).reshape(B, N)
 

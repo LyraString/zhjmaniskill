@@ -8,6 +8,9 @@ from einops import rearrange, reduce
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
+from diffusion_policy.model.diffusion.conditional_action_dit1d import (
+    ConditionalBimanualActionDiT1D,
+)
 from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
 from diffusion_policy.model.vision.multi_image_obs_encoder import MultiImageObsEncoder
@@ -36,6 +39,8 @@ class FPOImagePolicy(BaseImagePolicy):
         cond_predict_scale=True,
         sigma_min=0.0,  # 最小噪声水平
         ode_solver='euler',  # 'euler' 或 'rk4'
+        denoiser_type='unet',
+        action_dit=None,
         **kwargs,
     ):
         super().__init__()
@@ -54,16 +59,32 @@ class FPOImagePolicy(BaseImagePolicy):
             input_dim = action_dim
             global_cond_dim = obs_feature_dim * n_obs_steps
 
-        model = ConditionalUnet1D(
-            input_dim=input_dim,
-            local_cond_dim=None,
-            global_cond_dim=global_cond_dim,
-            diffusion_step_embed_dim=diffusion_step_embed_dim,
-            down_dims=down_dims,
-            kernel_size=kernel_size,
-            n_groups=n_groups,
-            cond_predict_scale=cond_predict_scale,
-        )
+        if denoiser_type == 'unet':
+            model = ConditionalUnet1D(
+                input_dim=input_dim,
+                local_cond_dim=None,
+                global_cond_dim=global_cond_dim,
+                diffusion_step_embed_dim=diffusion_step_embed_dim,
+                down_dims=down_dims,
+                kernel_size=kernel_size,
+                n_groups=n_groups,
+                cond_predict_scale=cond_predict_scale,
+            )
+        elif denoiser_type == 'action_dit':
+            if not obs_as_global_cond:
+                raise ValueError("Action DiT requires obs_as_global_cond=True.")
+            action_dit_config = {} if action_dit is None else dict(action_dit)
+            model = ConditionalBimanualActionDiT1D(
+                input_dim=input_dim,
+                horizon=horizon,
+                n_obs_steps=n_obs_steps,
+                obs_feature_dim=obs_feature_dim,
+                **action_dit_config,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported denoiser_type `{denoiser_type}`; expected `unet` or `action_dit`."
+            )
 
         self.obs_encoder = obs_encoder
         self.model = model
@@ -84,6 +105,7 @@ class FPOImagePolicy(BaseImagePolicy):
         self.num_inference_steps = num_inference_steps
         self.sigma_min = sigma_min
         self.ode_solver = ode_solver
+        self.denoiser_type = denoiser_type
         self.kwargs = kwargs
 
     def build_condition_from_obs(self, obs_dict: Dict[str, torch.Tensor], *args) -> Dict:
@@ -137,7 +159,7 @@ class FPOImagePolicy(BaseImagePolicy):
                 this_nobs = dict_apply(nobs, lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
                 nobs_features = self.obs_encoder(this_nobs)
 
-                global_cond = nobs_features.reshape(B, -1)
+                global_cond = nobs_features.reshape(B, -1).clone()
 
                 cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
                 cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)

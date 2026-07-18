@@ -16,7 +16,13 @@ policy:
     fusion_hidden_dim: 512
     use_layernorm: True
 
+critic:
+  input_dim: ${eval:'${n_obs_steps} * (${policy.obs_encoder.pointnet_out_dim} + ${task.shape_meta.obs.agent_pos.shape[0]}) + ${training.critic_stage_conditioning.num_stages}'}
+
 training:
+  critic_stage_conditioning:
+    enabled: true
+    num_stages: 5
   preserve_ckpt_normalizer: True
   init_actor_from_ema: True
   load_optimizer_state: False

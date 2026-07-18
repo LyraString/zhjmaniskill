@@ -1,0 +1,69 @@
+defaults:
+  - maniskill_fpo_base
+  - task: maniskill_handover_block_ur5_v2_multiview_delta_pose_actual_task
+  - _self_
+
+name: maniskill_fpo_handover_ur5_v2_multiview_delta_pose_actual_action_dit_patch
+exp_name: handover_block_ur5_v2_multiview_delta_pose_actual_action_dit_patch
+
+n_action_steps: 1
+
+policy:
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.pointcloud_obs_encoder.MultiViewPointCloudPatchTokenObsEncoder
+    shape_meta: ${shape_meta}
+    pointnet_out_dim: 512
+    point_feature_dim: 256
+    view_token_counts: [12, 6, 6]
+    neighbors_per_patch: 32
+    ignore_zero_points: True
+    use_layernorm: True
+  denoiser_type: action_dit
+  action_dit:
+    view_feature_dim: 512
+    num_views: 3
+    view_token_counts: [12, 6, 6]
+    use_spatial_token_embedding: False
+    num_arms: 2
+    proprio_dim_per_arm: 7
+    condition_depth: 4
+    condition_num_heads: 12
+    hidden_dim: 768
+    depth: 12
+    num_heads: 12
+    mlp_ratio: 4.0
+    dropout: 0.0
+
+critic:
+  input_dim: ${eval:'${n_obs_steps} * (sum(${policy.obs_encoder.view_token_counts}) * ${policy.obs_encoder.pointnet_out_dim} + ${task.shape_meta.obs.agent_pos.shape[0]}) + ${training.critic_stage_conditioning.num_stages}'}
+
+training:
+  actor_amp:
+    enabled: true
+    dtype: bf16
+  critic_stage_conditioning:
+    enabled: true
+    num_stages: 5
+  preserve_ckpt_normalizer: True
+  init_actor_from_ema: True
+  load_optimizer_state: False
+  online_iters: 120
+  timesteps_per_batch: 6400
+  max_timesteps_per_episode: 800
+  n_updates_per_iteration: 1
+  num_minibatches: 32
+  num_envs: 8
+  checkpoint_every: 20
+  max_total_fpo_samples_per_call: 32
+  num_fpo_samples: 1
+  velocity_kl_coeff: 0.01
+  point_cloud_sampling: fast
+  enable_tf32: true
+  float32_matmul_precision: high
+  torch_compile:
+    enabled: true
+    mode: default
+    dynamic: false
+    fullgraph: false
+    suppress_logs: true
+    compile_obs_encoder: true
