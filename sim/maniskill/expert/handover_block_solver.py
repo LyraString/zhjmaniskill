@@ -130,8 +130,6 @@ class HandoverBlockSolver:
     RIGHT_HANDOVER_TRIAL_SWITCH_DISTANCE_MARGIN = 0.02
     RIGHT_CARRY_TRANSITION_WAYPOINTS = 4
     USE_RIGHT_ABOVE_TARGET_WAYPOINT = False
-    RIGHT_RELEASE_LIFT_DISTANCE = 0.18
-    RIGHT_RELEASE_RETRACT_DISTANCE = 0.03
     RIGHT_PLACE_SETTLE_STEPS = 3
     RIGHT_PLACE_CORRECTION_ITERS = 3
     RIGHT_PLACE_CORRECTION_EPS = 0.01
@@ -194,8 +192,6 @@ class HandoverBlockSolver:
     LEFT_RELEASE_CLEAR_MIN_LIFT_DELTA = 0.035
     LEFT_RELEASE_CLEAR_LIFT_RETRY_DELTA = np.asarray([0.0, 0.0, 0.04], dtype=np.float64)
     LEFT_RELEASE_CLEAR_LIFT_MAX_ATTEMPTS = 2
-    FINAL_RELEASE_SETTLE_STEPS = 4
-    FINAL_SETTLE_STEPS = 12
     LEFT_FIRST_GRASP_PROBE_MIN_BOX_Z_GAIN = 0.04
     LEFT_FIRST_GRASP_PROBE_MIN_FOLLOW_RATIO = 0.35
     LEFT_FIRST_GRASP_PROBE_MAX_BOX_GRIPPER_DISTANCE = 0.22
@@ -2573,78 +2569,6 @@ class HandoverBlockSolver:
                 "right_full_qpos": np.asarray(self.ctrl.current_full_qpos(1), dtype=np.float64).round(4).tolist(),
                 "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
             }
-            return False, self.ctrl.steps_taken, self.ctrl.last_status
-
-        if self.ctrl.hold_pose(
-            recorder,
-            steps=self.FINAL_RELEASE_SETTLE_STEPS,
-            right_gripper=1.0,
-            allow_success_early=False,
-        ):
-            return True, self.ctrl.steps_taken, self.ctrl.last_status
-        if self.ctrl.last_status != "running":
-            return False, self.ctrl.steps_taken, self.ctrl.last_status
-
-        if self.RIGHT_RELEASE_RETRACT_DISTANCE > 1e-8:
-            if self.ctrl.move_by_displacement(
-                1,
-                recorder,
-                z=self.RIGHT_RELEASE_RETRACT_DISTANCE,
-                move_axis="grasp",
-                fail_status="right_release_retract_failed",
-            ):
-                return True, self.ctrl.steps_taken, self.ctrl.last_status
-            if self.ctrl.last_status != "running":
-                self.last_debug_info = {
-                    "stage": "right_release_retract",
-                    **left_release_clear_debug,
-                    "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
-                    "right_qpos": np.asarray(self.ctrl.current_qpos(1), dtype=np.float64).round(4).tolist(),
-                    "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
-                    "plan_debug": dict(self.ctrl.last_plan_debug),
-                }
-                return False, self.ctrl.steps_taken, self.ctrl.last_status
-
-        if self.ctrl.move_by_displacement(
-            1,
-            recorder,
-            z=self.RIGHT_RELEASE_LIFT_DISTANCE,
-            move_axis="world",
-            fail_status="right_release_lift_failed",
-        ):
-            return True, self.ctrl.steps_taken, self.ctrl.last_status
-        if self.ctrl.last_status != "running":
-            self.last_debug_info = {
-                "stage": "right_release_lift",
-                **left_release_clear_debug,
-                "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
-                "right_qpos": np.asarray(self.ctrl.current_qpos(1), dtype=np.float64).round(4).tolist(),
-                "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
-                "plan_debug": dict(self.ctrl.last_plan_debug),
-            }
-            return False, self.ctrl.steps_taken, self.ctrl.last_status
-
-        if self.ctrl.back_to_origin(1, recorder, fail_status="right_release_clear_failed"):
-            return True, self.ctrl.steps_taken, self.ctrl.last_status
-        if self.ctrl.last_status != "running":
-            self.last_debug_info = {
-                "stage": "right_release_clear",
-                **left_release_clear_debug,
-                "right_ee_pose": np.asarray(self.ctrl.current_ee_pose(1), dtype=np.float64).round(4).tolist(),
-                "right_qpos": np.asarray(self.ctrl.current_qpos(1), dtype=np.float64).round(4).tolist(),
-                "right_full_qpos": np.asarray(self.ctrl.current_full_qpos(1), dtype=np.float64).round(4).tolist(),
-                "box_pose": np.asarray(self._box_pose(), dtype=np.float64).round(4).tolist(),
-            }
-            return False, self.ctrl.steps_taken, self.ctrl.last_status
-
-        if self.ctrl.hold_pose(
-            recorder,
-            steps=self.FINAL_SETTLE_STEPS,
-            right_gripper=1.0,
-            allow_success_early=False,
-        ):
-            return True, self.ctrl.steps_taken, self.ctrl.last_status
-        if self.ctrl.last_status != "running":
             return False, self.ctrl.steps_taken, self.ctrl.last_status
 
         previous_success_gate_enabled = self._set_success_gate_enabled(True)

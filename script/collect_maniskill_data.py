@@ -546,6 +546,7 @@ def run_collection(args) -> None:
                         "translation_frame": "root_aligned",
                         "gripper_semantics": "absolute",
                         "control_mode": "bimanual_pd_ee_delta_pose",
+                        "terminal_semantics": "box_placed_right_gripper_open_static",
                         "seed": int(reset_seed),
                         "length": int(episode_length),
                         "success": bool(success),

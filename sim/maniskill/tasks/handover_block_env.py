@@ -243,7 +243,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         ) & (
             torch.linalg.norm(self.box.angular_velocity, axis=1) <= BOX_SETTLE_ANGULAR_EPS
         )
-        success = base_info["robots_ready"] & spatial_success & right_gripper_open & right_ee_clear & box_static
+        success = base_info["robots_ready"] & spatial_success & right_gripper_open & box_static
         if not bool(getattr(self, "success_gate_enabled", True)):
             success = torch.zeros_like(success, dtype=torch.bool)
 
@@ -357,7 +357,6 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         target_reward = torch.exp(-10.0 * box_to_target)
         final_release_reward = (
             info["right_gripper_open"].to(torch.float32)
-            + info["right_ee_clear"].to(torch.float32)
             + info["box_static"].to(torch.float32)
         )
 
