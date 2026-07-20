@@ -373,12 +373,17 @@ class ConditionalBimanualActionDiT1D(nn.Module):
             condition_tokens = block(condition_tokens)
         return self.condition_norm(condition_tokens)
 
+    def encode_condition_tokens(self, global_cond: torch.Tensor) -> torch.Tensor:
+        """Encode observation tokens once for reuse across Flow ODE steps."""
+        return self._build_condition_tokens(global_cond)
+
     def forward(
         self,
         sample: torch.Tensor,
         timestep: Union[torch.Tensor, float, int],
         local_cond=None,
         global_cond: torch.Tensor | None = None,
+        condition_tokens: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if local_cond is not None:
@@ -445,7 +450,23 @@ class ConditionalBimanualActionDiT1D(nn.Module):
         action_tokens = action_tokens + self.token_type_embedding.weight[2][None, None, None, :]
         action_tokens = action_tokens.reshape(batch_size, -1, self.hidden_dim)
 
-        condition_tokens = self._build_condition_tokens(global_cond)
+        if condition_tokens is None:
+            condition_tokens = self.encode_condition_tokens(global_cond)
+        else:
+            expected_tokens = self.n_obs_steps * (
+                sum(self.view_token_counts) + self.num_arms
+            )
+            expected_shape = (batch_size, expected_tokens, self.hidden_dim)
+            if tuple(condition_tokens.shape) != expected_shape:
+                raise ValueError(
+                    "Precomputed Action DiT condition tokens must have shape "
+                    f"{expected_shape}, got {tuple(condition_tokens.shape)}."
+                )
+            if condition_tokens.device != sample.device:
+                raise ValueError(
+                    "Precomputed condition tokens and action samples must share a device, "
+                    f"got {condition_tokens.device} and {sample.device}."
+                )
         for block in self.blocks:
             action_tokens = block(action_tokens, condition_tokens, time_embedding)
 

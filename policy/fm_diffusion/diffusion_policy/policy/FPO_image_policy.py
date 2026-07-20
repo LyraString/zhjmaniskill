@@ -182,32 +182,59 @@ class FPOImagePolicy(BaseImagePolicy):
         return conds
 
     # ========= 流匹配采样 ============
-    def ode_step_euler(self, x, t, dt, local_cond=None, global_cond=None):
+    def ode_step_euler(
+        self,
+        x,
+        t,
+        dt,
+        local_cond=None,
+        global_cond=None,
+        condition_tokens=None,
+    ):
         """单步欧拉积分。"""
         # 在当前状态预测速度
-        v = self.model(x, t, local_cond=local_cond, global_cond=global_cond)
+        v = self.model(
+            x,
+            t,
+            local_cond=local_cond,
+            global_cond=global_cond,
+            condition_tokens=condition_tokens,
+        )
         # 欧拉步: x_{t+dt} = x_t + v_t * dt
         x_next = x + v * dt
         return x_next
 
-    def ode_step_rk4(self, x, t, dt, local_cond=None, global_cond=None):
+    def ode_step_rk4(
+        self,
+        x,
+        t,
+        dt,
+        local_cond=None,
+        global_cond=None,
+        condition_tokens=None,
+    ):
         """单步 RK4（四阶龙格库塔）积分。"""
+        model_kwargs = {
+            "local_cond": local_cond,
+            "global_cond": global_cond,
+            "condition_tokens": condition_tokens,
+        }
         # k1 = v(x, t)
-        k1 = self.model(x, t, local_cond=local_cond, global_cond=global_cond)
+        k1 = self.model(x, t, **model_kwargs)
         
         # k2 = v(x + k1*dt/2, t + dt/2)
         x2 = x + k1 * dt / 2
         t2 = t + dt / 2
-        k2 = self.model(x2, t2, local_cond=local_cond, global_cond=global_cond)
+        k2 = self.model(x2, t2, **model_kwargs)
         
         # k3 = v(x + k2*dt/2, t + dt/2)
         x3 = x + k2 * dt / 2
-        k3 = self.model(x3, t2, local_cond=local_cond, global_cond=global_cond)
+        k3 = self.model(x3, t2, **model_kwargs)
         
         # k4 = v(x + k3*dt, t + dt)
         x4 = x + k3 * dt
         t4 = t + dt
-        k4 = self.model(x4, t4, local_cond=local_cond, global_cond=global_cond)
+        k4 = self.model(x4, t4, **model_kwargs)
         
         # RK4 组合
         x_next = x + (k1 + 2*k2 + 2*k3 + k4) * dt / 6
@@ -252,6 +279,11 @@ class FPOImagePolicy(BaseImagePolicy):
         
         # 为批处理创建时间张量
         batch_size = x.shape[0]
+
+        condition_tokens = None
+        encode_condition = getattr(self.model, "encode_condition_tokens", None)
+        if callable(encode_condition):
+            condition_tokens = encode_condition(global_cond)
         
         for step in range(self.num_inference_steps):
             t = step * dt
@@ -263,9 +295,23 @@ class FPOImagePolicy(BaseImagePolicy):
             
             # ODE 积分步
             if self.ode_solver == 'euler':
-                x = self.ode_step_euler(x, t_tensor, dt, local_cond, global_cond)
+                x = self.ode_step_euler(
+                    x,
+                    t_tensor,
+                    dt,
+                    local_cond,
+                    global_cond,
+                    condition_tokens,
+                )
             elif self.ode_solver == 'rk4':
-                x = self.ode_step_rk4(x, t_tensor, dt, local_cond, global_cond)
+                x = self.ode_step_rk4(
+                    x,
+                    t_tensor,
+                    dt,
+                    local_cond,
+                    global_cond,
+                    condition_tokens,
+                )
             else:
                 raise ValueError(f"未知的 ODE 求解器: {self.ode_solver}")
             

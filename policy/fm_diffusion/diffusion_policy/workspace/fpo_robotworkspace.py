@@ -428,7 +428,7 @@ class RobotWorkspace(BaseWorkspace):
         actor_amp_enabled, actor_amp_dtype = _resolve_actor_amp_config(cfg.training, device)
         if actor_amp_enabled:
             tqdm.tqdm.write(
-                f"[AMP] FPO actor update autocast enabled: dtype={actor_amp_dtype}; "
+                f"[AMP] FPO actor rollout/update autocast enabled: dtype={actor_amp_dtype}; "
                 "PPO reductions and critic remain FP32"
             )
 
@@ -1147,6 +1147,7 @@ class RobotWorkspace(BaseWorkspace):
 
     def collect_rollout_maniskill_cuda_vector(self, env, device, num_envs):
         cfg_t = self.cfg.training
+        actor_amp_enabled, actor_amp_dtype = _resolve_actor_amp_config(cfg_t, device)
         target_steps = int(cfg_t.timesteps_per_batch)
         max_ep_steps = int(cfg_t.max_timesteps_per_episode)
         n_obs_steps = int(self.model.n_obs_steps)
@@ -1398,7 +1399,11 @@ class RobotWorkspace(BaseWorkspace):
                 if capo_enabled:
                     chunk_coupling_score, chunk_stage_id = fpo_current_coupling(chunk_stage_at_sample)
 
-                with torch.inference_mode():
+                with torch.inference_mode(), torch.autocast(
+                    device_type=device.type,
+                    dtype=actor_amp_dtype,
+                    enabled=actor_amp_enabled,
+                ):
                     out = self.model.sample_action_with_info(
                         obs_hist,
                         num_fpo_samples=num_fpo_samples,
@@ -1407,7 +1412,9 @@ class RobotWorkspace(BaseWorkspace):
                         compute_initial_cfm_loss=False,
                     )
 
-                action_chunk = out["action"].detach()
+                # Critic inputs and environment actions stay in FP32.
+                out["global_cond"] = out["global_cond"].float()
+                action_chunk = out["action"].detach().float()
                 chunk_limit = min(chunk_steps, int(action_chunk.shape[1]))
                 executed_actions = []
                 chunk_start_step = len(reward_steps)
@@ -1546,7 +1553,11 @@ class RobotWorkspace(BaseWorkspace):
                     "local_cond": None,
                     "global_cond": flat_global,
                 }
-                with torch.inference_mode():
+                with torch.inference_mode(), torch.autocast(
+                    device_type=device.type,
+                    dtype=actor_amp_dtype,
+                    enabled=actor_amp_enabled,
+                ):
                     initial_cfm_loss = self.model.compute_cfm_loss_with_fixed_noise_t(
                         postdict,
                         flat_target,
@@ -1554,7 +1565,7 @@ class RobotWorkspace(BaseWorkspace):
                         flat_t,
                         return_per_sample=True,
                         postdict=True,
-                    ).reshape(B, N)
+                    ).float().reshape(B, N)
 
                 flat_actor_critic_obs.append(out["global_cond"].detach())
                 flat_actor_naction_target.append(actor_target.detach())
