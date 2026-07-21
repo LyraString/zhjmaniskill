@@ -1,5 +1,4 @@
 import argparse
-import math
 import os
 import subprocess
 import sys
@@ -8,13 +7,19 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from sim.maniskill.collection_scheduler import SharedCollectionScheduler
+
+
 COLLECT_SCRIPT = REPO_ROOT / "script" / "collect_maniskill_data.py"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Launch multiple independent collect_maniskill_data.py workers. "
+            "Dynamically schedule seeds across persistent collection workers. "
             "This only parallelizes at the process level; it does not change the collector, "
             "controller, action semantics, or saved episode format."
         )
@@ -36,13 +41,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--seed-stride",
         type=int,
         default=100000,
-        help="Seed offset between worker processes.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--max-attempts-per-worker",
         type=int,
         default=None,
-        help="If set, pass this max-attempts value to every worker.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--log-dir",
@@ -53,14 +58,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--progress-interval-sec",
         type=float,
-        default=30.0,
-        help="Print saved episode counts from worker output directories at this interval.",
+        default=2.0,
+        help="Poll saved episodes at this interval; print only when the count increases.",
     )
     parser.add_argument("--dry-run", action="store_true")
 
     # Arguments forwarded to collect_maniskill_data.py.
     parser.add_argument("--task-profile", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--episode-index-offset",
+        type=int,
+        default=0,
+        help="Starting episode index in the shared dataset directory.",
+    )
     parser.add_argument("--max-episode-steps", type=int, default=None)
     parser.add_argument("--action-type", type=str, default=None)
     parser.add_argument("--obs-mode", type=str, default=None)
@@ -98,42 +109,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def split_counts(total: int, parts: int) -> list[int]:
-    if total <= 0:
-        raise ValueError("episode_num must be positive.")
-    if parts <= 0:
-        raise ValueError("--num-workers must be positive.")
-    base = total // parts
-    remainder = total % parts
-    return [base + (1 if idx < remainder else 0) for idx in range(parts)]
-
-
 def maybe_add_option(cmd: list[str], name: str, value) -> None:
     if value is None:
         return
     cmd.extend([name, str(value)])
 
 
-def worker_max_attempts(args, episode_count: int) -> int | None:
-    if args.max_attempts_per_worker is not None:
-        return int(args.max_attempts_per_worker)
-    if args.max_attempts is None:
-        return None
-    attempts_per_episode = float(args.max_attempts) / float(args.episode_num)
-    return max(int(episode_count), int(math.ceil(attempts_per_episode * episode_count)))
-
-
-def build_worker_command(args, worker_idx: int, episode_count: int, unknown_args: list[str]) -> list[str]:
-    task_config = f"{args.task_config}_part{worker_idx}"
+def build_worker_command(
+    args,
+    worker_idx: int,
+    scheduler_path: Path,
+    unknown_args: list[str],
+) -> list[str]:
     cmd = [
         sys.executable,
         "-u",
         str(COLLECT_SCRIPT),
         args.task_name,
-        task_config,
-        str(episode_count),
+        args.task_config,
+        str(args.episode_num),
         "--seed",
-        str(int(args.seed) + worker_idx * int(args.seed_stride)),
+        str(args.seed),
+        "--shared-collection-state",
+        str(scheduler_path),
     ]
     maybe_add_option(cmd, "--task-profile", args.task_profile)
     maybe_add_option(cmd, "--max-episode-steps", args.max_episode_steps)
@@ -154,7 +152,6 @@ def build_worker_command(args, worker_idx: int, episode_count: int, unknown_args
     maybe_add_option(cmd, "--teacher-seed-path", args.teacher_seed_path)
     maybe_add_option(cmd, "--policy-kind", args.policy_kind)
     maybe_add_option(cmd, "--ckpt-path", args.ckpt_path)
-    maybe_add_option(cmd, "--max-attempts", worker_max_attempts(args, episode_count))
     if args.save_only_success:
         cmd.append("--save-only-success")
     if args.debug_scripted_expert:
@@ -181,40 +178,89 @@ def worker_env(args, worker_idx: int) -> dict[str, str]:
     return env
 
 
-def count_saved_npz(task_name: str, task_config: str) -> int | None:
+def count_saved_episodes(
+    task_name: str,
+    task_config: str,
+    episode_index_offset: int,
+    episode_count: int,
+) -> int | None:
     data_dir = REPO_ROOT / "data" / task_name / task_config / "data"
     if not data_dir.is_dir():
         return None
-    return len(list(data_dir.glob("*.npz")))
+    return sum(
+        (data_dir / f"episode{episode_idx}.npz").is_file()
+        and (data_dir / f"episode{episode_idx}.json").is_file()
+        for episode_idx in range(
+            episode_index_offset,
+            episode_index_offset + episode_count,
+        )
+    )
 
 
 def main(argv=None) -> int:
     parser = build_parser()
     args, unknown_args = parser.parse_known_args(argv)
-    episode_counts = split_counts(int(args.episode_num), int(args.num_workers))
-    active_workers = [
-        (worker_idx, episode_count)
-        for worker_idx, episode_count in enumerate(episode_counts)
-        if episode_count > 0
+    if args.episode_num <= 0:
+        raise ValueError("episode_num must be positive.")
+    if args.num_workers <= 0:
+        raise ValueError("--num-workers must be positive.")
+    if args.episode_index_offset < 0:
+        raise ValueError("--episode-index-offset must be non-negative.")
+    if args.collector not in {"scripted_expert", "scripted_delta_pose_expert"}:
+        raise ValueError(
+            "Dynamic seed scheduling requires --collector scripted_expert or "
+            "--collector scripted_delta_pose_expert."
+        )
+
+    max_attempts = args.max_attempts
+    if max_attempts is None and args.max_attempts_per_worker is not None:
+        max_attempts = int(args.max_attempts_per_worker) * int(args.num_workers)
+
+    data_dir = REPO_ROOT / "data" / args.task_name / args.task_config / "data"
+    collisions = [
+        data_dir / f"episode{episode_idx}{suffix}"
+        for episode_idx in range(
+            int(args.episode_index_offset),
+            int(args.episode_index_offset) + int(args.episode_num),
+        )
+        for suffix in (".npz", ".json")
+        if (data_dir / f"episode{episode_idx}{suffix}").exists()
     ]
+    if collisions:
+        preview = ", ".join(str(path) for path in collisions[:3])
+        raise FileExistsError(
+            "Refusing to overwrite existing episode files in the shared output range: "
+            f"{preview}"
+        )
+
     log_dir = Path(args.log_dir) if args.log_dir is not None else REPO_ROOT / "tmp" / "collect_parallel" / args.task_config
     log_dir.mkdir(parents=True, exist_ok=True)
+    scheduler_path = log_dir / "scheduler_state.json"
 
     worker_specs = []
-    for worker_idx, episode_count in active_workers:
-        cmd = build_worker_command(args, worker_idx, episode_count, unknown_args)
+    active_worker_count = min(int(args.num_workers), int(args.episode_num))
+    for worker_idx in range(active_worker_count):
+        cmd = build_worker_command(
+            args,
+            worker_idx,
+            scheduler_path,
+            unknown_args,
+        )
         env = worker_env(args, worker_idx)
-        task_config = f"{args.task_config}_part{worker_idx}"
         log_path = log_dir / f"worker{worker_idx}.log"
-        worker_specs.append((worker_idx, episode_count, task_config, cmd, env, log_path))
+        worker_specs.append((worker_idx, cmd, env, log_path))
 
-    print(f"parallel collection workers={len(worker_specs)} total_episodes={args.episode_num}", flush=True)
-    for worker_idx, episode_count, task_config, cmd, env, log_path in worker_specs:
+    print(
+        f"dynamic collection workers={len(worker_specs)} "
+        f"target_episodes={args.episode_num} start_seed={args.seed} "
+        f"max_attempts={max_attempts}",
+        flush=True,
+    )
+    for worker_idx, cmd, env, log_path in worker_specs:
         gpu = env.get("CUDA_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "inherit"))
         print(
-            f"worker{worker_idx}: episodes={episode_count} task_config={task_config} "
-            f"cuda_visible_devices={gpu} log={log_path}"
-            ,
+            f"worker{worker_idx}: task_config={args.task_config} "
+            f"cuda_visible_devices={gpu} log={log_path}",
             flush=True,
         )
         print("  " + " ".join(cmd), flush=True)
@@ -222,9 +268,17 @@ def main(argv=None) -> int:
     if args.dry_run:
         return 0
 
+    scheduler = SharedCollectionScheduler.initialize(
+        scheduler_path,
+        seed=int(args.seed),
+        episode_index_offset=int(args.episode_index_offset),
+        episode_count=int(args.episode_num),
+        max_attempts=None if max_attempts is None else int(max_attempts),
+    )
+
     processes = []
     start_time = time.time()
-    for worker_idx, episode_count, task_config, cmd, env, log_path in worker_specs:
+    for worker_idx, cmd, env, log_path in worker_specs:
         log_file = log_path.open("w", encoding="utf-8")
         process = subprocess.Popen(
             cmd,
@@ -234,55 +288,75 @@ def main(argv=None) -> int:
             stderr=subprocess.STDOUT,
             text=True,
         )
-        processes.append((worker_idx, episode_count, task_config, process, log_file, log_path))
+        processes.append((worker_idx, process, log_file, log_path))
 
     exit_code = 0
     remaining = {
-        worker_idx: (episode_count, task_config, process, log_file, log_path)
-        for worker_idx, episode_count, task_config, process, log_file, log_path in processes
+        worker_idx: (process, log_file, log_path)
+        for worker_idx, process, log_file, log_path in processes
     }
-    last_progress_time = 0.0
-    progress_interval = max(1.0, float(args.progress_interval_sec))
+    initial_saved_count = count_saved_episodes(
+        args.task_name,
+        args.task_config,
+        int(args.episode_index_offset),
+        int(args.episode_num),
+    )
+    last_reported_saved_count = initial_saved_count or 0
+    progress_interval = max(0.5, float(args.progress_interval_sec))
     while remaining:
-        now = time.time()
-        if now - last_progress_time >= progress_interval:
-            parts = []
-            for worker_idx, (episode_count, task_config, _process, _log_file, _log_path) in sorted(remaining.items()):
-                saved_count = count_saved_npz(args.task_name, task_config)
-                saved_text = "?" if saved_count is None else str(saved_count)
-                parts.append(f"worker{worker_idx}={saved_text}/{episode_count}")
-            print("progress " + " ".join(parts), flush=True)
-            last_progress_time = now
+        saved_count = count_saved_episodes(
+            args.task_name,
+            args.task_config,
+            int(args.episode_index_offset),
+            int(args.episode_num),
+        )
+        if (
+            saved_count is not None
+            and saved_count > last_reported_saved_count
+        ):
+            print(f"saved {saved_count}/{args.episode_num}", flush=True)
+            last_reported_saved_count = saved_count
 
         finished_workers = []
-        for worker_idx, (episode_count, task_config, process, log_file, log_path) in remaining.items():
+        for worker_idx, (process, log_file, log_path) in remaining.items():
             return_code = process.poll()
             if return_code is None:
                 continue
             log_file.close()
-            saved_count = count_saved_npz(args.task_name, task_config)
-            saved_text = "unknown" if saved_count is None else str(saved_count)
             print(
-                f"worker{worker_idx} finished returncode={return_code} "
-                f"requested={episode_count} saved={saved_text} log={log_path}",
+                f"worker{worker_idx} finished returncode={return_code} log={log_path}",
                 flush=True,
             )
             if return_code != 0:
                 exit_code = return_code if exit_code == 0 else exit_code
-            if saved_count is not None and saved_count != episode_count:
-                print(
-                    f"warning: worker{worker_idx} saved {saved_count}/{episode_count} episodes "
-                    f"in data/{args.task_name}/{task_config}/data",
-                    flush=True,
-                )
             finished_workers.append(worker_idx)
         for worker_idx in finished_workers:
             remaining.pop(worker_idx, None)
         if remaining:
-            time.sleep(min(5.0, progress_interval))
+            time.sleep(progress_interval)
 
     elapsed = time.time() - start_time
-    print(f"parallel collection elapsed_sec={elapsed:.1f}", flush=True)
+    scheduler_state = scheduler.snapshot()
+    saved_count = count_saved_episodes(
+        args.task_name,
+        args.task_config,
+        int(args.episode_index_offset),
+        int(args.episode_num),
+    )
+    if saved_count is not None and saved_count > last_reported_saved_count:
+        print(f"saved {saved_count}/{args.episode_num}", flush=True)
+    if saved_count != int(args.episode_num):
+        exit_code = 1 if exit_code == 0 else exit_code
+        print(
+            f"warning: shared dataset saved {saved_count}/{args.episode_num} episodes "
+            f"in data/{args.task_name}/{args.task_config}/data",
+            flush=True,
+        )
+    print(
+        f"dynamic collection attempts={scheduler_state['attempt_count']} "
+        f"next_seed={scheduler_state['next_seed']} elapsed_sec={elapsed:.1f}",
+        flush=True,
+    )
     return exit_code
 
 

@@ -21,6 +21,7 @@ from sim.maniskill import (
     resolve_runtime_task_target,
     resolve_task_profile,
 )
+from sim.maniskill.collection_scheduler import SharedCollectionScheduler
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,6 +31,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("episode_num", type=int, help="Number of episodes to collect")
     parser.add_argument("--task-profile", type=str, default=None, help="Optional registered ManiSkill task profile")
     parser.add_argument("--seed", type=int, default=42, help="Base reset seed")
+    parser.add_argument(
+        "--episode-index-offset",
+        type=int,
+        default=0,
+        help="Offset added to saved episode filenames for process-level sharding.",
+    )
+    parser.add_argument(
+        "--shared-collection-state",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--max-episode-steps", type=int, default=50)
     parser.add_argument("--action-type", type=str, default=None)
     parser.add_argument("--obs-mode", type=str, default=None)
@@ -209,6 +222,12 @@ def _write_episode_metadata(out_path: Path, metadata: dict) -> None:
     )
 
 
+def _save_episode_with_metadata(recorder, episode_idx: int, metadata: dict) -> Path:
+    out_path = recorder.save_episode(episode_idx)
+    _write_episode_metadata(out_path, metadata)
+    return out_path
+
+
 def _maybe_capture_frame(env_backend, frames: list[np.ndarray]) -> None:
     frame = env_backend.render()
     if frame is None:
@@ -313,6 +332,22 @@ def _resolve_teacher_assets(args, resolved_profile_name: str | None) -> tuple[Pa
 
 
 def run_collection(args) -> None:
+    if args.episode_index_offset < 0:
+        raise ValueError("--episode-index-offset must be non-negative.")
+    shared_scheduler = (
+        SharedCollectionScheduler(args.shared_collection_state)
+        if args.shared_collection_state is not None
+        else None
+    )
+    if shared_scheduler is not None and args.collector not in {
+        "scripted_expert",
+        "scripted_delta_pose_expert",
+    }:
+        raise ValueError(
+            "Shared seed scheduling currently supports scripted_expert and "
+            "scripted_delta_pose_expert only."
+        )
+
     runtime_env_id = args.task_name
     if args.task_profile is not None and args.task_name == args.task_profile:
         runtime_env_id = None
@@ -400,7 +435,7 @@ def run_collection(args) -> None:
                     if result.terminated or result.truncated:
                         break
 
-                out_path = recorder.save_episode(episode_idx)
+                out_path = recorder.save_episode(args.episode_index_offset + episode_idx)
                 print(f"saved {out_path}")
             return
 
@@ -410,13 +445,22 @@ def run_collection(args) -> None:
             solver = HandoverBlockSolver(env)
             saved_episode_idx = 0
             attempted_episode_idx = 0
-            while saved_episode_idx < args.episode_num and (
-                args.max_attempts is None or attempted_episode_idx < int(args.max_attempts)
+            while shared_scheduler is not None or (
+                saved_episode_idx < args.episode_num
+                and (
+                    args.max_attempts is None
+                    or attempted_episode_idx < int(args.max_attempts)
+                )
             ):
+                if shared_scheduler is not None:
+                    reset_seed = shared_scheduler.claim_seed()
+                    if reset_seed is None:
+                        break
+                else:
+                    reset_seed = args.seed + attempted_episode_idx
                 if recreate_real_layout_scripted_runtime and attempted_episode_idx > 0:
                     recreate_runtime()
                     solver = HandoverBlockSolver(env)
-                reset_seed = args.seed + attempted_episode_idx
                 obs = env.reset(seed=reset_seed)
                 recorder.start_episode(dict(obs.data))
                 maybe_render()
@@ -449,7 +493,6 @@ def run_collection(args) -> None:
                 should_save = (success and (replay_success is not False)) or not args.save_only_success
                 if should_save:
                     if episode_length > 0:
-                        out_path = recorder.save_episode(saved_episode_idx)
                         metadata = {
                             "collector": "scripted_expert",
                             "seed": int(reset_seed),
@@ -461,7 +504,23 @@ def run_collection(args) -> None:
                             "first_pick_debug": getattr(solver, "first_pick_debug", None),
                             "debug": getattr(solver, "last_debug_info", None),
                         }
-                        _write_episode_metadata(out_path, metadata)
+                        if shared_scheduler is not None:
+                            save_result = shared_scheduler.save_next_episode(
+                                lambda episode_idx: _save_episode_with_metadata(
+                                    recorder,
+                                    episode_idx,
+                                    metadata,
+                                )
+                            )
+                            if save_result is None:
+                                break
+                            _episode_idx, out_path = save_result
+                        else:
+                            out_path = _save_episode_with_metadata(
+                                recorder,
+                                args.episode_index_offset + saved_episode_idx,
+                                metadata,
+                            )
                         print(
                             f"saved {out_path} "
                             f"(seed={reset_seed}, length={episode_length}, "
@@ -496,7 +555,11 @@ def run_collection(args) -> None:
                     if args.debug_scripted_expert and getattr(solver, "last_debug_info", None):
                         print("scripted_expert_debug=" + json.dumps(solver.last_debug_info, ensure_ascii=False))
                 attempted_episode_idx += 1
-            if saved_episode_idx < args.episode_num and args.max_attempts is not None:
+            if (
+                shared_scheduler is None
+                and saved_episode_idx < args.episode_num
+                and args.max_attempts is not None
+            ):
                 print(
                     f"warning: requested {args.episode_num} episodes but only saved {saved_episode_idx} "
                     f"after {attempted_episode_idx} scripted_expert attempts"
@@ -510,13 +573,22 @@ def run_collection(args) -> None:
             solver = HandoverBlockSolver(env, ctrl_cls=DeltaPoseMotionPrimitives)
             saved_episode_idx = 0
             attempted_episode_idx = 0
-            while saved_episode_idx < args.episode_num and (
-                args.max_attempts is None or attempted_episode_idx < int(args.max_attempts)
+            while shared_scheduler is not None or (
+                saved_episode_idx < args.episode_num
+                and (
+                    args.max_attempts is None
+                    or attempted_episode_idx < int(args.max_attempts)
+                )
             ):
+                if shared_scheduler is not None:
+                    reset_seed = shared_scheduler.claim_seed()
+                    if reset_seed is None:
+                        break
+                else:
+                    reset_seed = args.seed + attempted_episode_idx
                 if recreate_real_layout_scripted_runtime and attempted_episode_idx > 0:
                     recreate_runtime()
                     solver = HandoverBlockSolver(env, ctrl_cls=DeltaPoseMotionPrimitives)
-                reset_seed = args.seed + attempted_episode_idx
                 obs = env.reset(seed=reset_seed)
                 recorder.start_episode(dict(obs.data))
                 maybe_render()
@@ -538,7 +610,6 @@ def run_collection(args) -> None:
                     and actions_valid
                 )
                 if should_save:
-                    out_path = recorder.save_episode(saved_episode_idx)
                     metadata = {
                         "collector": "scripted_delta_pose_expert",
                         "action_semantics": "delta_pose_actual",
@@ -555,7 +626,23 @@ def run_collection(args) -> None:
                         "first_pick_debug": getattr(solver, "first_pick_debug", None),
                         "debug": getattr(solver, "last_debug_info", None),
                     }
-                    _write_episode_metadata(out_path, metadata)
+                    if shared_scheduler is not None:
+                        save_result = shared_scheduler.save_next_episode(
+                            lambda episode_idx: _save_episode_with_metadata(
+                                recorder,
+                                episode_idx,
+                                metadata,
+                            )
+                        )
+                        if save_result is None:
+                            break
+                        _episode_idx, out_path = save_result
+                    else:
+                        out_path = _save_episode_with_metadata(
+                            recorder,
+                            args.episode_index_offset + saved_episode_idx,
+                            metadata,
+                        )
                     print(
                         f"saved {out_path} "
                         f"(seed={reset_seed}, length={episode_length}, "
@@ -580,7 +667,11 @@ def run_collection(args) -> None:
                     if args.debug_scripted_expert and getattr(solver, "last_debug_info", None):
                         print("scripted_delta_pose_expert_debug=" + json.dumps(solver.last_debug_info, ensure_ascii=False))
                 attempted_episode_idx += 1
-            if saved_episode_idx < args.episode_num and args.max_attempts is not None:
+            if (
+                shared_scheduler is None
+                and saved_episode_idx < args.episode_num
+                and args.max_attempts is not None
+            ):
                 print(
                     f"warning: requested {args.episode_num} delta episodes but only saved {saved_episode_idx} "
                     f"after {attempted_episode_idx} scripted_delta_pose_expert attempts"
@@ -612,7 +703,9 @@ def run_collection(args) -> None:
                 )
                 if success or not args.save_only_success:
                     if episode_length > 0:
-                        out_path = recorder.save_episode(saved_episode_idx)
+                        out_path = recorder.save_episode(
+                            args.episode_index_offset + saved_episode_idx
+                        )
                         print(
                             f"saved {out_path} "
                             f"(seed={reset_seed}, length={episode_length}, "
@@ -691,7 +784,9 @@ def run_collection(args) -> None:
                 should_save = (success and (replay_success is not False)) or not args.save_only_success
                 if should_save:
                     if episode_length > 0:
-                        out_path = recorder.save_episode(saved_episode_idx)
+                        out_path = recorder.save_episode(
+                            args.episode_index_offset + saved_episode_idx
+                        )
                         metadata = {
                             "collector": "policy_manual_intervention",
                             "seed": int(reset_seed),
@@ -780,7 +875,9 @@ def run_collection(args) -> None:
                     break
 
             if success or not args.save_only_success:
-                out_path = recorder.save_episode(saved_episode_idx)
+                out_path = recorder.save_episode(
+                    args.episode_index_offset + saved_episode_idx
+                )
                 print(
                     f"saved {out_path} "
                     f"(teacher_episode={teacher_episode_idx}, seed={reset_seed}, "
