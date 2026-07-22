@@ -43,12 +43,12 @@ optimizer:
   fused: True
 
 dataloader:
-  batch_size: 128
+  batch_size: 256
   num_workers: 0
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 128
+  batch_size: 256
   num_workers: 0
   persistent_workers: False
 
