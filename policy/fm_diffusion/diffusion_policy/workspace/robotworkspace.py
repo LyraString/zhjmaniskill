@@ -11,10 +11,13 @@ if __name__ == "__main__":
 import os
 import subprocess
 import logging
+from contextlib import nullcontext
 import hydra
 import torch
+import torch.distributed as dist
 from omegaconf import OmegaConf
 import pathlib
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import copy
@@ -44,6 +47,23 @@ def _resolve_amp_config(training_cfg) -> tuple[bool, torch.dtype]:
     else:
         raise ValueError(f"Unsupported training.amp.dtype: {dtype_name}")
     return enabled, dtype
+
+
+def _distributed_context() -> tuple[int, int]:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+
+class _PolicyLossWrapper(torch.nn.Module):
+    """Expose policy loss through forward so DDP can synchronize gradients."""
+
+    def __init__(self, policy: BaseImagePolicy) -> None:
+        super().__init__()
+        self.policy = policy
+
+    def forward(self, batch):
+        return self.policy.compute_loss(batch)
 
 
 def _action_prediction_metrics(pred_action: torch.Tensor, gt_action: torch.Tensor) -> dict:
@@ -144,6 +164,7 @@ def _query_gpu_system_metrics(device: torch.device) -> dict:
 
 
 class RobotWorkspace(BaseWorkspace):
+    supports_distributed = True
     include_keys = ["global_step", "epoch"]
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
@@ -173,6 +194,9 @@ class RobotWorkspace(BaseWorkspace):
         cfg = copy.deepcopy(self.cfg)
         seed = cfg.training.seed
         head_camera_type = cfg.head_camera_type
+        rank, world_size = _distributed_context()
+        distributed = world_size > 1
+        is_main_process = rank == 0
 
         # resume training
         if cfg.training.resume:
@@ -185,12 +209,14 @@ class RobotWorkspace(BaseWorkspace):
                 ckpt_path = pathlib.Path(resume_ckpt_path)
                 if not ckpt_path.is_file():
                     raise FileNotFoundError(f"Specified resume checkpoint not found: {ckpt_path}")
-                print(f"Resuming from specified checkpoint {ckpt_path}")
+                if is_main_process:
+                    print(f"Resuming from specified checkpoint {ckpt_path}")
                 self.load_checkpoint(path=ckpt_path)
             else:
                 lastest_ckpt_path = self.get_checkpoint_path()
                 if lastest_ckpt_path.is_file():
-                    print(f"Resuming from checkpoint {lastest_ckpt_path}")
+                    if is_main_process:
+                        print(f"Resuming from checkpoint {lastest_ckpt_path}")
                     self.load_checkpoint(path=lastest_ckpt_path)
 
         # Optimizer checkpoints also contain runtime implementation flags. Reapply
@@ -205,12 +231,19 @@ class RobotWorkspace(BaseWorkspace):
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset)
-        train_dataloader = create_dataloader(dataset, **cfg.dataloader)
+        train_dataloader = create_dataloader(
+            dataset,
+            **cfg.dataloader,
+            rank=rank,
+            world_size=world_size,
+        )
         normalizer = dataset.get_normalizer()
 
         # configure validation dataset
-        val_dataset = dataset.get_validation_dataset()
-        val_dataloader = create_dataloader(val_dataset, **cfg.val_dataloader)
+        val_dataloader = None
+        if is_main_process:
+            val_dataset = dataset.get_validation_dataset()
+            val_dataloader = create_dataloader(val_dataset, **cfg.val_dataloader)
 
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
@@ -272,7 +305,8 @@ class RobotWorkspace(BaseWorkspace):
             fullgraph = tc_cfg.get("fullgraph", False)
             if tc_cfg.get("suppress_logs", True):
                 _suppress_torch_compile_logs()
-            print(f"[torch.compile] mode={mode}, dynamic={dynamic}, fullgraph={fullgraph}")
+            if is_main_process:
+                print(f"[torch.compile] mode={mode}, dynamic={dynamic}, fullgraph={fullgraph}")
             self.model.model = torch.compile(
                 self.model.model,
                 mode=mode,
@@ -287,7 +321,8 @@ class RobotWorkspace(BaseWorkspace):
                     fullgraph=fullgraph,
                 )
             if tc_cfg.get("compile_obs_encoder", False) and hasattr(self.model, "obs_encoder"):
-                print("[torch.compile] compiling obs_encoder")
+                if is_main_process:
+                    print("[torch.compile] compiling obs_encoder")
                 self.model.obs_encoder = torch.compile(
                     self.model.obs_encoder,
                     mode=mode,
@@ -302,9 +337,41 @@ class RobotWorkspace(BaseWorkspace):
                         fullgraph=fullgraph,
                     )
 
+        if cfg.training.freeze_encoder:
+            self.model.obs_encoder.eval()
+            self.model.obs_encoder.requires_grad_(False)
+
+        ddp_model = None
+        if distributed:
+            if device.type != "cuda" or device.index is None:
+                raise RuntimeError(
+                    f"DDP requires an explicit CUDA rank device, got {device}."
+                )
+            ddp_model = DistributedDataParallel(
+                _PolicyLossWrapper(self.model),
+                device_ids=[device.index],
+                output_device=device.index,
+            )
+            process_seed = int(seed) + rank
+            torch.manual_seed(process_seed)
+            torch.cuda.manual_seed(process_seed)
+            np.random.seed(process_seed)
+            random.seed(process_seed)
+            if is_main_process:
+                per_device_batch = int(cfg.dataloader.batch_size)
+                global_batch = (
+                    per_device_batch
+                    * world_size
+                    * int(cfg.training.gradient_accumulate_every)
+                )
+                print(
+                    f"DDP active: world_size={world_size}, "
+                    f"per_device_batch={per_device_batch}, global_batch={global_batch}"
+                )
+
         amp_enabled, amp_dtype = _resolve_amp_config(cfg.training)
         amp_enabled = bool(amp_enabled and device.type == "cuda")
-        if amp_enabled:
+        if amp_enabled and is_main_process:
             print(f"Using AMP autocast: dtype={amp_dtype}")
 
         # save batch for sampling
@@ -329,11 +396,19 @@ class RobotWorkspace(BaseWorkspace):
         tb_log_every = int(getattr(cfg.logging, "tensorboard", {}).get("log_every", 1))
         tb_flush_secs = int(getattr(cfg.logging, "tensorboard", {}).get("flush_secs", 10))
         tb_dir = os.path.join(self.output_dir, "tensorboard")
-        tb_writer = SummaryWriter(log_dir=tb_dir, flush_secs=tb_flush_secs) if tb_enabled else None
+        tb_writer = (
+            SummaryWriter(log_dir=tb_dir, flush_secs=tb_flush_secs)
+            if tb_enabled and is_main_process
+            else None
+        )
+        logger_context = JsonLogger(log_path) if is_main_process else nullcontext(None)
 
         try:
-            with JsonLogger(log_path) as json_logger:
+            with logger_context as json_logger:
                 for local_epoch_idx in range(cfg.training.num_epochs):
+                    sampler = train_dataloader.sampler
+                    if hasattr(sampler, "set_epoch"):
+                        sampler.set_epoch(self.epoch)
                     step_log = dict()
                     # ========= train for this epoch ==========
                     if cfg.training.freeze_encoder:
@@ -346,6 +421,7 @@ class RobotWorkspace(BaseWorkspace):
                             desc=f"Training epoch {self.epoch}",
                             leave=False,
                             mininterval=cfg.training.tqdm_interval_sec,
+                            disable=not is_main_process,
                     ) as tepoch:
                         for batch_idx, batch in enumerate(tepoch):
                             batch = dataset.postprocess(batch, device)
@@ -353,7 +429,7 @@ class RobotWorkspace(BaseWorkspace):
                                 train_sampling_batch = batch
 
                             # one-time FPO checks on the first train batch
-                            if (not fpo_checks_done) and hasattr(self.model, "run_fpo_forward_smoke_test") and hasattr(self.model, "run_fpo_reproducibility_check"):
+                            if is_main_process and (not fpo_checks_done) and hasattr(self.model, "run_fpo_forward_smoke_test") and hasattr(self.model, "run_fpo_reproducibility_check"):
                                 smoke_info = self.model.run_fpo_forward_smoke_test(
                                     batch=batch,
                                     num_fpo_samples=4,
@@ -380,7 +456,11 @@ class RobotWorkspace(BaseWorkspace):
                                 dtype=amp_dtype,
                                 enabled=amp_enabled,
                             ):
-                                raw_loss = self.model.compute_loss(batch)
+                                raw_loss = (
+                                    ddp_model(batch)
+                                    if ddp_model is not None
+                                    else self.model.compute_loss(batch)
+                                )
                             loss = raw_loss / cfg.training.gradient_accumulate_every
                             loss.backward()
 
@@ -396,7 +476,8 @@ class RobotWorkspace(BaseWorkspace):
 
                             # logging
                             raw_loss_cpu = raw_loss.item()
-                            tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
+                            if is_main_process:
+                                tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
                             train_losses.append(raw_loss_cpu)
                             step_log = {
                                 "train_loss": raw_loss_cpu,
@@ -419,146 +500,169 @@ class RobotWorkspace(BaseWorkspace):
                             is_last_batch = batch_idx == (len(train_dataloader) - 1)
                             if not is_last_batch:
                                 # log of last step is combined with validation and rollout
-                                json_logger.log(step_log)
+                                if is_main_process:
+                                    json_logger.log(step_log)
                                 self.global_step += 1
 
                             if (cfg.training.max_train_steps
                                     is not None) and batch_idx >= (cfg.training.max_train_steps - 1):
                                 break
 
-                    # at the end of each epoch
-                    # replace train_loss with epoch average
-                    train_loss = np.mean(train_losses)
+                    if not train_losses:
+                        raise RuntimeError(
+                            "Training dataloader produced no batches. Reduce the per-device "
+                            "batch size or the distributed world size."
+                        )
+                    if distributed:
+                        loss_stats = torch.tensor(
+                            [
+                                float(np.sum(train_losses)),
+                                float(np.sum(np.square(train_losses))),
+                                float(len(train_losses)),
+                            ],
+                            dtype=torch.float64,
+                            device=device,
+                        )
+                        dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
+                        train_loss = (loss_stats[0] / loss_stats[2]).item()
+                        train_loss_var = (
+                            loss_stats[1] / loss_stats[2] - train_loss**2
+                        ).clamp_min(0.0)
+                        train_loss_std = train_loss_var.sqrt().item()
+                    else:
+                        train_loss = float(np.mean(train_losses))
+                        train_loss_std = float(np.std(train_losses))
                     step_log["train_loss"] = train_loss
-                    step_log["train_loss_std"] = float(np.std(train_losses))
+                    step_log["train_loss_std"] = train_loss_std
 
-                    # ========= eval for this epoch ==========
-                    policy = self.model
-                    if cfg.training.use_ema:
-                        policy = self.ema_model
-                    policy.eval()
+                    if is_main_process:
+                        # ========= eval for this epoch ==========
+                        policy = self.model
+                        if cfg.training.use_ema:
+                            policy = self.ema_model
+                        policy.eval()
 
-                    # run rollout
-                    # if (self.epoch % cfg.training.rollout_every) == 0:
-                    #     runner_log = env_runner.run(policy)
-                    #     # log all
-                    #     step_log.update(runner_log)
+                        # run rollout
+                        # if (self.epoch % cfg.training.rollout_every) == 0:
+                        #     runner_log = env_runner.run(policy)
+                        #     step_log.update(runner_log)
 
-                    # run validation
-                    if (self.epoch % cfg.training.val_every) == 0:
-                        with torch.no_grad():
-                            val_losses = list()
-                            val_sampling_batch = None
-                            with tqdm.tqdm(
-                                    val_dataloader,
-                                    desc=f"Validation epoch {self.epoch}",
-                                    leave=False,
-                                    mininterval=cfg.training.tqdm_interval_sec,
-                            ) as tepoch:
-                                for batch_idx, batch in enumerate(tepoch):
-                                    batch = dataset.postprocess(batch, device)
-                                    if val_sampling_batch is None:
-                                        val_sampling_batch = batch
-                                    with torch.autocast(
-                                        device_type=device.type,
-                                        dtype=amp_dtype,
-                                        enabled=amp_enabled,
-                                    ):
-                                        loss = self.model.compute_loss(batch)
-                                    val_losses.append(loss)
-                                    if (cfg.training.max_val_steps
-                                            is not None) and batch_idx >= (cfg.training.max_val_steps - 1):
-                                        break
-                            if len(val_losses) > 0:
-                                val_loss = torch.mean(torch.tensor(val_losses)).item()
-                                # log epoch average validation loss
-                                step_log["val_loss"] = val_loss
-                            if val_sampling_batch is not None:
-                                result = policy.predict_action(val_sampling_batch["obs"])
-                                step_log.update(_action_prediction_metrics(
-                                    result["action_pred"],
-                                    val_sampling_batch["action"],
-                                ))
+                        # run validation
+                        if (self.epoch % cfg.training.val_every) == 0:
+                            assert val_dataloader is not None
+                            with torch.no_grad():
+                                val_losses = list()
+                                val_sampling_batch = None
+                                with tqdm.tqdm(
+                                        val_dataloader,
+                                        desc=f"Validation epoch {self.epoch}",
+                                        leave=False,
+                                        mininterval=cfg.training.tqdm_interval_sec,
+                                ) as tepoch:
+                                    for batch_idx, batch in enumerate(tepoch):
+                                        batch = dataset.postprocess(batch, device)
+                                        if val_sampling_batch is None:
+                                            val_sampling_batch = batch
+                                        with torch.autocast(
+                                            device_type=device.type,
+                                            dtype=amp_dtype,
+                                            enabled=amp_enabled,
+                                        ):
+                                            loss = self.model.compute_loss(batch)
+                                        val_losses.append(loss)
+                                        if (cfg.training.max_val_steps
+                                                is not None) and batch_idx >= (cfg.training.max_val_steps - 1):
+                                            break
+                                if len(val_losses) > 0:
+                                    val_loss = torch.mean(torch.tensor(val_losses)).item()
+                                    step_log["val_loss"] = val_loss
+                                if val_sampling_batch is not None:
+                                    result = policy.predict_action(val_sampling_batch["obs"])
+                                    step_log.update(_action_prediction_metrics(
+                                        result["action_pred"],
+                                        val_sampling_batch["action"],
+                                    ))
 
-                    # run diffusion sampling on a training batch
-                    if (self.epoch % cfg.training.sample_every) == 0:
-                        with torch.no_grad():
-                            # sample trajectory from training set, and evaluate difference
-                            batch = train_sampling_batch
-                            obs_dict = batch["obs"]
-                            gt_action = batch["action"]
+                        # run diffusion sampling on a training batch
+                        if (self.epoch % cfg.training.sample_every) == 0:
+                            with torch.no_grad():
+                                batch = train_sampling_batch
+                                obs_dict = batch["obs"]
+                                gt_action = batch["action"]
 
-                            result = policy.predict_action(obs_dict)
-                            pred_action = result["action_pred"]
-                            pred_action_float = pred_action.float()
-                            gt_action_float = gt_action.float()
-                            mse = torch.nn.functional.mse_loss(pred_action_float, gt_action_float)
-                            mae = torch.nn.functional.l1_loss(pred_action_float, gt_action_float)
-                            step_log["train_action_mse_error"] = mse.item()
-                            step_log["train_action_mae_error"] = mae.item()
-                            del batch
-                            del obs_dict
-                            del gt_action
-                            del result
-                            del pred_action
-                            del pred_action_float
-                            del gt_action_float
-                            del mse
-                            del mae
+                                result = policy.predict_action(obs_dict)
+                                pred_action = result["action_pred"]
+                                pred_action_float = pred_action.float()
+                                gt_action_float = gt_action.float()
+                                mse = torch.nn.functional.mse_loss(pred_action_float, gt_action_float)
+                                mae = torch.nn.functional.l1_loss(pred_action_float, gt_action_float)
+                                step_log["train_action_mse_error"] = mse.item()
+                                step_log["train_action_mae_error"] = mae.item()
+                                del batch
+                                del obs_dict
+                                del gt_action
+                                del result
+                                del pred_action
+                                del pred_action_float
+                                del gt_action_float
+                                del mse
+                                del mae
 
-                    step_log.update(_query_gpu_system_metrics(device))
+                        step_log.update(_query_gpu_system_metrics(device))
 
-                    # checkpoint
-                    if ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
-                        # checkpointing
-                        save_dir_name = cfg.training.get("checkpoint_run_name", None)
-                        if save_dir_name in (None, ""):
-                            save_name = pathlib.Path(self.cfg.task.dataset.zarr_path).stem
-                            save_dir_name = f"{save_name}-{seed}"
-                        self.save_checkpoint(f"checkpoints/{save_dir_name}/{self.epoch + 1}.ckpt")  # TODO
+                        # checkpoint
+                        if ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
+                            save_dir_name = cfg.training.get("checkpoint_run_name", None)
+                            if save_dir_name in (None, ""):
+                                save_name = pathlib.Path(self.cfg.task.dataset.zarr_path).stem
+                                save_dir_name = f"{save_name}-{seed}"
+                            self.save_checkpoint(f"checkpoints/{save_dir_name}/{self.epoch + 1}.ckpt")  # TODO
 
-                    if tb_writer is not None:
-                        tb_epoch = int(self.epoch)
-                        tb_writer.add_scalar("epoch/train_loss", float(step_log["train_loss"]), tb_epoch)
-                        if "val_loss" in step_log:
-                            tb_writer.add_scalar("epoch/val_loss", float(step_log["val_loss"]), tb_epoch)
-                        for key in (
-                            "val_action_translation_mae_m",
-                            "val_action_rotation_mae_rad",
-                            "val_gripper_accuracy",
-                        ):
-                            if key in step_log:
-                                tb_writer.add_scalar(f"epoch/{key}", float(step_log[key]), tb_epoch)
-                        if "train_action_mse_error" in step_log:
-                            tb_writer.add_scalar(
-                                "epoch/train_action_mse_error",
-                                float(step_log["train_action_mse_error"]),
-                                tb_epoch,
-                            )
-                        if "train_loss_std" in step_log:
-                            tb_writer.add_scalar("epoch/train_loss_std", float(step_log["train_loss_std"]), tb_epoch)
-                        if "train_action_mae_error" in step_log:
-                            tb_writer.add_scalar(
-                                "epoch/train_action_mae_error",
-                                float(step_log["train_action_mae_error"]),
-                                tb_epoch,
-                            )
-                        for key in (
-                            "system_gpu_util_percent",
-                            "system_gpu_mem_used_mb",
-                            "system_gpu_mem_total_mb",
-                            "system_gpu_power_w",
-                            "system_gpu_temp_c",
-                        ):
-                            if key in step_log:
-                                tb_writer.add_scalar(f"system/{key.removeprefix('system_')}", float(step_log[key]), tb_epoch)
+                        if tb_writer is not None:
+                            tb_epoch = int(self.epoch)
+                            tb_writer.add_scalar("epoch/train_loss", float(step_log["train_loss"]), tb_epoch)
+                            if "val_loss" in step_log:
+                                tb_writer.add_scalar("epoch/val_loss", float(step_log["val_loss"]), tb_epoch)
+                            for key in (
+                                "val_action_translation_mae_m",
+                                "val_action_rotation_mae_rad",
+                                "val_gripper_accuracy",
+                            ):
+                                if key in step_log:
+                                    tb_writer.add_scalar(f"epoch/{key}", float(step_log[key]), tb_epoch)
+                            if "train_action_mse_error" in step_log:
+                                tb_writer.add_scalar(
+                                    "epoch/train_action_mse_error",
+                                    float(step_log["train_action_mse_error"]),
+                                    tb_epoch,
+                                )
+                            if "train_loss_std" in step_log:
+                                tb_writer.add_scalar("epoch/train_loss_std", float(step_log["train_loss_std"]), tb_epoch)
+                            if "train_action_mae_error" in step_log:
+                                tb_writer.add_scalar(
+                                    "epoch/train_action_mae_error",
+                                    float(step_log["train_action_mae_error"]),
+                                    tb_epoch,
+                                )
+                            for key in (
+                                "system_gpu_util_percent",
+                                "system_gpu_mem_used_mb",
+                                "system_gpu_mem_total_mb",
+                                "system_gpu_power_w",
+                                "system_gpu_temp_c",
+                            ):
+                                if key in step_log:
+                                    tb_writer.add_scalar(f"system/{key.removeprefix('system_')}", float(step_log[key]), tb_epoch)
 
-                    # ========= eval end for this epoch ==========
-                    policy.train()
+                        # ========= eval end for this epoch ==========
+                        policy.train()
 
-                    # end of epoch
-                    # log of last step is combined with validation and rollout
-                    json_logger.log(step_log)
+                        # log of last step is combined with validation and rollout
+                        assert json_logger is not None
+                        json_logger.log(step_log)
+
+                    if distributed:
+                        dist.barrier()
                     self.global_step += 1
                     self.epoch += 1
         finally:
@@ -600,6 +704,62 @@ class BatchSampler:
         return self.num_batch
 
 
+class DistributedBatchSampler:
+    """Yield disjoint, equally sized index batches for one DDP rank."""
+
+    def __init__(
+        self,
+        data_size: int,
+        batch_size: int,
+        *,
+        rank: int,
+        world_size: int,
+        shuffle: bool = False,
+        seed: int = 0,
+        drop_last: bool = True,
+    ):
+        if not drop_last:
+            raise ValueError("DistributedBatchSampler requires drop_last=True.")
+        if not 0 <= rank < world_size:
+            raise ValueError(f"rank must be in [0, {world_size}), got {rank}.")
+        self.data_size = int(data_size)
+        self.batch_size = int(batch_size)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.global_batch_size = self.batch_size * self.world_size
+        self.num_batch = self.data_size // self.global_batch_size
+        if self.num_batch == 0:
+            raise ValueError(
+                f"Dataset size {self.data_size} is smaller than global batch size "
+                f"{self.global_batch_size}."
+            )
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        if self.shuffle:
+            rng = np.random.default_rng(self.seed + self.epoch)
+            indices = rng.permutation(self.data_size)
+        else:
+            indices = np.arange(self.data_size)
+        usable_size = self.num_batch * self.global_batch_size
+        indices = indices[:usable_size]
+        indices = indices.reshape(
+            self.num_batch,
+            self.world_size,
+            self.batch_size,
+        )
+        for batch_idx in range(self.num_batch):
+            yield indices[batch_idx, self.rank].copy()
+
+    def __len__(self):
+        return self.num_batch
+
+
 def _collate_identity(batch):
     assert len(batch) == 1
     return batch[0]
@@ -614,8 +774,27 @@ def create_dataloader(
     pin_memory: bool,
     persistent_workers: bool,
     seed: int = 0,
+    rank: int = 0,
+    world_size: int = 1,
 ):
-    batch_sampler = BatchSampler(len(dataset), batch_size, shuffle=shuffle, seed=seed, drop_last=True)
+    if world_size > 1:
+        batch_sampler = DistributedBatchSampler(
+            len(dataset),
+            batch_size,
+            rank=rank,
+            world_size=world_size,
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=True,
+        )
+    else:
+        batch_sampler = BatchSampler(
+            len(dataset),
+            batch_size,
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=True,
+        )
 
     mp_context = None
     if num_workers > 0:

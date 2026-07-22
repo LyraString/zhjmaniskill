@@ -5,7 +5,7 @@ class ModuleAttrMixin(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self._dummy_variable = nn.Parameter()
+        self._dummy_variable = nn.Parameter(requires_grad=False)
 
     @property
     def device(self):
