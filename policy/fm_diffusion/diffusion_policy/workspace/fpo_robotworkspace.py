@@ -14,6 +14,8 @@ import contextlib
 import logging
 import hydra
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 from omegaconf import OmegaConf
 import pathlib
@@ -91,6 +93,97 @@ def _resolve_actor_amp_config(training_cfg, device) -> tuple[bool, torch.dtype]:
             f"got training.actor_amp.dtype={dtype_name!r}."
         )
     return enabled, torch.bfloat16
+
+
+def _distributed_context() -> tuple[int, int]:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+
+class _FPOActorLossWrapper(torch.nn.Module):
+    """Route the existing fixed-noise FPO loss through DDP forward hooks."""
+
+    def __init__(self, policy: BaseImagePolicy) -> None:
+        super().__init__()
+        self.policy = policy
+
+    def forward(
+        self,
+        postdict,
+        naction_target,
+        noise,
+        t,
+        return_pred_v: bool = False,
+    ):
+        return self.policy.compute_cfm_loss_with_fixed_noise_t(
+            postdict,
+            naction_target,
+            noise,
+            t,
+            return_per_sample=True,
+            postdict=True,
+            return_pred_v=return_pred_v,
+        )
+
+
+def _distributed_normalize(values: torch.Tensor) -> torch.Tensor:
+    _, world_size = _distributed_context()
+    if world_size == 1:
+        return (values - values.mean()) / (values.std(unbiased=False) + 1e-8)
+    stats = torch.stack(
+        (
+            values.double().sum(),
+            values.double().square().sum(),
+            torch.tensor(float(values.numel()), device=values.device, dtype=torch.float64),
+        )
+    )
+    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    mean = stats[0] / stats[2].clamp_min(1.0)
+    variance = (stats[1] / stats[2].clamp_min(1.0) - mean.square()).clamp_min(0.0)
+    return (values - mean.to(values.dtype)) / (variance.sqrt().to(values.dtype) + 1e-8)
+
+
+def _distributed_loss_scale(local_count: int, device: torch.device) -> float:
+    _, world_size = _distributed_context()
+    if world_size == 1:
+        return 1.0
+    count = torch.tensor(float(local_count), device=device, dtype=torch.float64)
+    total = count.clone()
+    dist.all_reduce(total, op=dist.ReduceOp.SUM)
+    return float(world_size * count.item() / total.clamp_min(1.0).item())
+
+
+def _reduce_distributed_metrics(metrics: dict, device: torch.device) -> dict:
+    _, world_size = _distributed_context()
+    if world_size == 1:
+        return metrics
+
+    local_keys = tuple(sorted(metrics))
+    gathered_keys = [None] * world_size
+    dist.all_gather_object(gathered_keys, local_keys)
+    if any(keys != local_keys for keys in gathered_keys):
+        raise RuntimeError(
+            "Distributed FPO ranks produced different metric fields: "
+            f"{gathered_keys}"
+        )
+
+    reduced = {}
+    sum_keys = {"rollout_policy_calls", "rollout_env_steps"}
+    for key in local_keys:
+        value = metrics[key]
+        scalar = torch.tensor(float(value), device=device, dtype=torch.float64)
+        if key in sum_keys:
+            dist.all_reduce(scalar, op=dist.ReduceOp.SUM)
+        elif key.endswith("_max"):
+            dist.all_reduce(scalar, op=dist.ReduceOp.MAX)
+        elif key.endswith("_min"):
+            dist.all_reduce(scalar, op=dist.ReduceOp.MIN)
+        else:
+            dist.all_reduce(scalar, op=dist.ReduceOp.SUM)
+            scalar /= world_size
+        reduced[key] = float(scalar.item())
+    return reduced
 
 
 ONLINE_ROLLOUT_DIAG_KEYS = (
@@ -257,6 +350,7 @@ def _payload_has_model_normalizer(payload: dict) -> bool:
     return any(str(key).startswith("normalizer.") for key in model_state.keys())
 
 class RobotWorkspace(BaseWorkspace):
+    supports_distributed = True
     include_keys = ["global_step", "epoch"]
     exclude_keys = ("ref_model", "capo_coupling_model")
 
@@ -296,6 +390,10 @@ class RobotWorkspace(BaseWorkspace):
         cfg = copy.deepcopy(self.cfg)
         seed = cfg.training.seed
         head_camera_type = cfg.head_camera_type
+        rank, world_size = _distributed_context()
+        distributed = world_size > 1
+        is_main_process = rank == 0
+        self._is_main_process = is_main_process
 
         # resume training
         loaded_checkpoint_payload = None
@@ -311,11 +409,19 @@ class RobotWorkspace(BaseWorkspace):
                 ckpt_path = pathlib.Path(resume_ckpt_path)
                 if not ckpt_path.is_file():
                     raise FileNotFoundError(f"Specified resume checkpoint not found: {ckpt_path}")
-                loaded_checkpoint_payload = self.load_checkpoint(path=ckpt_path, exclude_keys=exclude_keys)
+                loaded_checkpoint_payload = self.load_checkpoint(
+                    path=ckpt_path,
+                    exclude_keys=exclude_keys,
+                    include_keys=self.include_keys,
+                )
             else:
                 lastest_ckpt_path = self.get_checkpoint_path()
                 if lastest_ckpt_path.is_file():
-                    loaded_checkpoint_payload = self.load_checkpoint(path=lastest_ckpt_path, exclude_keys=exclude_keys)
+                    loaded_checkpoint_payload = self.load_checkpoint(
+                        path=lastest_ckpt_path,
+                        exclude_keys=exclude_keys,
+                        include_keys=self.include_keys,
+                    )
 
         init_actor_from_ema = bool(getattr(cfg.training, "init_actor_from_ema", False))
         if init_actor_from_ema and (loaded_checkpoint_payload is not None):
@@ -324,6 +430,12 @@ class RobotWorkspace(BaseWorkspace):
             self.model.load_state_dict(self.ema_model.state_dict())
 
         env_backend = str(getattr(cfg.training, "env_backend", "robotwin_legacy"))
+        num_envs = int(getattr(cfg.training, "num_envs", 1))
+        if distributed and not (env_backend == "maniskill" and num_envs > 1):
+            raise RuntimeError(
+                "Distributed FPO currently requires the ManiSkill CUDA vector runner "
+                "with training.num_envs > 1."
+            )
         skip_offline_dataset = bool(getattr(cfg.training, "online_only_no_dataset", False))
         preserve_ckpt_normalizer = bool(getattr(cfg.training, "preserve_ckpt_normalizer", False))
         use_ckpt_normalizer = (
@@ -402,8 +514,12 @@ class RobotWorkspace(BaseWorkspace):
         # )
 
         # configure checkpoint
-        topk_manager = TopKCheckpointManager(save_dir=os.path.join(self.output_dir, "checkpoints"),
-                                             **cfg.checkpoint.topk)
+        topk_manager = None
+        if is_main_process:
+            topk_manager = TopKCheckpointManager(
+                save_dir=os.path.join(self.output_dir, "checkpoints"),
+                **cfg.checkpoint.topk,
+            )
 
         # device transfer
         device = torch.device(cfg.training.device)
@@ -423,10 +539,11 @@ class RobotWorkspace(BaseWorkspace):
             torch.set_float32_matmul_precision(matmul_precision)
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            tqdm.tqdm.write(f"[torch] TF32 enabled, float32_matmul_precision={matmul_precision}")
+            if is_main_process:
+                tqdm.tqdm.write(f"[torch] TF32 enabled, float32_matmul_precision={matmul_precision}")
 
         actor_amp_enabled, actor_amp_dtype = _resolve_actor_amp_config(cfg.training, device)
-        if actor_amp_enabled:
+        if actor_amp_enabled and is_main_process:
             tqdm.tqdm.write(
                 f"[AMP] FPO actor rollout/update autocast enabled: dtype={actor_amp_dtype}; "
                 "PPO reductions and critic remain FP32"
@@ -441,9 +558,10 @@ class RobotWorkspace(BaseWorkspace):
             fullgraph = bool(tc_cfg.get("fullgraph", False))
             if bool(tc_cfg.get("suppress_logs", True)):
                 _suppress_torch_compile_logs()
-            tqdm.tqdm.write(
-                f"[torch.compile] FPO actor model mode={mode}, dynamic={dynamic}, fullgraph={fullgraph}"
-            )
+            if is_main_process:
+                tqdm.tqdm.write(
+                    f"[torch.compile] FPO actor model mode={mode}, dynamic={dynamic}, fullgraph={fullgraph}"
+                )
             self.model.model = torch.compile(
                 self.model.model,
                 mode=mode,
@@ -466,7 +584,8 @@ class RobotWorkspace(BaseWorkspace):
                 )
 
             if bool(tc_cfg.get("compile_obs_encoder", False)) and hasattr(self.model, "obs_encoder"):
-                tqdm.tqdm.write("[torch.compile] FPO obs_encoder enabled")
+                if is_main_process:
+                    tqdm.tqdm.write("[torch.compile] FPO obs_encoder enabled")
                 self.model.obs_encoder = torch.compile(
                     self.model.obs_encoder,
                     mode=mode,
@@ -487,6 +606,40 @@ class RobotWorkspace(BaseWorkspace):
                         dynamic=dynamic,
                         fullgraph=fullgraph,
                     )
+
+        actor_ddp = None
+        critic_ddp = None
+        if distributed:
+            if device.type != "cuda" or device.index is None:
+                raise RuntimeError(f"Distributed FPO requires an explicit CUDA device, got {device}.")
+            actor_ddp = DistributedDataParallel(
+                _FPOActorLossWrapper(self.model),
+                device_ids=[device.index],
+                output_device=device.index,
+                broadcast_buffers=False,
+                find_unused_parameters=True,
+                gradient_as_bucket_view=True,
+            )
+            critic_ddp = DistributedDataParallel(
+                self.critic,
+                device_ids=[device.index],
+                output_device=device.index,
+                broadcast_buffers=False,
+                gradient_as_bucket_view=True,
+            )
+            process_seed = int(seed) + rank
+            torch.manual_seed(process_seed)
+            torch.cuda.manual_seed(process_seed)
+            np.random.seed(process_seed)
+            random.seed(process_seed)
+            if is_main_process:
+                tqdm.tqdm.write(
+                    "[FPO DDP] "
+                    f"world_size={world_size}, envs_per_rank={num_envs}, "
+                    f"steps_per_rank={int(cfg.training.timesteps_per_batch)}, "
+                    f"global_envs={num_envs * world_size}, "
+                    f"global_steps={int(cfg.training.timesteps_per_batch) * world_size}"
+                )
 
         # save batch for sampling
         train_sampling_batch = None
@@ -510,7 +663,11 @@ class RobotWorkspace(BaseWorkspace):
         tb_log_every = int(getattr(cfg.logging, "tensorboard", {}).get("log_every", 1))
         tb_flush_secs = int(getattr(cfg.logging, "tensorboard", {}).get("flush_secs", 10))
         tb_dir = os.path.join(self.output_dir, "tensorboard")
-        tb_writer = SummaryWriter(log_dir=tb_dir, flush_secs=tb_flush_secs) if tb_enabled else None
+        tb_writer = (
+            SummaryWriter(log_dir=tb_dir, flush_secs=tb_flush_secs)
+            if tb_enabled and is_main_process
+            else None
+        )
 
         # # 离线训练部分
         # with JsonLogger(log_path) as json_logger:
@@ -672,7 +829,6 @@ class RobotWorkspace(BaseWorkspace):
 
         # 在线训练部分
 
-        num_envs = int(getattr(cfg.training, "num_envs", 1))
         if env_backend == "maniskill":
             sim_config = getattr(cfg.training, "sim_config", None)
             sim_config = OmegaConf.to_container(sim_config, resolve=True) if sim_config is not None else None
@@ -693,6 +849,9 @@ class RobotWorkspace(BaseWorkspace):
                     env_id=task_env_id,
                     num_envs=num_envs,
                     base_seed=cfg.training.seed,
+                    seed_rank=rank,
+                    seed_world_size=world_size,
+                    cuda_device_index=device.index if distributed else None,
                     action_type=runtime_action_type,
                     obs_mode=str(getattr(cfg.training, "obs_mode", "pointcloud+state_dict")),
                     control_mode=runtime_control_mode,
@@ -744,8 +903,9 @@ class RobotWorkspace(BaseWorkspace):
                 action_type="qpos",
             )
 
+        logger_context = JsonLogger(log_path) if is_main_process else contextlib.nullcontext(None)
         try:
-            with JsonLogger(log_path) as json_logger:
+            with logger_context as json_logger:
                 online_iters = int(cfg.training.online_iters)
                 with tqdm.tqdm(
                     range(online_iters),
@@ -753,30 +913,40 @@ class RobotWorkspace(BaseWorkspace):
                     dynamic_ncols=True,
                     mininterval=float(getattr(cfg.training, "tqdm_interval_sec", 1.0)),
                     leave=True,
+                    disable=not is_main_process,
                 ) as pbar:
                     for it in pbar:
                         self.model.train()
                         self.critic.train()
 
                         rollout = self.collect_rollout(env, device)
-                        update_log = self.update_fpo_from_rollout(rollout, device)
+                        update_log = self.update_fpo_from_rollout(
+                            rollout,
+                            device,
+                            actor_ddp=actor_ddp,
+                            critic_ddp=critic_ddp,
+                        )
 
-                        step_log = {
-                            "iter": it,
-                            "iter_total": online_iters,
-                            "global_step": self.global_step,
+                        local_metrics = {
                             **update_log,
                             "mean_reward": rollout["reward_mean"],
                             "mean_ep_len": rollout["ep_len_mean"],
                         }
                         for diag_key in ONLINE_ROLLOUT_DIAG_KEYS:
                             if diag_key in rollout:
-                                step_log[diag_key] = rollout[diag_key]
+                                local_metrics[diag_key] = rollout[diag_key]
+                        metrics = _reduce_distributed_metrics(local_metrics, device)
+                        step_log = {
+                            "iter": it,
+                            "iter_total": online_iters,
+                            "global_step": self.global_step,
+                            **metrics,
+                        }
 
                         if cfg.training.use_ema:
                             ema.step(self.model)
                         
-                        if ((it + 1) % cfg.training.checkpoint_every) == 0:
+                        if is_main_process and ((it + 1) % cfg.training.checkpoint_every) == 0:
                             # Use one-based labels in checkpoint names so they match
                             # the offline pretraining filenames (e.g. 2000.ckpt) and
                             # the human-readable online iteration count.
@@ -787,14 +957,15 @@ class RobotWorkspace(BaseWorkspace):
                                 f"checkpoints/{save_name}-{seed}/{pretrain_epoch_label}-{online_iter_label}.ckpt"
                             )
 
-                        progress_line = _format_online_progress(it, online_iters, step_log)
-                        pbar.set_postfix({
-                            "rew": f"{_safe_float(step_log['mean_reward']):.3f}",
-                            "actor": f"{_safe_float(step_log['actor_loss']):.3f}",
-                            "critic": f"{_safe_float(step_log['critic_loss']):.3f}",
-                            "rho": f"{_safe_float(step_log['rho_mean']):.3f}",
-                            "stage": f"{_safe_float(step_log.get('rollout_reward_stage_mean', 0.0)):.2f}",
-                        })
+                        if is_main_process:
+                            progress_line = _format_online_progress(it, online_iters, step_log)
+                            pbar.set_postfix({
+                                "rew": f"{_safe_float(step_log['mean_reward']):.3f}",
+                                "actor": f"{_safe_float(step_log['actor_loss']):.3f}",
+                                "critic": f"{_safe_float(step_log['critic_loss']):.3f}",
+                                "rho": f"{_safe_float(step_log['rho_mean']):.3f}",
+                                "stage": f"{_safe_float(step_log.get('rollout_reward_stage_mean', 0.0)):.2f}",
+                            })
 
                         if (tb_writer is not None) and (((it + 1) % max(1, tb_log_every)) == 0):
                             tb_step = int(self.global_step)
@@ -814,11 +985,13 @@ class RobotWorkspace(BaseWorkspace):
                                     tb_writer.add_scalar(f"online/{diag_key}", _safe_float(step_log[diag_key]), tb_step)
                             tb_writer.add_scalar("online/iter", float(it), tb_step)
 
-                        tqdm.tqdm.write(progress_line)
-                        
-                        json_logger.log(step_log)
+                        if is_main_process:
+                            tqdm.tqdm.write(progress_line)
+                            assert json_logger is not None
+                            json_logger.log(step_log)
                         self.global_step += 1
-                tqdm.tqdm.write("[online_fpo] training finished")
+                if is_main_process:
+                    tqdm.tqdm.write("[online_fpo] training finished")
         
         finally:
             if tb_writer is not None:
@@ -1155,7 +1328,10 @@ class RobotWorkspace(BaseWorkspace):
         reward_scaling = float(getattr(cfg_t, "reward_scaling", 1.0))
         base_num_fpo_samples = int(cfg_t.num_fpo_samples)
         max_total_fpo_samples = int(getattr(cfg_t, "max_total_fpo_samples_per_call", 0))
-        show_rollout_tqdm = bool(getattr(cfg_t, "show_rollout_tqdm", True))
+        show_rollout_tqdm = bool(
+            getattr(cfg_t, "show_rollout_tqdm", True)
+            and getattr(self, "_is_main_process", True)
+        )
         rollout_tqdm_interval = float(getattr(cfg_t, "rollout_tqdm_interval_sec", 1.0))
         capo_cfg = getattr(cfg_t, "capo", None)
         capo_enabled = bool(getattr(capo_cfg, "enabled", False)) if capo_cfg is not None else False
@@ -2070,7 +2246,14 @@ class RobotWorkspace(BaseWorkspace):
 
         return rollout
 
-    def update_fpo_chunked_from_rollout(self, rollout, device):
+    def update_fpo_chunked_from_rollout(
+        self,
+        rollout,
+        device,
+        *,
+        actor_ddp=None,
+        critic_ddp=None,
+    ):
         cfg_t = self.cfg.training
         actor_amp_enabled, actor_amp_dtype = _resolve_actor_amp_config(cfg_t, device)
         clip_coef = float(cfg_t.clip_coef)
@@ -2091,10 +2274,7 @@ class RobotWorkspace(BaseWorkspace):
         critic_obs = rollout["critic_obs"].to(device)
         returns = rollout["returns"].to(device)
 
-        actor_advantages = rollout["actor_advantages"].to(device)
-        actor_advantages = (actor_advantages - actor_advantages.mean()) / (
-            actor_advantages.std(unbiased=False) + 1e-8
-        )
+        actor_advantages = _distributed_normalize(rollout["actor_advantages"].to(device))
         naction_target = rollout["naction_target"].to(device)
         loss_eps = rollout["loss_eps"].to(device)
         loss_t = rollout["loss_t"].to(device)
@@ -2122,6 +2302,19 @@ class RobotWorkspace(BaseWorkspace):
             capo_clip_low = float(getattr(capo_cfg, "clip_low_coupling", clip_coef))
             capo_clip_high = float(getattr(capo_cfg, "clip_high_coupling", clip_coef))
         num_minibatches = int(getattr(cfg_t, "num_minibatches", 4))
+        distributed = actor_ddp is not None
+        if distributed != (critic_ddp is not None):
+            raise RuntimeError("Actor and critic DDP wrappers must be provided together.")
+        if distributed:
+            min_counts = torch.tensor([actor_s, critic_s], device=device, dtype=torch.long)
+            dist.all_reduce(min_counts, op=dist.ReduceOp.MIN)
+            if int(min_counts.min().item()) < num_minibatches:
+                raise RuntimeError(
+                    "Distributed FPO requires at least one local sample per minibatch on every rank: "
+                    f"global_min_actor={int(min_counts[0].item())}, "
+                    f"global_min_critic={int(min_counts[1].item())}, "
+                    f"num_minibatches={num_minibatches}."
+                )
         actor_minibatch_size = max(1, actor_s // num_minibatches)
         critic_minibatch_size = max(1, critic_s // num_minibatches)
 
@@ -2137,8 +2330,14 @@ class RobotWorkspace(BaseWorkspace):
 
         for _ in range(n_updates):
             actor_idx_all = torch.randperm(actor_s, device=device)
-            for start in range(0, actor_s, actor_minibatch_size):
-                idx = actor_idx_all[start:start + actor_minibatch_size]
+            if distributed:
+                actor_batches = torch.tensor_split(actor_idx_all, num_minibatches)
+            else:
+                actor_batches = [
+                    actor_idx_all[start:start + actor_minibatch_size]
+                    for start in range(0, actor_s, actor_minibatch_size)
+                ]
+            for idx in actor_batches:
                 if idx.numel() == 0:
                     continue
 
@@ -2181,7 +2380,19 @@ class RobotWorkspace(BaseWorkspace):
                     dtype=actor_amp_dtype,
                     enabled=actor_amp_enabled,
                 ):
-                    if velocity_kl_coeff > 0.0:
+                    if actor_ddp is not None:
+                        actor_result = actor_ddp(
+                            postdict,
+                            flat_naction,
+                            flat_eps,
+                            flat_t,
+                            velocity_kl_coeff > 0.0,
+                        )
+                        if velocity_kl_coeff > 0.0:
+                            curr, pred_v, velocity_mask = actor_result
+                        else:
+                            curr = actor_result
+                    elif velocity_kl_coeff > 0.0:
                         curr, pred_v, velocity_mask = self.model.compute_cfm_loss_with_fixed_noise_t(
                             postdict,
                             flat_naction,
@@ -2266,7 +2477,8 @@ class RobotWorkspace(BaseWorkspace):
                     velocity_kl_losses.append(float(velocity_kl_loss.detach().item()))
 
                 self.optimizer.zero_grad()
-                actor_loss.backward()
+                actor_backward_loss = actor_loss * _distributed_loss_scale(idx.numel(), device)
+                actor_backward_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
                 self.optimizer.step()
 
@@ -2274,17 +2486,25 @@ class RobotWorkspace(BaseWorkspace):
                 ratio_means.append(float(ratio.mean().item()))
 
             critic_idx_all = torch.randperm(critic_s, device=device)
-            for start in range(0, critic_s, critic_minibatch_size):
-                idx = critic_idx_all[start:start + critic_minibatch_size]
+            if distributed:
+                critic_batches = torch.tensor_split(critic_idx_all, num_minibatches)
+            else:
+                critic_batches = [
+                    critic_idx_all[start:start + critic_minibatch_size]
+                    for start in range(0, critic_s, critic_minibatch_size)
+                ]
+            for idx in critic_batches:
                 if idx.numel() == 0:
                     continue
                 mb_ret = returns[idx]
-                ret_pred = self.critic(critic_obs[idx]).squeeze(-1)
+                critic_model = critic_ddp if critic_ddp is not None else self.critic
+                ret_pred = critic_model(critic_obs[idx]).squeeze(-1)
                 ret_error = mb_ret - ret_pred
                 critic_loss = (ret_error.pow(2).mean()) * value_loss_coeff
 
                 self.critic_optimizer.zero_grad()
-                critic_loss.backward()
+                critic_backward_loss = critic_loss * _distributed_loss_scale(idx.numel(), device)
+                critic_backward_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_grad_norm)
                 self.critic_optimizer.step()
 
@@ -2306,12 +2526,26 @@ class RobotWorkspace(BaseWorkspace):
             })
         return update_log
 
-    def update_fpo_from_rollout(self, rollout, device):
+    def update_fpo_from_rollout(
+        self,
+        rollout,
+        device,
+        *,
+        actor_ddp=None,
+        critic_ddp=None,
+    ):
         """
         使用 rollout 做一次 FPO 更新（actor+critic）
         """
         if bool(rollout.get("chunked_fpo", False)):
-            return self.update_fpo_chunked_from_rollout(rollout, device)
+            return self.update_fpo_chunked_from_rollout(
+                rollout,
+                device,
+                actor_ddp=actor_ddp,
+                critic_ddp=critic_ddp,
+            )
+        if actor_ddp is not None or critic_ddp is not None:
+            raise RuntimeError("Distributed FPO currently supports only chunked CUDA rollouts.")
 
         cfg_t = self.cfg.training
         actor_amp_enabled, actor_amp_dtype = _resolve_actor_amp_config(cfg_t, device)

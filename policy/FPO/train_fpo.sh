@@ -144,8 +144,9 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 if [ "${backend}" = "maniskill" ]; then
     if ! [[ ${#positional[@]} -eq 2 || ${#positional[@]} -eq 3 || ${#positional[@]} -eq 6 || ${#positional[@]} -eq 7 ]]; then
-        echo "Usage: $0 seed gpu_id [resume_ckpt_path] [--backend maniskill] [--task-profile PROFILE] [--config-name CONFIG] [-- HYDRA_OVERRIDE ...]"
-        echo "Legacy ManiSkill form is also accepted: $0 task_name task_config expert_data_num seed action_dim gpu_id [resume_ckpt_path] ..."
+        echo "Usage: $0 seed gpu_id_or_list [resume_ckpt_path] [--backend maniskill] [--task-profile PROFILE] [--config-name CONFIG] [-- HYDRA_OVERRIDE ...]"
+        echo "Use one GPU id (1) or a comma-separated DDP list (1,3)."
+        echo "Legacy ManiSkill form is also accepted: $0 task_name task_config expert_data_num seed action_dim gpu_id_or_list [resume_ckpt_path] ..."
         exit 1
     fi
 else
@@ -222,7 +223,30 @@ fi
 exp_name=${exp_task_label}-${exp_backend}_fpo-${addition_info}
 run_dir="data/outputs/${exp_name}_seed${seed}"
 
-echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
+if [ -z "${gpu_id}" ] || [[ "${gpu_id}" =~ [[:space:]] ]]; then
+    echo "Invalid GPU id list '${gpu_id}'. Use one id or comma-separated ids without spaces."
+    exit 1
+fi
+IFS=',' read -r -a requested_gpu_ids <<< "${gpu_id}"
+declare -A seen_gpu_ids=()
+for requested_gpu_id in "${requested_gpu_ids[@]}"; do
+    if ! [[ "${requested_gpu_id}" =~ ^[0-9]+$ ]]; then
+        echo "Invalid GPU id list '${gpu_id}'. Expected one id or comma-separated ids, for example 1 or 1,3."
+        exit 1
+    fi
+    if [[ -n "${seen_gpu_ids[${requested_gpu_id}]:-}" ]]; then
+        echo "Duplicate GPU id '${requested_gpu_id}' in '${gpu_id}'."
+        exit 1
+    fi
+    seen_gpu_ids[${requested_gpu_id}]=1
+done
+num_gpus=${#requested_gpu_ids[@]}
+if [ "${num_gpus}" -gt 1 ] && [ "${backend}" != "maniskill" ]; then
+    echo "Multi-GPU FPO is currently supported only by the ManiSkill CUDA runner."
+    exit 1
+fi
+
+echo -e "\033[33mgpu id(s) (to use): ${gpu_id}\033[0m"
 
 
 if [ $DEBUG = True ]; then
@@ -322,6 +346,34 @@ maniskill_overrides=(
     training.resume_ckpt_path=${resume_ckpt_path}
 )
 
+training_launcher=(python)
+if [ "${num_gpus}" -gt 1 ]; then
+    training_launcher=(
+        python -m torch.distributed.run
+        --standalone
+        --nproc_per_node="${num_gpus}"
+    )
+    if ! has_override_prefix "hydra.run.dir=" && ! has_override_prefix "+hydra.run.dir="; then
+        ddp_timestamp="$(date +%Y.%m.%d-%H.%M.%S)"
+        hydra_overrides+=(
+            "hydra.run.dir=${SCRIPT_DIR}/data/outputs/${ddp_timestamp}_${config_name}_ddp${num_gpus}_seed${seed}"
+        )
+    fi
+    if ! has_override_prefix "hydra.output_subdir=" && ! has_override_prefix "+hydra.output_subdir="; then
+        hydra_overrides+=("hydra.output_subdir=null")
+    fi
+    if [ -z "${NUMBA_NUM_THREADS:-}" ]; then
+        available_cpu_threads="$(nproc)"
+        per_process_numba_threads=$((available_cpu_threads / num_gpus))
+        if [ "${per_process_numba_threads}" -lt 1 ]; then
+            per_process_numba_threads=1
+        fi
+        export NUMBA_NUM_THREADS=${per_process_numba_threads}
+    fi
+    echo -e "\033[33mFPO DDP enabled: ${num_gpus} processes\033[0m"
+    echo -e "\033[33mNUMBA_NUM_THREADS per process: ${NUMBA_NUM_THREADS}\033[0m"
+fi
+
 if [ "${inject_task_name}" = true ]; then
     maniskill_overrides=(task.name=${hydra_task_name} "${maniskill_overrides[@]}")
 fi
@@ -331,11 +383,11 @@ if [ "${inject_dataset_zarr_path}" = true ]; then
 fi
 
 if [ "${backend}" = "maniskill" ]; then
-    python "${SCRIPT_DIR}/train.py" --config-name=${config_name}.yaml \
+    "${training_launcher[@]}" "${SCRIPT_DIR}/train.py" --config-name=${config_name}.yaml \
                                 "${maniskill_overrides[@]}" \
                                 "${hydra_overrides[@]}"
 else
-    python "${SCRIPT_DIR}/train.py" --config-name=${config_name}.yaml \
+    "${training_launcher[@]}" "${SCRIPT_DIR}/train.py" --config-name=${config_name}.yaml \
                                 task.name=${task_name} \
                                 task.dataset.zarr_path="${zarr_path}" \
                                 training.debug=$DEBUG \

@@ -36,6 +36,16 @@ from sim.maniskill.task_profiles import (
 )
 
 
+def _bind_cuda_backend(backend: str | None, device_index: int, *, default: str) -> str:
+    if backend is None or str(backend).lower() == "auto":
+        return f"{default}:{device_index}"
+    backend_name = str(backend)
+    base_name = backend_name.split(":", maxsplit=1)[0]
+    if base_name in {"cuda", "gpu", "physx_cuda", "sapien_cuda"}:
+        return f"{base_name}:{device_index}"
+    return backend_name
+
+
 class ManiSkillCudaFPORunner:
     """ManiSkill vector runner that keeps FPO rollout tensors on CUDA."""
 
@@ -48,6 +58,9 @@ class ManiSkillCudaFPORunner:
         env_id: str | None = None,
         num_envs: int = 2,
         base_seed: int = 0,
+        seed_rank: int = 0,
+        seed_world_size: int = 1,
+        cuda_device_index: int | None = None,
         action_type: str | None = "pd_joint_delta_pos",
         obs_mode: str | None = "pointcloud+state_dict",
         control_mode: str | None = None,
@@ -98,10 +111,31 @@ class ManiSkillCudaFPORunner:
         self.env_id = str(env_id) if env_id not in (None, "") else self.runtime_task_name
         self.num_envs = int(num_envs)
         self.base_seed = int(base_seed)
+        self.seed_rank = int(seed_rank)
+        self.seed_world_size = int(seed_world_size)
+        if not 0 <= self.seed_rank < self.seed_world_size:
+            raise ValueError(
+                f"seed_rank must be in [0, {self.seed_world_size}), got {self.seed_rank}."
+            )
         self.action_type = runtime_action_type
         self.control_mode = runtime_control_mode
         self.point_cloud_sampling = sampling
         self._episode_ids = [0 for _ in range(self.num_envs)]
+
+        if cuda_device_index is not None:
+            cuda_device_index = int(cuda_device_index)
+            if cuda_device_index < 0:
+                raise ValueError(f"cuda_device_index must be non-negative, got {cuda_device_index}.")
+            sim_backend = _bind_cuda_backend(
+                sim_backend,
+                cuda_device_index,
+                default="physx_cuda",
+            )
+            render_backend = _bind_cuda_backend(
+                render_backend,
+                cuda_device_index,
+                default="sapien_cuda",
+            )
 
         obs_meta = shape_meta["obs"]
         self.point_cloud_shapes = {
@@ -144,6 +178,11 @@ class ManiSkillCudaFPORunner:
             make_kwargs.setdefault("reward_mode", reward_mode)
         if robot_uids not in (None, "none", "None"):
             make_kwargs.setdefault("robot_uids", robot_uids)
+        if cuda_device_index is not None:
+            # DDP owns device placement; profile/env kwargs must not silently
+            # move this rank's simulator or renderer onto another visible GPU.
+            make_kwargs["sim_backend"] = sim_backend
+            make_kwargs["render_backend"] = render_backend
 
         merged_sim_config = dict(sim_config or {})
         if sim_freq is not None:
@@ -155,6 +194,14 @@ class ManiSkillCudaFPORunner:
 
         self.env = gym.make(self.env_id, **make_kwargs)
         self.device = torch.device(getattr(self.env.unwrapped, "device", "cpu"))
+        if cuda_device_index is not None:
+            expected_device = torch.device(f"cuda:{cuda_device_index}")
+            if self.device != expected_device:
+                self.env.close()
+                raise RuntimeError(
+                    "ManiSkill CUDA environment was created on the wrong device: "
+                    f"expected {expected_device}, got {self.device}."
+                )
         action_space = getattr(self.env.unwrapped, "single_action_space", self.env.action_space)
         self.action_low = torch.as_tensor(
             action_space.low,
@@ -178,7 +225,9 @@ class ManiSkillCudaFPORunner:
         )
 
     def _seed_for_env(self, env_id: int) -> int:
-        return self.base_seed + self._episode_ids[env_id] * self.num_envs + env_id
+        global_env_count = self.num_envs * self.seed_world_size
+        global_env_id = self.seed_rank * self.num_envs + env_id
+        return self.base_seed + self._episode_ids[env_id] * global_env_count + global_env_id
 
     def reset(self):
         seeds = [self._seed_for_env(env_id) for env_id in range(self.num_envs)]
