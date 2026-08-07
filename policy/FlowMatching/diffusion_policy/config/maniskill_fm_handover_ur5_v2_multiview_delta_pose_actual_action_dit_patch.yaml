@@ -37,7 +37,7 @@ policy:
     depth: 12
     num_heads: 12
     mlp_ratio: 4.0
-    dropout: 0.0
+    dropout: 0.05
 
 optimizer:
   fused: True
