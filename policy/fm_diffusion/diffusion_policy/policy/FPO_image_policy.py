@@ -248,6 +248,7 @@ class FPOImagePolicy(BaseImagePolicy):
         global_cond=None,
         generator=None,
         return_path=False,
+        condition_tokens=None,
     ):
         """
         使用流匹配 ODE 积分采样轨迹。
@@ -280,10 +281,10 @@ class FPOImagePolicy(BaseImagePolicy):
         # 为批处理创建时间张量
         batch_size = x.shape[0]
 
-        condition_tokens = None
-        encode_condition = getattr(self.model, "encode_condition_tokens", None)
-        if callable(encode_condition):
-            condition_tokens = encode_condition(global_cond)
+        if condition_tokens is None:
+            encode_condition = getattr(self.model, "encode_condition_tokens", None)
+            if callable(encode_condition):
+                condition_tokens = encode_condition(global_cond)
         
         for step in range(self.num_inference_steps):
             t = step * dt
@@ -326,55 +327,30 @@ class FPOImagePolicy(BaseImagePolicy):
             return x, x_t_path
         return x
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        从观测预测动作。
-        
-        Args:
-            obs_dict: 包含观测的字典
-        Returns:
-            包含 'action' 和 'action_pred' 键的字典
-        """
+    def _predict_action_impl(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        *,
+        generator=None,
+        return_obs_feature: bool = False,
+    ) -> Dict[str, torch.Tensor]:
         assert "past_action" not in obs_dict  # 尚未实现
-        
-        # # 归一化输入
-        # nobs = self.normalizer.normalize(obs_dict)
-        # value = next(iter(nobs.values()))
-        # B, To = value.shape[:2]
-        T = self.horizon
         Da = self.action_dim
-        Do = self.obs_feature_dim
         To = self.n_obs_steps
-
-        # # build input
-        # device = self.device
-        # dtype = self.dtype
-
-        # # 处理不同的观测传递方式
-        # local_cond = None
-        # global_cond = None
-        # if self.obs_as_global_cond:
-        #     # 通过全局特征作为条件
-        #     this_nobs = dict_apply(nobs, lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
-        #     nobs_features = self.obs_encoder(this_nobs)
-        #     # 重塑回 B, Do
-        #     global_cond = nobs_features.reshape(B, -1)
-        #     # 动作的空数据
-        #     cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
-        #     cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-        # else:
-        #     # 通过修复（inpainting）作为条件
-        #     this_nobs = dict_apply(nobs, lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
-        #     nobs_features = self.obs_encoder(this_nobs)
-        #     # 重塑回 B, T, Do
-        #     nobs_features = nobs_features.reshape(B, To, -1)
-        #     cond_data = torch.zeros(size=(B, T, Da + Do), device=device, dtype=dtype)
-        #     cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-        #     cond_data[:, :To, Da:] = nobs_features
-        #     cond_mask[:, :To, Da:] = True
 
         conds_dict = self.build_condition_from_obs(obs_dict)
         cond_data, cond_mask, local_cond, global_cond = conds_dict["cond_data"], conds_dict["cond_mask"], conds_dict["local_cond"], conds_dict["global_cond"]
+
+        condition_tokens = None
+        obs_feature = None
+        if return_obs_feature:
+            encode_condition = getattr(self.model, "encode_condition_tokens", None)
+            if not callable(encode_condition) or global_cond is None:
+                raise RuntimeError(
+                    "ResFiT observation features require an Action DiT global-condition encoder."
+                )
+            condition_tokens = encode_condition(global_cond)
+            obs_feature = condition_tokens.mean(dim=1).float().clone()
 
         # 运行流匹配采样
         nsample = self.flow_matching_sample(
@@ -382,6 +358,8 @@ class FPOImagePolicy(BaseImagePolicy):
             cond_mask,
             local_cond=local_cond,
             global_cond=global_cond,
+            generator=generator,
+            condition_tokens=condition_tokens,
         )
 
         # unnormalize prediction
@@ -394,7 +372,26 @@ class FPOImagePolicy(BaseImagePolicy):
         action = action_pred[:, start:end]
 
         result = {"action": action, "action_pred": action_pred}
+        if obs_feature is not None:
+            result["obs_feature"] = obs_feature
         return result
+
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Predict actions while preserving the existing policy API."""
+        return self._predict_action_impl(obs_dict)
+
+    def predict_action_with_feature(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        *,
+        generator=None,
+    ) -> Dict[str, torch.Tensor]:
+        """Predict actions and return one pooled frozen condition feature per batch item."""
+        return self._predict_action_impl(
+            obs_dict,
+            generator=generator,
+            return_obs_feature=True,
+        )
 
     # ========= Training (Flow Matching Loss) ============
     def set_normalizer(self, normalizer: LinearNormalizer):
