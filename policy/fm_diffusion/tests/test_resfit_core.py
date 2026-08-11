@@ -1,5 +1,6 @@
 import copy
 import unittest
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -18,6 +19,7 @@ from diffusion_policy.model.rl.residual_actor import (
 )
 from diffusion_policy.policy.FPO_image_policy import FPOImagePolicy
 from diffusion_policy.policy.resfit_policy import ResFiTPolicy
+from diffusion_policy.workspace.resfit_robotworkspace import ResFiTWorkspace
 
 
 ACTION_LOW = torch.tensor(
@@ -51,6 +53,66 @@ class _ToyBasePolicy(nn.Module):
             "action": action,
             "obs_feature": obs_dict["encoded"],
         }
+
+
+class _ToyRolloutPolicy(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.base_policy = SimpleNamespace(n_obs_steps=1)
+        self.residual_actor = ResidualActor(
+            feature_dim=4,
+            residual_scale=[0.003, 0.003, 0.003, 0.02, 0.02, 0.02, 0.1] * 2,
+        )
+        self.register_buffer("action_low", ACTION_LOW.clone())
+        self.register_buffer("action_high", ACTION_HIGH.clone())
+
+    def predict_action(self, obs_history):
+        feature = obs_history["encoded"][:, -1]
+        base_action = torch.zeros(feature.shape[0], 14)
+        residual_action = self.residual_actor(feature, base_action)
+        action = compose_bimanual_delta_pose_action(
+            base_action,
+            residual_action,
+            self.action_low,
+            self.action_high,
+        )
+        return {
+            "action": action[:, None],
+            "base_action": base_action,
+            "residual_action": residual_action,
+            "obs_feature": feature,
+        }
+
+
+class _ToyContinuousRunner:
+    def __init__(self, num_envs=2):
+        self.num_envs = num_envs
+        self.device = torch.device("cpu")
+        self.reset_count = 0
+        self.step_count = 0
+
+    def reset(self):
+        self.reset_count += 1
+        return {"encoded": torch.zeros(self.num_envs, 4)}, {}
+
+    def step(self, action):
+        self.step_count += 1
+        obs = {
+            "encoded": torch.full(
+                (self.num_envs, 4),
+                float(self.step_count),
+            )
+        }
+        reward = torch.ones(self.num_envs)
+        done = torch.zeros(self.num_envs, dtype=torch.bool)
+        info = {
+            "reward_stage": torch.zeros(self.num_envs),
+            "success": done,
+        }
+        return obs, reward, done, done.clone(), info
+
+    def reset_at(self, env_ids):
+        raise AssertionError(f"Unexpected reset_at for continuing envs: {env_ids}")
 
 
 class ResfitCoreTest(unittest.TestCase):
@@ -333,6 +395,47 @@ class ResfitCoreTest(unittest.TestCase):
             for before, after in zip(actor_before, actor.parameters(), strict=True)
         )
         self.assertGreater(actor_change, 0.0)
+
+    def test_rollout_state_continues_across_collection_iterations(self):
+        workspace = ResFiTWorkspace.__new__(ResFiTWorkspace)
+        policy = _ToyRolloutPolicy()
+        runner = _ToyContinuousRunner()
+        replay = OnlineReplayBuffer(capacity=16, feature_dim=4, action_dim=14)
+        cfg = SimpleNamespace(
+            training=SimpleNamespace(
+                num_envs=runner.num_envs,
+                exploration_noise_fraction=0.0,
+                exploration_noise_clip_fraction=0.0,
+            )
+        )
+
+        rollout_state = workspace._initialize_rollout_state(policy, runner)
+        first = workspace._collect_online_transitions(
+            policy,
+            runner,
+            replay,
+            cfg,
+            rollout_state,
+            rollout_steps=2,
+        )
+        second = workspace._collect_online_transitions(
+            policy,
+            runner,
+            replay,
+            cfg,
+            rollout_state,
+            rollout_steps=2,
+        )
+
+        self.assertEqual(runner.reset_count, 1)
+        self.assertEqual(runner.step_count, 4)
+        self.assertEqual(len(replay), 8)
+        self.assertEqual(first["transitions"], 4)
+        self.assertEqual(second["transitions"], 4)
+        torch.testing.assert_close(
+            rollout_state["episode_length"],
+            torch.full((runner.num_envs,), 4, dtype=torch.long),
+        )
 
 
 if __name__ == "__main__":

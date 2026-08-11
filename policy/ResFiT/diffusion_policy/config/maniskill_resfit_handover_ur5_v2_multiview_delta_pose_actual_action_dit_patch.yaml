@@ -111,9 +111,11 @@ training:
   base_checkpoint: null
   base_policy_source: ema_model
   num_envs: 8
-  identity_rollout_steps: 2
-  learner_rollout_steps: 2
-  learner_updates: 2
+  identity_rollout_steps: 1
+  learning_starts: 8
+  online_iters: 2
+  rollout_steps_per_iteration: 1
+  updates_per_iteration: 2
   batch_size: 8
   replay_capacity: 1024
   replay_device: cpu
@@ -124,9 +126,19 @@ training:
   exploration_noise_clip_fraction: 0.25
   target_noise_fraction: 0.20
   target_noise_clip_fraction: 0.50
+  checkpoint_every: 1
+  save_final_checkpoint: true
+  resume: false
+  resume_checkpoint: null
+  tqdm_interval_sec: 1.0
   sim_backend: physx_cuda
   render_backend: sapien_cuda
   point_cloud_sampling: fast
+
+logging:
+  tensorboard:
+    enabled: true
+    flush_secs: 10
 
 hydra:
   run:
