@@ -91,12 +91,18 @@ def resfit_td3_update(
     policy_delay: int,
     target_noise_fraction: float,
     target_noise_clip_fraction: float,
+    residual_actor_forward: torch.nn.Module | None = None,
+    critic_forward: torch.nn.Module | None = None,
 ) -> dict[str, float | bool]:
     """Run one critic update and an optional delayed residual-actor update."""
     if critic_update_step <= 0:
         raise ValueError("critic_update_step must be positive.")
     if policy_delay <= 0:
         raise ValueError("policy_delay must be positive.")
+    actor_forward = (
+        residual_actor if residual_actor_forward is None else residual_actor_forward
+    )
+    train_critic_forward = critic if critic_forward is None else critic_forward
 
     with torch.no_grad():
         next_residual = target_residual_actor(
@@ -126,7 +132,7 @@ def resfit_td3_update(
             gamma,
         )
 
-    q1, q2 = critic(batch["obs_feature"], batch["action"])
+    q1, q2 = train_critic_forward(batch["obs_feature"], batch["action"])
     critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
     if not torch.isfinite(critic_loss):
         raise RuntimeError("ResFiT critic loss is NaN or Inf.")
@@ -143,7 +149,7 @@ def resfit_td3_update(
         for parameter in critic_parameters:
             parameter.requires_grad_(False)
         try:
-            actor_residual = residual_actor(
+            actor_residual = actor_forward(
                 batch["obs_feature"],
                 batch["base_action"],
             )

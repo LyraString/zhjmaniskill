@@ -56,6 +56,17 @@ class _ToyBasePolicy(nn.Module):
         }
 
 
+class _ForwardProxy(nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+        self.calls = 0
+
+    def forward(self, *args, **kwargs):
+        self.calls += 1
+        return self.module(*args, **kwargs)
+
+
 class _ToyRolloutPolicy(nn.Module):
     def __init__(self):
         super().__init__()
@@ -461,6 +472,57 @@ class ResfitCoreTest(unittest.TestCase):
             for before, after in zip(actor_before, actor.parameters(), strict=True)
         )
         self.assertGreater(actor_change, 0.0)
+
+    def test_td3_update_uses_distributed_forward_modules(self):
+        torch.manual_seed(11)
+        actor = ResidualActor(
+            feature_dim=4,
+            residual_scale=[0.003, 0.003, 0.003, 0.02, 0.02, 0.02, 0.1] * 2,
+        )
+        critic = TwinQCritic(feature_dim=4, action_dim=14, hidden_dims=(32, 16))
+        target_actor = copy.deepcopy(actor)
+        target_critic = copy.deepcopy(critic)
+        for module in (target_actor, target_critic):
+            for parameter in module.parameters():
+                parameter.requires_grad_(False)
+        actor_forward = _ForwardProxy(actor)
+        critic_forward = _ForwardProxy(critic)
+        actor_optimizer = torch.optim.Adam(actor.parameters(), lr=1e-3)
+        critic_optimizer = torch.optim.Adam(critic.parameters(), lr=1e-3)
+        base_action = ACTION_LOW + torch.rand(8, 14) * (ACTION_HIGH - ACTION_LOW)
+        batch = {
+            "obs_feature": torch.randn(8, 4),
+            "base_action": base_action,
+            "action": base_action.clone(),
+            "reward": torch.randn(8, 1),
+            "next_obs_feature": torch.randn(8, 4),
+            "next_base_action": base_action.clone(),
+            "terminated": torch.zeros(8, 1),
+        }
+
+        result = resfit_td3_update(
+            residual_actor=actor,
+            critic=critic,
+            target_residual_actor=target_actor,
+            target_critic=target_critic,
+            actor_optimizer=actor_optimizer,
+            critic_optimizer=critic_optimizer,
+            batch=batch,
+            action_low=ACTION_LOW,
+            action_high=ACTION_HIGH,
+            gamma=0.99,
+            tau=0.005,
+            critic_update_step=1,
+            policy_delay=1,
+            target_noise_fraction=0.0,
+            target_noise_clip_fraction=0.0,
+            residual_actor_forward=actor_forward,
+            critic_forward=critic_forward,
+        )
+
+        self.assertTrue(result["actor_updated"])
+        self.assertEqual(actor_forward.calls, 1)
+        self.assertEqual(critic_forward.calls, 1)
 
     def test_rollout_state_continues_across_collection_iterations(self):
         workspace = ResFiTWorkspace.__new__(ResFiTWorkspace)

@@ -110,6 +110,7 @@ training:
   device: cuda:0
   base_checkpoint: null
   base_policy_source: ema_model
+  # These capacities are per rank; distributed logs also report global totals.
   num_envs: 8
   identity_rollout_steps: 4
   learning_starts: 2048

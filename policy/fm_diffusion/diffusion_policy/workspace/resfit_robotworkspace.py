@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import os
 import pathlib
@@ -9,8 +10,10 @@ import time
 import hydra
 import numpy as np
 import torch
+import torch.distributed as dist
 import tqdm
 from omegaconf import OmegaConf
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 
 from diffusion_policy.common.json_logger import JsonLogger
@@ -28,9 +31,16 @@ from diffusion_policy.policy.resfit_policy import ResFiTPolicy
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 
 
+def _distributed_context() -> tuple[int, int]:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+
 class ResFiTWorkspace(BaseWorkspace):
     """Online residual fine-tuning workspace for a frozen Flow Matching policy."""
 
+    supports_distributed = True
     include_keys = ("global_step", "epoch", "critic_update_step")
     exclude_keys = ("model", "ema_model")
 
@@ -65,6 +75,9 @@ class ResFiTWorkspace(BaseWorkspace):
 
     def run(self) -> None:
         cfg = copy.deepcopy(self.cfg)
+        rank, world_size = _distributed_context()
+        distributed = world_size > 1
+        is_main_process = rank == 0
         device = torch.device(str(cfg.training.device))
         if device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("The ManiSkill ResFiT identity rollout requires CUDA.")
@@ -115,6 +128,36 @@ class ResFiTWorkspace(BaseWorkspace):
             self.target_residual_actor.eval()
             self.target_critic.eval()
 
+        actor_forward = self.residual_actor
+        critic_forward = self.critic
+        if distributed:
+            if device.index is None:
+                raise RuntimeError(
+                    f"Distributed ResFiT requires an explicit CUDA device, got {device}."
+                )
+            actor_forward = DistributedDataParallel(
+                self.residual_actor,
+                device_ids=[device.index],
+                output_device=device.index,
+                broadcast_buffers=False,
+                gradient_as_bucket_view=True,
+            )
+            critic_forward = DistributedDataParallel(
+                self.critic,
+                device_ids=[device.index],
+                output_device=device.index,
+                broadcast_buffers=False,
+                gradient_as_bucket_view=True,
+            )
+            self._broadcast_module(self.target_residual_actor)
+            self._broadcast_module(self.target_critic)
+
+        process_seed = int(cfg.training.seed) + rank
+        torch.manual_seed(process_seed)
+        torch.cuda.manual_seed(process_seed)
+        np.random.seed(process_seed)
+        random.seed(process_seed)
+
         task_cfg = cfg.task.maniskill
         runner = ManiSkillCudaFPORunner(
             task_name=str(cfg.task.name),
@@ -123,6 +166,8 @@ class ResFiTWorkspace(BaseWorkspace):
             env_id=str(task_cfg.env_id),
             num_envs=int(cfg.training.num_envs),
             base_seed=int(cfg.training.seed),
+            seed_rank=rank,
+            seed_world_size=world_size,
             cuda_device_index=device.index,
             action_type=str(task_cfg.action_type),
             obs_mode=str(task_cfg.obs_mode),
@@ -150,35 +195,49 @@ class ResFiTWorkspace(BaseWorkspace):
                 action_low=runner.action_low,
                 action_high=runner.action_high,
             ).to(device).eval()
+            if is_main_process and distributed:
+                print(
+                    "[ResFiT distributed] "
+                    f"world_size={world_size} "
+                    f"envs_per_rank={int(cfg.training.num_envs)} "
+                    f"global_envs={int(cfg.training.num_envs) * world_size} "
+                    f"batch_size_per_rank={int(cfg.training.batch_size)} "
+                    f"effective_batch_size={int(cfg.training.batch_size) * world_size}"
+                )
             identity_summary = None
             if not resume and int(cfg.training.identity_rollout_steps) > 0:
                 identity_summary = self._run_identity_rollout(policy, runner, cfg)
-                print(
-                    "[ResFiT identity] "
-                    f"checkpoint={checkpoint_path} source={source} "
-                    f"steps={identity_summary['steps']} "
-                    f"envs={identity_summary['num_envs']} "
-                    f"feature_shape={identity_summary['feature_shape']} "
-                    f"residual_abs_max={identity_summary['residual_abs_max']:.3e} "
-                    f"identity_error_max={identity_summary['identity_error_max']:.3e} "
-                    f"action_abs_max={identity_summary['action_abs_max']:.6f}"
-                )
+                if is_main_process:
+                    print(
+                        "[ResFiT identity] "
+                        f"checkpoint={checkpoint_path} source={source} "
+                        f"steps={identity_summary['steps']} "
+                        f"envs={identity_summary['num_envs']} "
+                        f"feature_shape={identity_summary['feature_shape']} "
+                        f"residual_abs_max={identity_summary['residual_abs_max']:.3e} "
+                        f"identity_error_max={identity_summary['identity_error_max']:.3e} "
+                        f"action_abs_max={identity_summary['action_abs_max']:.6f}"
+                    )
             training_summary = self._run_online_training(
                 policy,
                 runner,
                 cfg,
                 device,
+                actor_forward=actor_forward,
+                critic_forward=critic_forward,
+                is_main_process=is_main_process,
             )
         finally:
             runner.close()
 
-        print(
-            "[ResFiT complete] "
-            f"iterations={training_summary['iteration']} "
-            f"global_step={training_summary['global_step']} "
-            f"replay_size={training_summary['replay_size']} "
-            f"checkpoint={training_summary['checkpoint_path']}"
-        )
+        if is_main_process:
+            print(
+                "[ResFiT complete] "
+                f"iterations={training_summary['iteration']} "
+                f"global_step={training_summary['global_step']} "
+                f"replay_size={training_summary['replay_size']} "
+                f"checkpoint={training_summary['checkpoint_path']}"
+            )
 
     @staticmethod
     def _validate_base_checkpoint(payload: dict, cfg: OmegaConf) -> None:
@@ -306,7 +365,18 @@ class ResFiTWorkspace(BaseWorkspace):
             "action_abs_max": action_abs_max,
         }
 
-    def _run_online_training(self, policy, runner, cfg, device: torch.device) -> dict:
+    def _run_online_training(
+        self,
+        policy,
+        runner,
+        cfg,
+        device: torch.device,
+        *,
+        actor_forward: torch.nn.Module,
+        critic_forward: torch.nn.Module,
+        is_main_process: bool,
+    ) -> dict:
+        _, world_size = _distributed_context()
         replay = OnlineReplayBuffer(
             capacity=int(cfg.training.replay_capacity),
             feature_dim=int(cfg.residual_actor.feature_dim),
@@ -336,11 +406,14 @@ class ResFiTWorkspace(BaseWorkspace):
                 rollout_state,
                 rollout_steps,
             )
-            self.global_step += int(warmup_summary["transitions"])
-        print(
-            "[ResFiT warmup] "
-            f"replay_size={len(replay)} global_step={self.global_step}"
-        )
+            self.global_step += int(warmup_summary["transitions"]) * world_size
+        if is_main_process:
+            print(
+                "[ResFiT warmup] "
+                f"replay_size_per_rank={len(replay)} "
+                f"global_replay_size={len(replay) * world_size} "
+                f"global_step={self.global_step}"
+            )
 
         online_iters = int(cfg.training.online_iters)
         start_iteration = int(self.epoch)
@@ -351,32 +424,39 @@ class ResFiTWorkspace(BaseWorkspace):
             )
 
         output_dir = pathlib.Path(self.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        if is_main_process:
+            output_dir.mkdir(parents=True, exist_ok=True)
         tb_cfg = cfg.logging.tensorboard
         tb_writer = (
             SummaryWriter(
                 log_dir=output_dir / "tensorboard",
                 flush_secs=int(tb_cfg.flush_secs),
             )
-            if bool(tb_cfg.enabled)
+            if bool(tb_cfg.enabled) and is_main_process
             else None
         )
         checkpoint_every = int(cfg.training.checkpoint_every)
         last_checkpoint_epoch = -1
         checkpoint_path = ""
         last_log = None
+        json_logger_context = (
+            JsonLogger(str(output_dir / "logs.json.txt"))
+            if is_main_process
+            else contextlib.nullcontext(None)
+        )
         try:
-            with JsonLogger(str(output_dir / "logs.json.txt")) as json_logger:
+            with json_logger_context as json_logger:
                 with tqdm.tqdm(
                     range(start_iteration, online_iters),
                     desc="ResFiT Training",
                     dynamic_ncols=True,
                     mininterval=float(cfg.training.tqdm_interval_sec),
                     leave=True,
+                    disable=not is_main_process,
                 ) as progress:
                     for iteration in progress:
                         started_at = time.perf_counter()
-                        rollout_summary = self._collect_online_transitions(
+                        local_rollout_summary = self._collect_online_transitions(
                             policy,
                             runner,
                             replay,
@@ -384,19 +464,35 @@ class ResFiTWorkspace(BaseWorkspace):
                             rollout_state,
                             int(cfg.training.rollout_steps_per_iteration),
                         )
+                        rollout_summary = self._reduce_rollout_summary(
+                            local_rollout_summary,
+                            device,
+                        )
                         self.global_step += int(rollout_summary["transitions"])
-                        update_summary = self._run_updates(
+                        local_update_summary = self._run_updates(
                             policy,
                             replay,
                             cfg,
                             device,
+                            actor_forward=actor_forward,
+                            critic_forward=critic_forward,
+                        )
+                        update_summary = self._reduce_update_summary(
+                            local_update_summary,
+                            device,
                         )
                         self.epoch = iteration + 1
                         iteration_seconds = time.perf_counter() - started_at
+                        iteration_seconds = self._distributed_scalar(
+                            iteration_seconds,
+                            device,
+                            op=dist.ReduceOp.MAX,
+                        )
                         last_log = {
                             "iteration": self.epoch,
                             "global_step": self.global_step,
-                            "replay_size": len(replay),
+                            "replay_size": len(replay) * world_size,
+                            "replay_size_per_rank": len(replay),
                             "iteration_seconds": iteration_seconds,
                             "iteration_transitions_per_second": (
                                 rollout_summary["transitions"] / iteration_seconds
@@ -404,16 +500,21 @@ class ResFiTWorkspace(BaseWorkspace):
                             **rollout_summary,
                             **update_summary,
                         }
-                        json_logger.log(last_log)
-                        self._write_tensorboard(tb_writer, last_log)
-                        progress.set_postfix(
-                            reward=f"{last_log['reward_mean']:.3f}",
-                            stage=f"{last_log['reward_stage_mean']:.2f}",
-                            critic=f"{last_log['critic_loss']:.3f}",
-                            actor=f"{last_log['actor_loss']:.3f}",
-                        )
+                        if is_main_process:
+                            json_logger.log(last_log)
+                            self._write_tensorboard(tb_writer, last_log)
+                            progress.set_postfix(
+                                reward=f"{last_log['reward_mean']:.3f}",
+                                stage=f"{last_log['reward_stage_mean']:.2f}",
+                                critic=f"{last_log['critic_loss']:.3f}",
+                                actor=f"{last_log['actor_loss']:.3f}",
+                            )
 
-                        if checkpoint_every > 0 and self.epoch % checkpoint_every == 0:
+                        if (
+                            is_main_process
+                            and checkpoint_every > 0
+                            and self.epoch % checkpoint_every == 0
+                        ):
                             checkpoint_path = self.save_checkpoint(
                                 path=output_dir / "checkpoints" / f"{self.epoch}.ckpt",
                                 use_thread=False,
@@ -425,15 +526,32 @@ class ResFiTWorkspace(BaseWorkspace):
 
         if last_log is None:
             raise RuntimeError("ResFiT online loop completed without an iteration.")
-        if bool(cfg.training.save_final_checkpoint) and last_checkpoint_epoch != self.epoch:
+        if (
+            is_main_process
+            and bool(cfg.training.save_final_checkpoint)
+            and last_checkpoint_epoch != self.epoch
+        ):
             checkpoint_path = self.save_checkpoint(
                 path=output_dir / "checkpoints" / f"{self.epoch}.ckpt",
                 use_thread=False,
             )
+        if world_size > 1:
+            shared_checkpoint_path = [checkpoint_path if is_main_process else None]
+            dist.broadcast_object_list(shared_checkpoint_path, src=0)
+            checkpoint_path = shared_checkpoint_path[0] or ""
         last_log["checkpoint_path"] = checkpoint_path
         return last_log
 
-    def _run_updates(self, policy, replay, cfg, device: torch.device) -> dict:
+    def _run_updates(
+        self,
+        policy,
+        replay,
+        cfg,
+        device: torch.device,
+        *,
+        actor_forward: torch.nn.Module,
+        critic_forward: torch.nn.Module,
+    ) -> dict:
         updates = int(cfg.training.updates_per_iteration)
         if updates <= 0:
             raise ValueError("training.updates_per_iteration must be positive.")
@@ -442,6 +560,8 @@ class ResFiTWorkspace(BaseWorkspace):
 
         policy.train()
         self.critic.train()
+        actor_forward.train()
+        critic_forward.train()
         update_logs = []
         for _ in range(updates):
             self.critic_update_step += 1
@@ -467,6 +587,8 @@ class ResFiTWorkspace(BaseWorkspace):
                     target_noise_clip_fraction=float(
                         cfg.training.target_noise_clip_fraction
                     ),
+                    residual_actor_forward=actor_forward,
+                    critic_forward=critic_forward,
                 )
             )
         if any(parameter.grad is not None for parameter in policy.base_policy.parameters()):
@@ -493,6 +615,122 @@ class ResFiTWorkspace(BaseWorkspace):
             "target_action_abs_max": max(
                 log["target_action_abs_max"] for log in update_logs
             ),
+        }
+
+    @staticmethod
+    def _broadcast_module(module: torch.nn.Module) -> None:
+        _, world_size = _distributed_context()
+        if world_size == 1:
+            return
+        with torch.no_grad():
+            for tensor in tuple(module.parameters()) + tuple(module.buffers()):
+                dist.broadcast(tensor, src=0)
+
+    @staticmethod
+    def _distributed_scalar(
+        value: float,
+        device: torch.device,
+        *,
+        op,
+    ) -> float:
+        _, world_size = _distributed_context()
+        if world_size == 1:
+            return float(value)
+        scalar = torch.tensor(float(value), device=device, dtype=torch.float64)
+        dist.all_reduce(scalar, op=op)
+        return float(scalar.item())
+
+    @staticmethod
+    def _reduce_rollout_summary(summary: dict, device: torch.device) -> dict:
+        _, world_size = _distributed_context()
+        if world_size == 1:
+            return summary
+
+        transitions = float(summary["transitions"])
+        completed = float(summary["completed_episodes"])
+        sums = torch.tensor(
+            [
+                transitions,
+                float(summary["reward_mean"]) * transitions,
+                float(summary["terminated_count"]),
+                float(summary["truncated_count"]),
+                float(summary["reward_stage_mean"]) * transitions,
+                completed,
+                float(summary["episode_return_mean"]) * completed,
+                float(summary["episode_length_mean"]) * completed,
+                float(summary["episode_success_rate"]) * completed,
+            ],
+            device=device,
+            dtype=torch.float64,
+        )
+        maxima = torch.tensor(
+            [
+                float(summary["rollout_residual_abs_max"]),
+                float(summary["rollout_action_abs_max"]),
+                float(summary["reward_stage_max"]),
+            ],
+            device=device,
+            dtype=torch.float64,
+        )
+        dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(maxima, op=dist.ReduceOp.MAX)
+
+        global_transitions = max(1.0, float(sums[0].item()))
+        global_completed = float(sums[5].item())
+        completed_denominator = max(1.0, global_completed)
+        return {
+            "transitions": int(sums[0].item()),
+            "reward_mean": float(sums[1].item()) / global_transitions,
+            "terminated_count": int(sums[2].item()),
+            "truncated_count": int(sums[3].item()),
+            "rollout_residual_abs_max": float(maxima[0].item()),
+            "rollout_action_abs_max": float(maxima[1].item()),
+            "reward_stage_mean": float(sums[4].item()) / global_transitions,
+            "reward_stage_max": float(maxima[2].item()),
+            "completed_episodes": int(global_completed),
+            "episode_return_mean": float(sums[6].item()) / completed_denominator,
+            "episode_length_mean": float(sums[7].item()) / completed_denominator,
+            "episode_success_rate": float(sums[8].item()) / completed_denominator,
+        }
+
+    @staticmethod
+    def _reduce_update_summary(summary: dict, device: torch.device) -> dict:
+        _, world_size = _distributed_context()
+        if world_size == 1:
+            return summary
+
+        means = torch.tensor(
+            [
+                float(summary["critic_loss"]),
+                float(summary["actor_loss"]),
+                float(summary["q1_mean"]),
+                float(summary["q2_mean"]),
+                float(summary["target_q_mean"]),
+            ],
+            device=device,
+            dtype=torch.float64,
+        )
+        maxima = torch.tensor(
+            [
+                float(summary["actor_residual_abs_max"]),
+                float(summary["target_action_abs_max"]),
+            ],
+            device=device,
+            dtype=torch.float64,
+        )
+        dist.all_reduce(means, op=dist.ReduceOp.SUM)
+        means /= world_size
+        dist.all_reduce(maxima, op=dist.ReduceOp.MAX)
+        return {
+            "updates": int(summary["updates"]),
+            "actor_updates": int(summary["actor_updates"]),
+            "critic_loss": float(means[0].item()),
+            "actor_loss": float(means[1].item()),
+            "q1_mean": float(means[2].item()),
+            "q2_mean": float(means[3].item()),
+            "target_q_mean": float(means[4].item()),
+            "actor_residual_abs_max": float(maxima[0].item()),
+            "target_action_abs_max": float(maxima[1].item()),
         }
 
     def _initialize_rollout_state(self, policy, runner, cfg) -> dict:
