@@ -1,3 +1,4 @@
+import copy
 import unittest
 
 import torch
@@ -7,6 +8,10 @@ from pytorch3d.transforms import euler_angles_to_matrix
 from diffusion_policy.common.online_replay_buffer import OnlineReplayBuffer
 from diffusion_policy.model.common.normalizer import SingleFieldLinearNormalizer
 from diffusion_policy.model.rl.q_critic import TwinQCritic
+from diffusion_policy.model.rl.resfit_td3 import (
+    compute_resfit_td_target,
+    resfit_td3_update,
+)
 from diffusion_policy.model.rl.residual_actor import (
     ResidualActor,
     compose_bimanual_delta_pose_action,
@@ -237,6 +242,97 @@ class ResfitCoreTest(unittest.TestCase):
         self.assertEqual(sample["action"].shape, (8, 2))
         self.assertTrue(torch.all(sample["reward"] >= 2))
         self.assertTrue(torch.all(sample["reward"] <= 6))
+
+    def test_td_target_bootstraps_time_limit_but_not_termination(self):
+        reward = torch.tensor([[1.0], [1.0]])
+        terminated = torch.tensor([[1.0], [0.0]])
+        next_q = torch.tensor([[5.0], [5.0]])
+
+        target = compute_resfit_td_target(reward, terminated, next_q, gamma=0.9)
+
+        torch.testing.assert_close(
+            target,
+            torch.tensor([[1.0], [5.5]]),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_td3_update_delays_actor_and_keeps_values_finite(self):
+        torch.manual_seed(7)
+        actor = ResidualActor(
+            feature_dim=4,
+            residual_scale=[0.003, 0.003, 0.003, 0.02, 0.02, 0.02, 0.1] * 2,
+        )
+        critic = TwinQCritic(feature_dim=4, action_dim=14, hidden_dims=(32, 16))
+        target_actor = copy.deepcopy(actor)
+        target_critic = copy.deepcopy(critic)
+        for module in (target_actor, target_critic):
+            for parameter in module.parameters():
+                parameter.requires_grad_(False)
+        actor_optimizer = torch.optim.Adam(actor.parameters(), lr=1e-3)
+        critic_optimizer = torch.optim.Adam(critic.parameters(), lr=1e-3)
+
+        batch_size = 8
+        base_action = ACTION_LOW + torch.rand(batch_size, 14) * (
+            ACTION_HIGH - ACTION_LOW
+        )
+        batch = {
+            "obs_feature": torch.randn(batch_size, 4),
+            "base_action": base_action,
+            "action": base_action.clone(),
+            "reward": torch.randn(batch_size, 1),
+            "next_obs_feature": torch.randn(batch_size, 4),
+            "next_base_action": base_action.clone(),
+            "terminated": torch.zeros(batch_size, 1),
+        }
+        actor_before = tuple(parameter.detach().clone() for parameter in actor.parameters())
+
+        first = resfit_td3_update(
+            residual_actor=actor,
+            critic=critic,
+            target_residual_actor=target_actor,
+            target_critic=target_critic,
+            actor_optimizer=actor_optimizer,
+            critic_optimizer=critic_optimizer,
+            batch=batch,
+            action_low=ACTION_LOW,
+            action_high=ACTION_HIGH,
+            gamma=0.99,
+            tau=0.005,
+            critic_update_step=1,
+            policy_delay=2,
+            target_noise_fraction=0.0,
+            target_noise_clip_fraction=0.0,
+        )
+        self.assertFalse(first["actor_updated"])
+        for before, after in zip(actor_before, actor.parameters(), strict=True):
+            torch.testing.assert_close(after, before, rtol=0, atol=0)
+
+        second = resfit_td3_update(
+            residual_actor=actor,
+            critic=critic,
+            target_residual_actor=target_actor,
+            target_critic=target_critic,
+            actor_optimizer=actor_optimizer,
+            critic_optimizer=critic_optimizer,
+            batch=batch,
+            action_low=ACTION_LOW,
+            action_high=ACTION_HIGH,
+            gamma=0.99,
+            tau=0.005,
+            critic_update_step=2,
+            policy_delay=2,
+            target_noise_fraction=0.0,
+            target_noise_clip_fraction=0.0,
+        )
+        self.assertTrue(second["actor_updated"])
+        self.assertTrue(torch.isfinite(torch.tensor(second["critic_loss"])))
+        self.assertTrue(torch.isfinite(torch.tensor(second["actor_loss"])))
+        actor_change = max(
+            float((after.detach() - before).abs().amax().item())
+            for before, after in zip(actor_before, actor.parameters(), strict=True)
+        )
+        self.assertGreater(actor_change, 0.0)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,133 @@
+name: maniskill_resfit_handover_ur5_v2_multiview_delta_pose_actual_action_dit_patch
+_target_: diffusion_policy.workspace.resfit_robotworkspace.ResFiTWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+horizon: 8
+n_obs_steps: 3
+n_action_steps: 1
+obs_as_global_cond: true
+
+task:
+  name: handover_block_ur5_v2_multiview_delta_pose_actual
+  maniskill:
+    profile: handover_block_ur5_v2_multiview_delta_pose_actual
+    env_id: HandoverBlockUR5-v2
+    action_type: bimanual_pd_ee_delta_pose
+    obs_mode: pointcloud+state_dict
+    control_mode: bimanual_pd_ee_delta_pose
+    render_mode: null
+    reward_mode: normalized_dense
+    robot_uids: null
+    sim_freq: 200
+    control_freq: 20
+  shape_meta: &shape_meta
+    obs:
+      head_point_cloud:
+        shape: [1024, 3]
+        type: point_cloud
+      left_wrist_point_cloud:
+        shape: [512, 3]
+        type: point_cloud
+      right_wrist_point_cloud:
+        shape: [512, 3]
+        type: point_cloud
+      agent_pos:
+        shape: [14]
+        type: low_dim
+    action:
+      shape: [14]
+
+policy:
+  _target_: diffusion_policy.policy.FPO_image_policy.FPOImagePolicy
+  shape_meta: ${shape_meta}
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.pointcloud_obs_encoder.MultiViewPointCloudPatchTokenObsEncoder
+    shape_meta: ${shape_meta}
+    pointnet_out_dim: 512
+    point_feature_dim: 256
+    view_token_counts: [12, 6, 6]
+    neighbors_per_patch: 32
+    ignore_zero_points: true
+    use_layernorm: true
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 10
+  obs_as_global_cond: ${obs_as_global_cond}
+  sigma_min: 0.0
+  ode_solver: euler
+  denoiser_type: action_dit
+  action_dit:
+    view_feature_dim: 512
+    num_views: 3
+    view_token_counts: [12, 6, 6]
+    use_spatial_token_embedding: false
+    num_arms: 2
+    proprio_dim_per_arm: 7
+    condition_depth: 4
+    condition_num_heads: 12
+    hidden_dim: 768
+    depth: 12
+    num_heads: 12
+    mlp_ratio: 4.0
+    dropout: 0.05
+
+residual_actor:
+  _target_: diffusion_policy.model.rl.residual_actor.ResidualActor
+  feature_dim: 768
+  action_dim: 14
+  hidden_dims: [256, 256]
+  residual_scale: [0.003, 0.003, 0.003, 0.02, 0.02, 0.02, 0.10,
+                   0.003, 0.003, 0.003, 0.02, 0.02, 0.02, 0.10]
+  activation: silu
+  use_layer_norm: true
+
+critic:
+  _target_: diffusion_policy.model.rl.q_critic.TwinQCritic
+  feature_dim: 768
+  action_dim: 14
+  hidden_dims: [512, 512, 256]
+  activation: silu
+  use_layer_norm: true
+
+actor_optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+
+critic_optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+
+training:
+  seed: 114514
+  device: cuda:0
+  base_checkpoint: null
+  base_policy_source: ema_model
+  num_envs: 8
+  identity_rollout_steps: 2
+  learner_rollout_steps: 2
+  learner_updates: 2
+  batch_size: 8
+  replay_capacity: 1024
+  replay_device: cpu
+  gamma: 0.99
+  tau: 0.005
+  policy_delay: 2
+  exploration_noise_fraction: 0.10
+  exploration_noise_clip_fraction: 0.25
+  target_noise_fraction: 0.20
+  target_noise_clip_fraction: 0.50
+  sim_backend: physx_cuda
+  render_backend: sapien_cuda
+  point_cloud_sampling: fast
+
+hydra:
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}

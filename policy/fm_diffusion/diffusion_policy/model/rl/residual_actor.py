@@ -114,6 +114,8 @@ class ResidualActor(nn.Module):
 
         self.network = nn.Sequential(*layers)
         self.register_buffer("residual_scale", scale)
+        self.feature_dim = int(feature_dim)
+        self.action_dim = int(action_dim)
 
     def forward(
         self,
