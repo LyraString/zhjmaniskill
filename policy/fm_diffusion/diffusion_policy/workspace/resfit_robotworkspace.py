@@ -264,7 +264,9 @@ class ResFiTWorkspace(BaseWorkspace):
                 raise RuntimeError("ResFiT identity rollout produced NaN or Inf values.")
 
             residual_max = float(residual_action.abs().amax().item())
-            identity_error = float((action - expected_action).abs().amax().item())
+            identity_error = float(
+                (result["action"] - expected_action).abs().amax().item()
+            )
             if residual_max != 0.0:
                 raise RuntimeError(
                     f"Zero-initialized residual actor produced non-zero output: {residual_max}."
@@ -318,7 +320,7 @@ class ResFiTWorkspace(BaseWorkspace):
         if learning_starts > replay.capacity:
             raise ValueError("training.learning_starts must not exceed replay_capacity.")
 
-        rollout_state = self._initialize_rollout_state(policy, runner)
+        rollout_state = self._initialize_rollout_state(policy, runner, cfg)
         while len(replay) < learning_starts:
             missing = learning_starts - len(replay)
             rollout_steps = max(
@@ -493,15 +495,17 @@ class ResFiTWorkspace(BaseWorkspace):
             ),
         }
 
-    def _initialize_rollout_state(self, policy, runner) -> dict:
+    def _initialize_rollout_state(self, policy, runner, cfg) -> dict:
         obs, _ = runner.reset()
         obs_history = self._init_obs_history(obs, int(policy.base_policy.n_obs_steps))
         policy.eval()
         with torch.inference_mode():
-            current_result = policy.predict_action(obs_history)
+            base_result = policy.predict_base_action_chunk(obs_history)
+            current_result = self._prepare_rollout_chunk(policy, base_result, cfg)
         return {
             "obs_history": obs_history,
             "current_result": current_result,
+            "chunk_index": 0,
             "episode_return": torch.zeros(
                 runner.num_envs,
                 device=runner.device,
@@ -528,6 +532,7 @@ class ResFiTWorkspace(BaseWorkspace):
 
         obs_history = rollout_state["obs_history"]
         current_result = rollout_state["current_result"]
+        chunk_index = int(rollout_state["chunk_index"])
         policy.eval()
 
         reward_sum = 0.0
@@ -542,25 +547,16 @@ class ResFiTWorkspace(BaseWorkspace):
         completed_lengths = []
         completed_successes = []
         for _ in range(rollout_steps):
-            with torch.inference_mode():
-                current_residual = policy.residual_actor(
-                    current_result["obs_feature"],
-                    current_result["base_action"],
+            base_action_sequence = current_result["base_action"]
+            if not 0 <= chunk_index < base_action_sequence.shape[1]:
+                raise RuntimeError(
+                    f"Invalid ResFiT action chunk index {chunk_index} for "
+                    f"shape {tuple(base_action_sequence.shape)}."
                 )
-                residual_action = add_bounded_residual_noise(
-                    current_residual,
-                    policy.residual_actor.residual_scale,
-                    noise_fraction=float(cfg.training.exploration_noise_fraction),
-                    noise_clip_fraction=float(
-                        cfg.training.exploration_noise_clip_fraction
-                    ),
-                )
-                action = compose_bimanual_delta_pose_action(
-                    current_result["base_action"],
-                    residual_action,
-                    policy.action_low,
-                    policy.action_high,
-                )
+            obs_feature = current_result["obs_feature"]
+            base_action = base_action_sequence[:, chunk_index]
+            residual_action = current_result["residual_action"][:, chunk_index]
+            action = current_result["action"][:, chunk_index]
             if not torch.isfinite(action).all():
                 raise RuntimeError("ResFiT rollout action contains NaN or Inf values.")
             if torch.any(action < policy.action_low) or torch.any(action > policy.action_high):
@@ -568,16 +564,35 @@ class ResFiTWorkspace(BaseWorkspace):
 
             next_obs, reward, terminated, truncated, info = runner.step(action)
             next_obs_history = self._append_obs_history(obs_history, next_obs)
-            with torch.inference_mode():
-                next_result = policy.predict_action(next_obs_history)
+            done_ids = torch.logical_or(terminated, truncated).nonzero(
+                as_tuple=False
+            ).flatten()
+            next_chunk_index = chunk_index + 1
+            refresh_chunk = (
+                next_chunk_index >= base_action_sequence.shape[1]
+                or done_ids.numel() > 0
+            )
+            if refresh_chunk:
+                with torch.inference_mode():
+                    transition_next_result = policy.predict_base_action_chunk(
+                        next_obs_history
+                    )
+                transition_next_index = 0
+            else:
+                transition_next_result = current_result
+                transition_next_index = next_chunk_index
+            next_obs_feature = transition_next_result["obs_feature"]
+            next_base_action = transition_next_result["base_action"][
+                :, transition_next_index
+            ]
 
             replay.add_batch(
-                obs_feature=current_result["obs_feature"].detach(),
-                base_action=current_result["base_action"].detach(),
+                obs_feature=obs_feature.detach(),
+                base_action=base_action.detach(),
                 action=action.detach(),
                 reward=reward.detach().to(dtype=torch.float32),
-                next_obs_feature=next_result["obs_feature"].detach(),
-                next_base_action=next_result["base_action"].detach(),
+                next_obs_feature=next_obs_feature.detach(),
+                next_base_action=next_base_action.detach(),
                 terminated=terminated.detach().to(dtype=torch.float32),
             )
 
@@ -601,9 +616,6 @@ class ResFiTWorkspace(BaseWorkspace):
                 float(action.detach().abs().amax().item()),
             )
 
-            done_ids = torch.logical_or(terminated, truncated).nonzero(
-                as_tuple=False
-            ).flatten()
             if done_ids.numel() > 0:
                 completed_returns.extend(
                     rollout_state["episode_return"][done_ids].detach().cpu().tolist()
@@ -621,14 +633,42 @@ class ResFiTWorkspace(BaseWorkspace):
                 self._reset_obs_history(next_obs_history, reset_obs, done_ids)
                 rollout_state["episode_return"][done_ids] = 0.0
                 rollout_state["episode_length"][done_ids] = 0
+                reset_obs_history = {
+                    key: value.index_select(0, done_ids)
+                    for key, value in next_obs_history.items()
+                }
                 with torch.inference_mode():
-                    current_result = policy.predict_action(next_obs_history)
+                    reset_result = policy.predict_base_action_chunk(
+                        reset_obs_history
+                    )
+                current_result = {
+                    key: value.clone()
+                    for key, value in transition_next_result.items()
+                    if key in ("base_action", "obs_feature")
+                }
+                for key, value in current_result.items():
+                    value.index_copy_(0, done_ids, reset_result[key])
+                current_result = self._prepare_rollout_chunk(
+                    policy,
+                    current_result,
+                    cfg,
+                )
+                chunk_index = 0
             else:
-                current_result = next_result
+                if refresh_chunk:
+                    current_result = self._prepare_rollout_chunk(
+                        policy,
+                        transition_next_result,
+                        cfg,
+                    )
+                else:
+                    current_result = transition_next_result
+                chunk_index = transition_next_index
             obs_history = next_obs_history
 
         rollout_state["obs_history"] = obs_history
         rollout_state["current_result"] = current_result
+        rollout_state["chunk_index"] = chunk_index
         transitions = rollout_steps * int(cfg.training.num_envs)
         return {
             "transitions": transitions,
@@ -649,6 +689,41 @@ class ResFiTWorkspace(BaseWorkspace):
             "episode_success_rate": (
                 float(np.mean(completed_successes)) if completed_successes else 0.0
             ),
+        }
+
+    @staticmethod
+    def _prepare_rollout_chunk(policy, base_result, cfg) -> dict[str, torch.Tensor]:
+        base_action = base_result["base_action"]
+        obs_feature = base_result["obs_feature"]
+        feature_sequence = obs_feature[:, None, :].expand(
+            -1,
+            base_action.shape[1],
+            -1,
+        )
+        with torch.inference_mode():
+            current_residual = policy.residual_actor(
+                feature_sequence,
+                base_action,
+            )
+            residual_action = add_bounded_residual_noise(
+                current_residual,
+                policy.residual_actor.residual_scale,
+                noise_fraction=float(cfg.training.exploration_noise_fraction),
+                noise_clip_fraction=float(
+                    cfg.training.exploration_noise_clip_fraction
+                ),
+            )
+            action = compose_bimanual_delta_pose_action(
+                base_action,
+                residual_action,
+                policy.action_low,
+                policy.action_high,
+            )
+        return {
+            "base_action": base_action,
+            "obs_feature": obs_feature,
+            "residual_action": residual_action,
+            "action": action,
         }
 
     @staticmethod

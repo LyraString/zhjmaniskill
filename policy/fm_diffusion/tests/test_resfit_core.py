@@ -40,15 +40,16 @@ class _ToyObsEncoder(nn.Module):
 
 
 class _ToyBasePolicy(nn.Module):
-    def __init__(self):
+    def __init__(self, n_action_steps=1):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(()))
+        self.n_action_steps = int(n_action_steps)
 
     def predict_action_with_feature(self, obs_dict, *, generator=None):
         del generator
         batch_size = obs_dict["encoded"].shape[0]
-        action = torch.zeros(batch_size, 1, 14)
-        action[:, 0, 0] = 0.01 * self.weight
+        action = torch.zeros(batch_size, self.n_action_steps, 14)
+        action[:, :, 0] = 0.01 * self.weight
         return {
             "action": action,
             "obs_feature": obs_dict["encoded"],
@@ -58,7 +59,8 @@ class _ToyBasePolicy(nn.Module):
 class _ToyRolloutPolicy(nn.Module):
     def __init__(self):
         super().__init__()
-        self.base_policy = SimpleNamespace(n_obs_steps=1)
+        self.base_policy = SimpleNamespace(n_obs_steps=1, n_action_steps=4)
+        self.base_predict_count = 0
         self.residual_actor = ResidualActor(
             feature_dim=4,
             residual_scale=[0.003, 0.003, 0.003, 0.02, 0.02, 0.02, 0.1] * 2,
@@ -66,10 +68,25 @@ class _ToyRolloutPolicy(nn.Module):
         self.register_buffer("action_low", ACTION_LOW.clone())
         self.register_buffer("action_high", ACTION_HIGH.clone())
 
-    def predict_action(self, obs_history):
+    def predict_base_action_chunk(self, obs_history):
+        self.base_predict_count += 1
         feature = obs_history["encoded"][:, -1]
-        base_action = torch.zeros(feature.shape[0], 14)
-        residual_action = self.residual_actor(feature, base_action)
+        base_action = torch.zeros(
+            feature.shape[0],
+            self.base_policy.n_action_steps,
+            14,
+        )
+        return {
+            "base_action": base_action,
+            "obs_feature": feature,
+        }
+
+    def predict_action(self, obs_history):
+        result = self.predict_base_action_chunk(obs_history)
+        base_action = result["base_action"]
+        feature = result["obs_feature"]
+        feature_sequence = feature[:, None, :].expand(-1, base_action.shape[1], -1)
+        residual_action = self.residual_actor(feature_sequence, base_action)
         action = compose_bimanual_delta_pose_action(
             base_action,
             residual_action,
@@ -77,7 +94,7 @@ class _ToyRolloutPolicy(nn.Module):
             self.action_high,
         )
         return {
-            "action": action[:, None],
+            "action": action,
             "base_action": base_action,
             "residual_action": residual_action,
             "obs_feature": feature,
@@ -113,6 +130,29 @@ class _ToyContinuousRunner:
 
     def reset_at(self, env_ids):
         raise AssertionError(f"Unexpected reset_at for continuing envs: {env_ids}")
+
+
+class _ToyPartialDoneRunner(_ToyContinuousRunner):
+    def step(self, action):
+        del action
+        self.step_count += 1
+        obs = {"encoded": torch.ones(self.num_envs, 4)}
+        reward = torch.ones(self.num_envs)
+        terminated = torch.tensor([True, False])
+        truncated = torch.zeros(self.num_envs, dtype=torch.bool)
+        info = {
+            "reward_stage": torch.zeros(self.num_envs),
+            "success": terminated,
+        }
+        return obs, reward, terminated, truncated, info
+
+    def reset_at(self, env_ids):
+        self.reset_count += 1
+        if env_ids != [0]:
+            raise AssertionError(f"Expected only env 0 to reset, got {env_ids}.")
+        obs = {"encoded": torch.zeros(self.num_envs, 4)}
+        obs["encoded"][0] = 100.0
+        return obs, {}
 
 
 class ResfitCoreTest(unittest.TestCase):
@@ -261,9 +301,10 @@ class ResfitCoreTest(unittest.TestCase):
         self.assertFalse(base_policy.training)
         self.assertTrue(all(not parameter.requires_grad for parameter in base_policy.parameters()))
         self.assertEqual(result["action"].shape, (3, 1, 14))
+        self.assertEqual(result["base_action"].shape, (3, 1, 14))
         self.assertEqual(result["obs_feature"].shape, (3, 4))
         torch.testing.assert_close(
-            result["action"][:, 0],
+            result["action"],
             result["base_action"],
             rtol=0,
             atol=0,
@@ -279,6 +320,29 @@ class ResfitCoreTest(unittest.TestCase):
         actor_output_layer = residual_actor.network[-1]
         self.assertIsNotNone(actor_output_layer.weight.grad)
         self.assertGreater(torch.linalg.vector_norm(actor_output_layer.weight.grad).item(), 0.0)
+
+    def test_resfit_policy_corrects_all_action_chunk_slots(self):
+        policy = ResFiTPolicy(
+            base_policy=_ToyBasePolicy(n_action_steps=4),
+            residual_actor=ResidualActor(
+                feature_dim=4,
+                residual_scale=[0.003, 0.003, 0.003, 0.02, 0.02, 0.02, 0.1] * 2,
+            ),
+            action_low=ACTION_LOW,
+            action_high=ACTION_HIGH,
+        )
+
+        result = policy.predict_action({"encoded": torch.randn(3, 4)})
+
+        self.assertEqual(result["action"].shape, (3, 4, 14))
+        self.assertEqual(result["base_action"].shape, (3, 4, 14))
+        self.assertEqual(result["residual_action"].shape, (3, 4, 14))
+        torch.testing.assert_close(
+            result["action"],
+            result["base_action"],
+            rtol=0,
+            atol=0,
+        )
 
     def test_online_replay_buffer_wraps_and_samples(self):
         buffer = OnlineReplayBuffer(capacity=5, feature_dim=3, action_dim=2)
@@ -411,7 +475,7 @@ class ResfitCoreTest(unittest.TestCase):
             )
         )
 
-        rollout_state = workspace._initialize_rollout_state(policy, runner)
+        rollout_state = workspace._initialize_rollout_state(policy, runner, cfg)
         first = workspace._collect_online_transitions(
             policy,
             runner,
@@ -420,6 +484,8 @@ class ResfitCoreTest(unittest.TestCase):
             rollout_state,
             rollout_steps=2,
         )
+        with torch.no_grad():
+            policy.residual_actor.network[-1].bias.fill_(1.0)
         second = workspace._collect_online_transitions(
             policy,
             runner,
@@ -434,9 +500,53 @@ class ResfitCoreTest(unittest.TestCase):
         self.assertEqual(len(replay), 8)
         self.assertEqual(first["transitions"], 4)
         self.assertEqual(second["transitions"], 4)
+        self.assertEqual(policy.base_predict_count, 2)
+        self.assertEqual(rollout_state["chunk_index"], 0)
+        torch.testing.assert_close(
+            replay._storage["action"][:8],
+            torch.zeros(8, 14),
+        )
+        self.assertGreater(
+            float(rollout_state["current_result"]["residual_action"].abs().amax()),
+            0.0,
+        )
         torch.testing.assert_close(
             rollout_state["episode_length"],
             torch.full((runner.num_envs,), 4, dtype=torch.long),
+        )
+
+    def test_partial_reset_only_replaces_finished_env_action_chunk(self):
+        workspace = ResFiTWorkspace.__new__(ResFiTWorkspace)
+        policy = _ToyRolloutPolicy()
+        runner = _ToyPartialDoneRunner()
+        replay = OnlineReplayBuffer(capacity=8, feature_dim=4, action_dim=14)
+        cfg = SimpleNamespace(
+            training=SimpleNamespace(
+                num_envs=runner.num_envs,
+                exploration_noise_fraction=0.0,
+                exploration_noise_clip_fraction=0.0,
+            )
+        )
+
+        rollout_state = workspace._initialize_rollout_state(policy, runner, cfg)
+        workspace._collect_online_transitions(
+            policy,
+            runner,
+            replay,
+            cfg,
+            rollout_state,
+            rollout_steps=1,
+        )
+
+        self.assertEqual(policy.base_predict_count, 3)
+        self.assertEqual(rollout_state["chunk_index"], 0)
+        torch.testing.assert_close(
+            replay._storage["next_obs_feature"][:2],
+            torch.ones(2, 4),
+        )
+        torch.testing.assert_close(
+            rollout_state["current_result"]["obs_feature"],
+            torch.tensor([[100.0] * 4, [1.0] * 4]),
         )
 
 

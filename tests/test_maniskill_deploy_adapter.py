@@ -107,7 +107,7 @@ class ManiSkillDeployAdapterTest(unittest.TestCase):
                 model = resfit_deploy.get_model(
                     {
                         "ckpt_path": ckpt.name,
-                        "n_action_steps": 1,
+                        "n_action_steps": 4,
                         "action_low": action_low,
                         "action_high": action_high,
                     }
@@ -116,29 +116,11 @@ class ManiSkillDeployAdapterTest(unittest.TestCase):
         dp_cls.assert_called_once_with(
             ckpt.name,
             n_obs_steps=3,
-            n_action_steps=1,
+            n_action_steps=4,
             action_low=action_low,
             action_high=action_high,
         )
         self.assertIs(model, loaded_model)
-
-    def test_resfit_rejects_action_chunks(self) -> None:
-        cfg = SimpleNamespace(n_obs_steps=3, n_action_steps=1)
-        with tempfile.NamedTemporaryFile() as ckpt:
-            with mock.patch.object(
-                resfit_deploy.torch,
-                "load",
-                return_value={"cfg": cfg},
-            ):
-                with self.assertRaisesRegex(ValueError, "only supports n_action_steps=1"):
-                    resfit_deploy.get_model(
-                        {
-                            "ckpt_path": ckpt.name,
-                            "n_action_steps": 4,
-                            "action_low": np.full(14, -1.0, dtype=np.float32),
-                            "action_high": np.full(14, 1.0, dtype=np.float32),
-                        }
-                    )
 
 
 if __name__ == "__main__":

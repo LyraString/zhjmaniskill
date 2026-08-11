@@ -26,6 +26,7 @@ class DP:
     ) -> None:
         self.policy = self.get_policy(
             ckpt_file,
+            n_action_steps=n_action_steps,
             action_low=action_low,
             action_high=action_high,
             device="cuda:0",
@@ -50,7 +51,7 @@ class DP:
         return self.runner.obs[-1]
 
     @staticmethod
-    def get_policy(checkpoint, action_low, action_high, device):
+    def get_policy(checkpoint, n_action_steps, action_low, action_high, device):
         checkpoint_path = pathlib.Path(checkpoint).expanduser()
         with checkpoint_path.open("rb") as file:
             payload = torch.load(file, pickle_module=dill, map_location="cpu")
@@ -92,7 +93,7 @@ class DP:
             base_policy = workspace.model
         else:
             raise ValueError("training.base_policy_source must be `model` or `ema_model`.")
-        base_policy.n_action_steps = int(cfg.n_action_steps)
+        base_policy.n_action_steps = int(n_action_steps)
 
         policy = ResFiTPolicy(
             base_policy=base_policy,

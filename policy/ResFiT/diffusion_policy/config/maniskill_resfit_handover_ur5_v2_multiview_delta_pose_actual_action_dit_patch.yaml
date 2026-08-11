@@ -5,7 +5,7 @@ task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 horizon: 8
 n_obs_steps: 3
-n_action_steps: 1
+n_action_steps: 4
 obs_as_global_cond: true
 
 task:
@@ -111,13 +111,13 @@ training:
   base_checkpoint: null
   base_policy_source: ema_model
   num_envs: 8
-  identity_rollout_steps: 1
-  learning_starts: 8
-  online_iters: 2
-  rollout_steps_per_iteration: 1
-  updates_per_iteration: 2
-  batch_size: 8
-  replay_capacity: 1024
+  identity_rollout_steps: 4
+  learning_starts: 2048
+  online_iters: 500
+  rollout_steps_per_iteration: 4
+  updates_per_iteration: 32
+  batch_size: 256
+  replay_capacity: 100000
   replay_device: cpu
   gamma: 0.99
   tau: 0.005
@@ -126,7 +126,7 @@ training:
   exploration_noise_clip_fraction: 0.25
   target_noise_fraction: 0.20
   target_noise_clip_fraction: 0.50
-  checkpoint_every: 1
+  checkpoint_every: 100
   save_final_checkpoint: true
   resume: false
   resume_checkpoint: null

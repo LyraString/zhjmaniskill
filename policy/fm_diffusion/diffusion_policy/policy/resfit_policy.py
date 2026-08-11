@@ -63,30 +63,63 @@ class ResFiTPolicy(nn.Module):
         *,
         generator=None,
     ) -> Dict[str, torch.Tensor]:
+        base_result = self.predict_base_action_chunk(
+            obs_dict,
+            generator=generator,
+        )
+        base_action_sequence = base_result["base_action"]
+        obs_feature = base_result["obs_feature"]
+        feature_sequence = obs_feature[:, None, :].expand(
+            -1,
+            base_action_sequence.shape[1],
+            -1,
+        )
+        residual_action = self.residual_actor(
+            feature_sequence,
+            base_action_sequence,
+        )
+        action = compose_bimanual_delta_pose_action(
+            base_action_sequence,
+            residual_action,
+            self.action_low,
+            self.action_high,
+        )
+        return {
+            "action": action,
+            "base_action": base_action_sequence,
+            "residual_action": residual_action,
+            "obs_feature": obs_feature,
+        }
+
+    def predict_base_action_chunk(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        *,
+        generator=None,
+    ) -> Dict[str, torch.Tensor]:
         with torch.no_grad():
             base_result = self.base_policy.predict_action_with_feature(
                 obs_dict,
                 generator=generator,
             )
         base_action_sequence = base_result["action"]
-        if base_action_sequence.ndim != 3 or base_action_sequence.shape[1:] != (1, 14):
+        if (
+            base_action_sequence.ndim != 3
+            or base_action_sequence.shape[1] < 1
+            or base_action_sequence.shape[2] != 14
+        ):
             raise ValueError(
-                "ResFiT v0 requires base actions with shape [B, 1, 14], got "
+                "ResFiT requires base actions with shape [B, K, 14] and K >= 1, got "
                 f"{tuple(base_action_sequence.shape)}."
             )
 
-        base_action = base_action_sequence[:, 0]
         obs_feature = base_result["obs_feature"].detach()
-        residual_action = self.residual_actor(obs_feature, base_action)
-        action = compose_bimanual_delta_pose_action(
-            base_action,
-            residual_action,
-            self.action_low,
-            self.action_high,
-        )
+        if obs_feature.ndim != 2 or obs_feature.shape[0] != base_action_sequence.shape[0]:
+            raise ValueError(
+                "ResFiT requires pooled observation features with shape [B, F], got "
+                f"{tuple(obs_feature.shape)}."
+            )
         return {
-            "action": action[:, None],
-            "base_action": base_action,
-            "residual_action": residual_action,
+            "base_action": base_action_sequence.detach(),
             "obs_feature": obs_feature,
         }

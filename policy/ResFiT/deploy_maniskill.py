@@ -27,11 +27,6 @@ def get_model(usr_args):
         payload = torch.load(file, pickle_module=dill, map_location="cpu")
     cfg = payload["cfg"]
     n_action_steps = int(usr_args.get("n_action_steps", cfg.n_action_steps))
-    if n_action_steps != 1:
-        raise ValueError(
-            "ResFiT v0 only supports n_action_steps=1; "
-            f"got {n_action_steps}."
-        )
     if "action_low" not in usr_args or "action_high" not in usr_args:
         raise ValueError("ResFiT deployment requires environment action bounds.")
 
