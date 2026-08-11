@@ -23,13 +23,17 @@ def encode_obs(observation):
 
 def get_model(usr_args):
     ckpt_file = usr_args["ckpt_path"]
-    payload = torch.load(open(ckpt_file, "rb"), pickle_module=dill, map_location="cpu")
+    with open(ckpt_file, "rb") as file:
+        payload = torch.load(file, pickle_module=dill, map_location="cpu")
     cfg = payload["cfg"]
-    return DP(
+    n_action_steps = int(usr_args.get("n_action_steps", cfg.n_action_steps))
+    model = DP(
         ckpt_file,
         n_obs_steps=int(cfg.n_obs_steps),
-        n_action_steps=int(cfg.n_action_steps),
+        n_action_steps=n_action_steps,
     )
+    model.policy.n_action_steps = n_action_steps
+    return model
 
 
 def reset_model(model):

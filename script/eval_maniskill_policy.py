@@ -30,6 +30,7 @@ from sim.maniskill.task_profiles import resolve_runtime_control_mode, resolve_ru
 ADAPTER_MODULES = {
     "flowmatching": "policy.FlowMatching.deploy_maniskill",
     "fpo": "policy.FPO.deploy_maniskill",
+    "resfit": "policy.ResFiT.deploy_maniskill",
 }
 
 
@@ -563,6 +564,25 @@ def _format_optional_bool(value) -> str:
     return str(int(bool(value)))
 
 
+def _resolve_n_action_steps(ckpt_cfg, override: int | None) -> int:
+    checkpoint_steps = int(ckpt_cfg.n_action_steps)
+    if override is None:
+        return checkpoint_steps
+    if override < 1:
+        raise ValueError(f"--n-action-steps must be >= 1, got {override}.")
+
+    horizon = int(ckpt_cfg.horizon)
+    n_obs_steps = int(ckpt_cfg.n_obs_steps)
+    available_steps = horizon - (n_obs_steps - 1)
+    if override > available_steps:
+        raise ValueError(
+            "--n-action-steps exceeds the executable part of the predicted horizon: "
+            f"requested={override}, available={available_steps}, "
+            f"horizon={horizon}, n_obs_steps={n_obs_steps}."
+        )
+    return int(override)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate a ManiSkill checkpoint in a ManiSkill env.")
     parser.add_argument("policy_kind", choices=sorted(ADAPTER_MODULES.keys()))
@@ -582,6 +602,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robot-uids", type=str, default=None)
     parser.add_argument("--sim-freq", type=int, default=None)
     parser.add_argument("--control-freq", type=int, default=None)
+    parser.add_argument(
+        "--n-action-steps",
+        type=int,
+        default=None,
+        help="Override how many predicted actions are executed before the next policy inference.",
+    )
     parser.add_argument("--save-video-dir", type=str, default=None)
     parser.add_argument("--video-fps", type=int, default=10)
     parser.add_argument(
@@ -624,7 +650,7 @@ def run_evaluation(args) -> None:
     adapter = importlib.import_module(ADAPTER_MODULES[args.policy_kind])
     payload = torch.load(open(args.ckpt_path, "rb"), pickle_module=dill, map_location="cpu")
     ckpt_cfg = payload["cfg"]
-    model = adapter.get_model({"ckpt_path": args.ckpt_path})
+    n_action_steps = _resolve_n_action_steps(ckpt_cfg, args.n_action_steps)
     runtime_env_id = args.task_name
     if args.task_profile is not None and args.task_name == args.task_profile:
         runtime_env_id = None
@@ -661,6 +687,24 @@ def run_evaluation(args) -> None:
     env = ManiSkillTaskFactory().create_env(
         task_name=runtime_task_name,
         **resolved_runtime,
+    )
+    try:
+        model = adapter.get_model(
+            {
+                "ckpt_path": args.ckpt_path,
+                "n_action_steps": n_action_steps,
+                "action_low": np.asarray(env.action_space.low, dtype=np.float32),
+                "action_high": np.asarray(env.action_space.high, dtype=np.float32),
+            }
+        )
+    except BaseException:
+        env.close()
+        raise
+    print(
+        "action_chunk "
+        f"predicted_horizon={int(ckpt_cfg.horizon)} "
+        f"executed_steps={n_action_steps} "
+        f"checkpoint_executed_steps={int(ckpt_cfg.n_action_steps)}"
     )
     delta_pose_hold_filter = None
     if args.delta_pose_hold_mode != "off":

@@ -39,6 +39,14 @@ class ResFiTPolicy(nn.Module):
         self.register_buffer("action_high", action_high)
         self._freeze_base_policy()
 
+    @property
+    def device(self) -> torch.device:
+        return self.action_low.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.action_low.dtype
+
     def _freeze_base_policy(self) -> None:
         self.base_policy.eval()
         for parameter in self.base_policy.parameters():

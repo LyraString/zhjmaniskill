@@ -256,6 +256,8 @@ class ResfitCoreTest(unittest.TestCase):
 
         result = policy.predict_action({"encoded": torch.randn(3, 4)})
 
+        self.assertEqual(policy.device, ACTION_LOW.device)
+        self.assertEqual(policy.dtype, ACTION_LOW.dtype)
         self.assertFalse(base_policy.training)
         self.assertTrue(all(not parameter.requires_grad for parameter in base_policy.parameters()))
         self.assertEqual(result["action"].shape, (3, 1, 14))
