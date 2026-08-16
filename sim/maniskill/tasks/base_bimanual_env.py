@@ -17,6 +17,11 @@ from mani_skill.utils import common
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
 from mani_skill.utils.building.ground import build_ground
+from mani_skill.utils.geometry.rotation_conversions import (
+    euler_angles_to_matrix,
+    matrix_to_euler_angles,
+    quaternion_to_matrix,
+)
 from mani_skill.utils.structs.types import SimConfig
 
 from sim.maniskill.bimanual_embodiment import BimanualEmbodimentSpec
@@ -74,6 +79,8 @@ class BaseBimanualEnv(BaseEnv):
     DELTA_POSE_CONTROL_MODE = "bimanual_pd_ee_delta_pose"
     DELTA_POSITION_LIMIT = 0.015
     DELTA_ROTATION_LIMIT = 0.10
+    ABSOLUTE_EE_POSITION_LIMIT = 2.0
+    ABSOLUTE_EE_ROTATION_LIMIT = np.pi
     DELTA_JOINT_STIFFNESS_SCALE = 8.0
     DELTA_JOINT_DAMPING_SCALE = 3.0
     TABLE_LENGTH = 1.2
@@ -125,21 +132,21 @@ class BaseBimanualEnv(BaseEnv):
             )
         elif self._control_mode == self.DELTA_POSE_CONTROL_MODE:
             arm_low = [
-                -self.DELTA_POSITION_LIMIT,
-                -self.DELTA_POSITION_LIMIT,
-                -self.DELTA_POSITION_LIMIT,
-                -self.DELTA_ROTATION_LIMIT,
-                -self.DELTA_ROTATION_LIMIT,
-                -self.DELTA_ROTATION_LIMIT,
+                -self.ABSOLUTE_EE_POSITION_LIMIT,
+                -self.ABSOLUTE_EE_POSITION_LIMIT,
+                -self.ABSOLUTE_EE_POSITION_LIMIT,
+                -self.ABSOLUTE_EE_ROTATION_LIMIT,
+                -self.ABSOLUTE_EE_ROTATION_LIMIT,
+                -self.ABSOLUTE_EE_ROTATION_LIMIT,
                 0.0,
             ]
             arm_high = [
-                self.DELTA_POSITION_LIMIT,
-                self.DELTA_POSITION_LIMIT,
-                self.DELTA_POSITION_LIMIT,
-                self.DELTA_ROTATION_LIMIT,
-                self.DELTA_ROTATION_LIMIT,
-                self.DELTA_ROTATION_LIMIT,
+                self.ABSOLUTE_EE_POSITION_LIMIT,
+                self.ABSOLUTE_EE_POSITION_LIMIT,
+                self.ABSOLUTE_EE_POSITION_LIMIT,
+                self.ABSOLUTE_EE_ROTATION_LIMIT,
+                self.ABSOLUTE_EE_ROTATION_LIMIT,
+                self.ABSOLUTE_EE_ROTATION_LIMIT,
                 1.0,
             ]
             action_low = np.asarray(arm_low + arm_low, dtype=np.float32)
@@ -314,16 +321,16 @@ class BaseBimanualEnv(BaseEnv):
         assets = self.get_arm_planner_assets(arm_index)
         config = PDEEPoseControllerConfig(
             joint_names=self.get_arm_joint_names(arm_index),
-            pos_lower=-self.DELTA_POSITION_LIMIT,
-            pos_upper=self.DELTA_POSITION_LIMIT,
-            rot_lower=-self.DELTA_ROTATION_LIMIT,
-            rot_upper=self.DELTA_ROTATION_LIMIT,
+            pos_lower=-self.ABSOLUTE_EE_POSITION_LIMIT,
+            pos_upper=self.ABSOLUTE_EE_POSITION_LIMIT,
+            rot_lower=-self.ABSOLUTE_EE_ROTATION_LIMIT,
+            rot_upper=self.ABSOLUTE_EE_ROTATION_LIMIT,
             stiffness=stiffness * self.DELTA_JOINT_STIFFNESS_SCALE,
             damping=damping * self.DELTA_JOINT_DAMPING_SCALE,
             ee_link=self.get_arm_move_group(arm_index),
             urdf_path=assets["urdf_path"],
             frame="root_translation:root_aligned_body_rotation",
-            use_delta=True,
+            use_delta=False,
             use_target=False,
             interpolate=False,
             normalize_action=False,
@@ -342,6 +349,89 @@ class BaseBimanualEnv(BaseEnv):
         )
         controller.set_drive_property()
         return controller
+
+    def prepare_action_chunk(self, action_chunk, env_ids=None):
+        """Decode one anchor-relative policy chunk into absolute EEF targets.
+
+        The left and right EEF anchors are sampled exactly once when this method
+        is called. Every pose in the returned chunk is fixed in its arm's root
+        frame and can be sent directly to the absolute EEF controller.
+        """
+
+        return_numpy = isinstance(action_chunk, np.ndarray)
+        chunk = common.to_tensor(action_chunk, device=self.device).to(torch.float32)
+        squeeze_batch = False
+        if chunk.ndim == 2:
+            if self.num_envs != 1:
+                raise ValueError(
+                    "Unbatched action chunks are only valid for a single environment."
+                )
+            chunk = chunk.unsqueeze(0)
+            squeeze_batch = True
+        if chunk.ndim != 3 or chunk.shape[-1] != self.ACTION_DIM:
+            raise ValueError(
+                "Expected anchor-relative action chunk shape [B, K, 14] or [K, 14], "
+                f"got {tuple(chunk.shape)}."
+            )
+        if chunk.shape[1] <= 0:
+            raise ValueError("Action chunk must contain at least one target.")
+        if not torch.isfinite(chunk).all():
+            raise ValueError("Anchor-relative action chunk contains non-finite values.")
+
+        if env_ids is None:
+            if chunk.shape[0] != self.num_envs:
+                raise ValueError(
+                    f"Expected chunk batch {self.num_envs}, got {chunk.shape[0]}."
+                )
+            selected_env_ids = torch.arange(self.num_envs, device=self.device)
+        else:
+            selected_env_ids = torch.as_tensor(
+                env_ids,
+                device=self.device,
+                dtype=torch.long,
+            ).flatten()
+            if selected_env_ids.numel() != chunk.shape[0]:
+                raise ValueError(
+                    "env_ids length must match the action chunk batch dimension."
+                )
+            if torch.any(selected_env_ids < 0) or torch.any(
+                selected_env_ids >= self.num_envs
+            ):
+                raise IndexError("env_ids contains an out-of-range environment index.")
+
+        absolute_targets = chunk.clone()
+        arm_specs = (
+            (0, self.left_delta_pose_controller),
+            (7, self.right_delta_pose_controller),
+        )
+        for offset, controller in arm_specs:
+            if controller is None:
+                raise RuntimeError("Absolute EEF controller is not initialized.")
+            anchor_pose = controller.ee_pose_at_base.raw_pose[selected_env_ids]
+            anchor_position = anchor_pose[:, :3]
+            anchor_rotation = quaternion_to_matrix(anchor_pose[:, 3:])
+
+            delta_position = chunk[:, :, offset : offset + 3]
+            delta_euler = chunk[:, :, offset + 3 : offset + 6]
+            delta_rotation = euler_angles_to_matrix(delta_euler, "XYZ")
+            target_rotation = torch.matmul(
+                delta_rotation,
+                anchor_rotation[:, None, :, :],
+            )
+
+            absolute_targets[:, :, offset : offset + 3] = (
+                anchor_position[:, None, :] + delta_position
+            )
+            absolute_targets[:, :, offset + 3 : offset + 6] = matrix_to_euler_angles(
+                target_rotation,
+                "XYZ",
+            )
+
+        if squeeze_batch:
+            absolute_targets = absolute_targets[0]
+        if return_numpy:
+            return absolute_targets.detach().cpu().numpy()
+        return absolute_targets
 
     def _get_arm_joints(self, robot, arm_index: int):
         return [
@@ -685,7 +775,7 @@ class BaseBimanualEnv(BaseEnv):
                 )
                 if torch.any(parsed_action < low) or torch.any(parsed_action > high):
                     raise ValueError(
-                        "Delta-pose action exceeds physical bounds; actions are not clipped implicitly."
+                        "Absolute EEF target exceeds action-space bounds; targets are not clipped implicitly."
                     )
                 left_action = parsed_action[:, 0:6]
                 right_action = parsed_action[:, 7:13]
@@ -706,9 +796,13 @@ class BaseBimanualEnv(BaseEnv):
                 )
                 if any(value is None or not torch.isfinite(value).all() for value in target_qpos):
                     self.delta_controller_failure_count += 1
-                    raise RuntimeError("Delta-pose controller produced an invalid joint target.")
+                    raise RuntimeError("Absolute EEF controller produced an invalid joint target.")
+                left_target_pose = self.left_delta_pose_controller._target_pose.raw_pose
+                right_target_pose = self.right_delta_pose_controller._target_pose.raw_pose
                 self.last_delta_control_debug.update(
                     {
+                        "left_target_pose": left_target_pose.detach().clone(),
+                        "right_target_pose": right_target_pose.detach().clone(),
                         "left_target_qpos": target_qpos[0].detach().clone(),
                         "right_target_qpos": target_qpos[1].detach().clone(),
                     }

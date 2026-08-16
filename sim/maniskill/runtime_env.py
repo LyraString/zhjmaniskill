@@ -112,6 +112,11 @@ class ManiSkillEnvBackend:
         }
         return convert_maniskill_obs(obs, metadata=metadata)
 
+    def prepare_action_chunk(self, action_chunk):
+        """Resolve one policy chunk against the current EEF anchors."""
+
+        return self.env.unwrapped.prepare_action_chunk(action_chunk)
+
     def step(self, action: ActionSpec) -> StepResult:
         mani_action = convert_action_to_maniskill(action)
         obs, reward, terminated, truncated, info = self.env.step(mani_action)

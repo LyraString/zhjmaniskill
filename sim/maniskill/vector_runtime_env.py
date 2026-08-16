@@ -218,6 +218,14 @@ class ManiSkillVectorEnvBackend:
         observations = self._split_observations(raw_obs, info=info)
         return {env_id: observations[env_id] for env_id in env_ids}
 
+    def prepare_action_chunk(self, action_chunk, env_ids=None):
+        """Resolve one batched policy chunk against the selected EEF anchors."""
+
+        return self.env.unwrapped.prepare_action_chunk(
+            action_chunk,
+            env_ids=env_ids,
+        )
+
     def step(self, actions: Sequence[ActionSpec]):
         if len(actions) != self.num_envs:
             raise ValueError(
