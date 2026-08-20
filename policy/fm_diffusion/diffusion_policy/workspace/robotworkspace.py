@@ -190,6 +190,66 @@ class RobotWorkspace(BaseWorkspace):
         self.global_step = 0
         self.epoch = 0
 
+    @staticmethod
+    def _validate_maniskill_resume_action_semantics(cfg, payload) -> None:
+        """Reject checkpoints whose saved action targets use the old controller contract."""
+
+        def read(container, key, default=None):
+            if container is None:
+                return default
+            if hasattr(container, "get"):
+                return container.get(key, default)
+            return getattr(container, key, default)
+
+        current_task = read(read(cfg, "task"), "maniskill")
+        if str(read(current_task, "control_mode", "")) != "bimanual_pd_ee_delta_pose":
+            return
+        expected = {
+            "action_semantics": "chunk_anchor_relative_target",
+            "rotation_representation": "euler_xyz",
+            "translation_frame": "root_aligned",
+            "gripper_semantics": "absolute",
+            "n_action_steps": int(read(cfg, "n_action_steps")),
+        }
+        current = {
+            key: read(current_task, key)
+            for key in expected
+            if key != "n_action_steps"
+        }
+        current["n_action_steps"] = int(read(cfg, "n_action_steps"))
+        current_mismatches = {
+            key: (expected_value, current[key])
+            for key, expected_value in expected.items()
+            if current[key] != expected_value
+        }
+        if current_mismatches:
+            raise RuntimeError(
+                "Current ManiSkill training action semantics mismatch: "
+                f"{current_mismatches}"
+            )
+
+        checkpoint_cfg = payload.get("cfg")
+        checkpoint_task = read(read(checkpoint_cfg, "task"), "maniskill")
+        actual = {
+            key: read(checkpoint_task, key)
+            for key in expected
+            if key != "n_action_steps"
+        }
+        checkpoint_action_steps = read(checkpoint_cfg, "n_action_steps")
+        actual["n_action_steps"] = (
+            None if checkpoint_action_steps is None else int(checkpoint_action_steps)
+        )
+        mismatches = {
+            key: (expected_value, actual[key])
+            for key, expected_value in expected.items()
+            if actual[key] != expected_value
+        }
+        if mismatches:
+            raise RuntimeError(
+                "Flow Matching resume checkpoint action semantics mismatch: "
+                f"{mismatches}"
+            )
+
     def run(self):
         cfg = copy.deepcopy(self.cfg)
         seed = cfg.training.seed
@@ -211,13 +271,15 @@ class RobotWorkspace(BaseWorkspace):
                     raise FileNotFoundError(f"Specified resume checkpoint not found: {ckpt_path}")
                 if is_main_process:
                     print(f"Resuming from specified checkpoint {ckpt_path}")
-                self.load_checkpoint(path=ckpt_path)
+                payload = self.load_checkpoint(path=ckpt_path)
+                self._validate_maniskill_resume_action_semantics(cfg, payload)
             else:
                 lastest_ckpt_path = self.get_checkpoint_path()
                 if lastest_ckpt_path.is_file():
                     if is_main_process:
                         print(f"Resuming from checkpoint {lastest_ckpt_path}")
-                    self.load_checkpoint(path=lastest_ckpt_path)
+                    payload = self.load_checkpoint(path=lastest_ckpt_path)
+                    self._validate_maniskill_resume_action_semantics(cfg, payload)
 
         # Optimizer checkpoints also contain runtime implementation flags. Reapply
         # the current config so an older checkpoint cannot silently disable fused AdamW.

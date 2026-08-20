@@ -24,6 +24,7 @@ assets/embodiments/*
 !assets/embodiments/ur5-wsg/
 assets/embodiments/ur5-wsg/*
 !assets/embodiments/ur5-wsg/ur5_wsg_real_layout.srdf
+!assets/embodiments/ur5-wsg/ur5_wsg_gripper.urdf
 
 policy/weights/*
 

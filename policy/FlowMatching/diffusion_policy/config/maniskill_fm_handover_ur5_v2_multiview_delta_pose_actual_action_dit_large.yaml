@@ -6,7 +6,7 @@ defaults:
 name: maniskill_fm_handover_ur5_v2_multiview_delta_pose_actual_action_dit_large
 exp_name: handover_block_ur5_v2_multiview_delta_pose_actual_action_dit_large_fm
 
-n_action_steps: 1
+n_action_steps: 4
 
 task:
   dataset:

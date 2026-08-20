@@ -1,8 +1,12 @@
-from typing import Dict
-import numba
-import torch
-import numpy as np
 import copy
+import numbers
+from pathlib import Path
+from typing import Dict
+
+import numba
+import numpy as np
+import torch
+from pytorch3d.transforms import euler_angles_to_matrix, matrix_to_euler_angles
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.common.replay_buffer import ReplayBuffer
 from diffusion_policy.common.sampler import (
@@ -12,6 +16,162 @@ from diffusion_policy.common.sampler import (
 )
 from diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
+
+
+_ARM_OFFSETS = (0, 7)
+_DEFAULT_UR5_WSG_URDF = (
+    Path(__file__).resolve().parents[4]
+    / "assets"
+    / "embodiments"
+    / "ur5-wsg"
+    / "ur5_wsg_gripper.urdf"
+)
+
+
+def _reconstruct_absolute_eef_actions(state, recorded_action, urdf_path):
+    """Recover old controller targets and actual EEF poses in each arm root."""
+
+    import pytorch_kinematics as pk
+
+    state = np.asarray(state, dtype=np.float32)
+    recorded_action = np.asarray(recorded_action, dtype=np.float32)
+    if state.ndim != 2 or state.shape[1] != 14:
+        raise ValueError(f"Expected state shape [T, 14], got {state.shape}.")
+    if recorded_action.shape != state.shape:
+        raise ValueError(
+            "Expected recorded action shape to match state shape, got "
+            f"state={state.shape} action={recorded_action.shape}."
+        )
+    if not np.isfinite(state).all() or not np.isfinite(recorded_action).all():
+        raise ValueError("State and recorded actions must contain only finite values.")
+
+    urdf_path = Path(urdf_path).expanduser().resolve()
+    if not urdf_path.is_file():
+        raise FileNotFoundError(f"UR5-Wsg URDF not found: {urdf_path}")
+    with urdf_path.open("r", encoding="utf-8") as stream:
+        chain = pk.build_serial_chain_from_urdf(
+            stream.read(),
+            end_link_name="ee_link",
+            root_link_name="world",
+        ).to(dtype=torch.float32)
+    expected_joints = [
+        "shoulder_pan_joint",
+        "shoulder_lift_joint",
+        "elbow_joint",
+        "wrist_1_joint",
+        "wrist_2_joint",
+        "wrist_3_joint",
+    ]
+    if chain.get_joint_parameter_names() != expected_joints:
+        raise ValueError(
+            "UR5-Wsg FK joint order does not match the recorded state layout."
+        )
+
+    actual_eef_pose = np.empty((len(state), 2, 12), dtype=np.float32)
+    absolute_action = recorded_action.copy()
+    fk_batch_size = 131072
+    with torch.inference_mode():
+        for arm_index, offset in enumerate(_ARM_OFFSETS):
+            for start in range(0, len(state), fk_batch_size):
+                end = min(start + fk_batch_size, len(state))
+                qpos = torch.from_numpy(state[start:end, offset : offset + 6])
+                matrix = chain.forward_kinematics(qpos).get_matrix()
+                actual_position = matrix[:, :3, 3]
+                actual_rotation = matrix[:, :3, :3]
+                delta_position = torch.from_numpy(
+                    recorded_action[start:end, offset : offset + 3]
+                )
+                delta_euler = torch.from_numpy(
+                    recorded_action[start:end, offset + 3 : offset + 6]
+                )
+                target_rotation = torch.matmul(
+                    euler_angles_to_matrix(delta_euler, "XYZ"),
+                    actual_rotation,
+                )
+
+                actual_eef_pose[start:end, arm_index, :3] = actual_position.numpy()
+                actual_eef_pose[start:end, arm_index, 3:] = (
+                    actual_rotation.reshape(-1, 9).numpy()
+                )
+                absolute_action[start:end, offset : offset + 3] = (
+                    actual_position + delta_position
+                ).numpy()
+                absolute_action[start:end, offset + 3 : offset + 6] = (
+                    matrix_to_euler_angles(target_rotation, "XYZ").numpy()
+                )
+
+    if not np.isfinite(actual_eef_pose).all() or not np.isfinite(absolute_action).all():
+        raise ValueError("Reconstructed EEF poses contain non-finite values.")
+    return actual_eef_pose, absolute_action
+
+
+def _sequence_source_indices(indices, sequence_length):
+    """Return replay-buffer indices after SequenceSampler edge padding."""
+
+    indices = np.asarray(indices, dtype=np.int64)
+    if indices.ndim != 2 or indices.shape[1] != 4:
+        raise ValueError(f"Expected sampler indices shape [N, 4], got {indices.shape}.")
+    if int(sequence_length) <= 0:
+        raise ValueError(f"sequence_length must be positive, got {sequence_length}.")
+    steps = np.arange(sequence_length, dtype=np.int64)[None, :]
+    buffer_start = indices[:, 0:1]
+    sample_start = indices[:, 2:3]
+    source_length = indices[:, 1:2] - buffer_start
+    if np.any(source_length <= 0):
+        raise ValueError("Sampler indices contain an empty replay-buffer range.")
+    source_offset = np.clip(steps - sample_start, 0, source_length - 1)
+    return buffer_start + source_offset
+
+
+def _absolute_actions_to_anchor_relative(absolute_action, anchor_eef_pose):
+    """Express an absolute target chunk relative to one actual EEF anchor."""
+
+    if not isinstance(absolute_action, torch.Tensor) or not isinstance(
+        anchor_eef_pose, torch.Tensor
+    ):
+        raise TypeError("absolute_action and anchor_eef_pose must be torch tensors.")
+    squeeze_batch = absolute_action.ndim == 2
+    if squeeze_batch:
+        absolute_action = absolute_action.unsqueeze(0)
+        anchor_eef_pose = anchor_eef_pose.unsqueeze(0)
+    if absolute_action.ndim != 3 or absolute_action.shape[-1] != 14:
+        raise ValueError(
+            f"Expected absolute action shape [B, H, 14], got {absolute_action.shape}."
+        )
+    if anchor_eef_pose.shape != (absolute_action.shape[0], 2, 12):
+        raise ValueError(
+            "Expected anchor EEF pose shape [B, 2, 12], got "
+            f"{anchor_eef_pose.shape}."
+        )
+    if not torch.isfinite(absolute_action).all() or not torch.isfinite(
+        anchor_eef_pose
+    ).all():
+        raise ValueError("Absolute targets and anchor EEF poses must be finite.")
+
+    relative_action = absolute_action.clone()
+    for arm_index, offset in enumerate(_ARM_OFFSETS):
+        anchor_position = anchor_eef_pose[:, arm_index, :3]
+        anchor_rotation = anchor_eef_pose[:, arm_index, 3:].reshape(-1, 3, 3)
+        target_rotation = euler_angles_to_matrix(
+            absolute_action[:, :, offset + 3 : offset + 6],
+            "XYZ",
+        )
+        relative_rotation = torch.matmul(
+            target_rotation,
+            anchor_rotation[:, None].transpose(-1, -2),
+        )
+        relative_action[:, :, offset : offset + 3] = (
+            absolute_action[:, :, offset : offset + 3]
+            - anchor_position[:, None]
+        )
+        relative_action[:, :, offset + 3 : offset + 6] = matrix_to_euler_angles(
+            relative_rotation,
+            "XYZ",
+        )
+
+    if squeeze_batch:
+        relative_action = relative_action[0]
+    return relative_action
 
 
 class RobotPointCloudDataset(BaseImageDataset):
@@ -279,6 +439,140 @@ class RobotMultiViewPointCloudDataset(BaseImageDataset):
             "obs": obs,
             "action": samples["action"].to(device, non_blocking=True),
         }
+
+
+class RobotMultiViewPointCloudChunkAnchorDataset(RobotMultiViewPointCloudDataset):
+    """Train on fixed EEF target chunks expressed from one observation anchor."""
+
+    def __init__(
+        self,
+        zarr_path,
+        horizon=1,
+        obs_steps=None,
+        pad_before=0,
+        pad_after=0,
+        seed=42,
+        val_ratio=0.0,
+        batch_size=128,
+        max_train_episodes=None,
+        normalize_point_clouds=True,
+        urdf_path=None,
+    ):
+        if obs_steps is None:
+            raise ValueError("obs_steps is required for chunk-anchor action labels.")
+        super().__init__(
+            zarr_path=zarr_path,
+            horizon=horizon,
+            obs_steps=obs_steps,
+            pad_before=pad_before,
+            pad_after=pad_after,
+            seed=seed,
+            val_ratio=val_ratio,
+            batch_size=batch_size,
+            max_train_episodes=max_train_episodes,
+            normalize_point_clouds=normalize_point_clouds,
+        )
+        self.action_anchor_index = self.obs_steps - 1
+        if int(self.pad_before) != self.action_anchor_index:
+            raise ValueError(
+                "pad_before must equal obs_steps - 1 for chunk-anchor labels, got "
+                f"pad_before={self.pad_before} obs_steps={self.obs_steps}."
+            )
+
+        actual_eef_pose, absolute_action = _reconstruct_absolute_eef_actions(
+            self.replay_buffer["state"],
+            self.replay_buffer["action"],
+            _DEFAULT_UR5_WSG_URDF if urdf_path is None else urdf_path,
+        )
+        self._actual_eef_pose = actual_eef_pose
+        self.replay_buffer.data["action"] = absolute_action
+
+    def get_validation_dataset(self):
+        """Build a validation view without sharing mutable batch output buffers."""
+
+        val_set = super().get_validation_dataset()
+        val_set.buffers = {
+            key: np.zeros_like(value) for key, value in self.buffers.items()
+        }
+        val_set.buffers_torch = {
+            key: torch.from_numpy(value) for key, value in val_set.buffers.items()
+        }
+        return val_set
+
+    def _source_indices(self, idx):
+        if isinstance(idx, numbers.Integral):
+            sampler_indices = self.sampler.indices[int(idx) : int(idx) + 1]
+        else:
+            sampler_indices = self.sampler.indices[np.asarray(idx, dtype=np.int64)]
+        return _sequence_source_indices(sampler_indices, self.horizon)
+
+    def _convert_sample_action(self, action, source_indices):
+        anchor_indices = source_indices[:, self.action_anchor_index]
+        anchor_eef_pose = torch.from_numpy(self._actual_eef_pose[anchor_indices])
+        if action.ndim == 2:
+            anchor_eef_pose = anchor_eef_pose[0]
+        return _absolute_actions_to_anchor_relative(action, anchor_eef_pose)
+
+    def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
+        scalar_index = isinstance(idx, numbers.Integral)
+        if not scalar_index and not isinstance(idx, np.ndarray):
+            return super().__getitem__(idx)
+        normalized_idx = int(idx) if scalar_index else idx
+        sample = super().__getitem__(normalized_idx)
+        relative_action = self._convert_sample_action(
+            sample["action"],
+            self._source_indices(normalized_idx),
+        )
+        return {**sample, "action": relative_action}
+
+    def _materialize_anchor_relative_actions(self):
+        num_samples = len(self.sampler)
+        if num_samples == 0:
+            raise ValueError("Cannot fit an action normalizer without training samples.")
+        labels = np.empty(
+            (num_samples, self.horizon, 14),
+            dtype=np.float32,
+        )
+        materialize_batch_size = 8192
+        for start in range(0, num_samples, materialize_batch_size):
+            end = min(start + materialize_batch_size, num_samples)
+            source_indices = _sequence_source_indices(
+                self.sampler.indices[start:end],
+                self.horizon,
+            )
+            absolute_action = torch.from_numpy(
+                self.replay_buffer["action"][source_indices]
+            )
+            anchor_eef_pose = torch.from_numpy(
+                self._actual_eef_pose[
+                    source_indices[:, self.action_anchor_index]
+                ]
+            )
+            labels[start:end] = _absolute_actions_to_anchor_relative(
+                absolute_action,
+                anchor_eef_pose,
+            ).numpy()
+        return labels
+
+    def get_normalizer(self, mode="limits", **kwargs):
+        data = {
+            "agent_pos": self.replay_buffer["state"],
+        }
+        if self.normalize_point_clouds:
+            for key in self.POINT_CLOUD_KEYS:
+                data[key] = self.replay_buffer[key]
+        normalizer = LinearNormalizer()
+        normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
+        normalizer["action"] = SingleFieldLinearNormalizer.create_fit(
+            self._materialize_anchor_relative_actions(),
+            last_n_dims=1,
+            mode=mode,
+            **kwargs,
+        )
+        if not self.normalize_point_clouds:
+            for key in self.POINT_CLOUD_KEYS:
+                normalizer[key] = SingleFieldLinearNormalizer.create_identity()
+        return normalizer
 
 
 def _batch_sample_sequence(
