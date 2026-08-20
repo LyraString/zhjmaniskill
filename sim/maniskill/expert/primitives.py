@@ -1607,7 +1607,7 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
         return np.concatenate(chunks, axis=0).astype(np.float32, copy=False)
 
     def apply_delta_action(self, delta_action: np.ndarray, recorder) -> tuple[Any, bool]:
-        """Send and record the same native actual-relative delta action."""
+        """Execute one reconstructed absolute target and record its source delta."""
         if self.steps_taken >= self.step_limit:
             raise EpisodeLimitReached
         delta_action = np.asarray(delta_action, dtype=np.float32).reshape(self.base_env.ACTION_DIM)
@@ -1633,15 +1633,28 @@ class DeltaPoseMotionPrimitives(FixedRateMotionPrimitives):
                 }
                 return self._failed_result(), False
 
+        absolute_action = None
         try:
+            absolute_action = np.asarray(
+                self.backend.prepare_action_chunk(delta_action[None, :]),
+                dtype=np.float32,
+            ).reshape(self.base_env.ACTION_DIM)
             result = self.backend.step(
-                ActionSpec.from_value(delta_action, action_type="bimanual_pd_ee_delta_pose")
+                ActionSpec.from_value(
+                    absolute_action,
+                    action_type="bimanual_pd_ee_delta_pose",
+                )
             )
         except (RuntimeError, ValueError) as exc:
             self.controller_failure_count += 1
             self.last_status = "delta_pose_controller_failed"
             self.last_plan_debug = {
                 "delta_action": delta_action.round(6).tolist(),
+                "absolute_action": (
+                    None
+                    if absolute_action is None
+                    else absolute_action.round(6).tolist()
+                ),
                 "reason": f"{type(exc).__name__}:{exc}",
             }
             return self._failed_result(), False

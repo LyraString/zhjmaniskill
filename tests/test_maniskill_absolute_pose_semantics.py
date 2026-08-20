@@ -18,7 +18,10 @@ from mani_skill.utils.geometry.rotation_conversions import (
     euler_angles_to_matrix,
     matrix_to_quaternion,
 )
-from sim.maniskill.tasks.base_bimanual_env import BaseBimanualEnv
+from sim.maniskill.tasks.base_bimanual_env import (
+    BaseBimanualEnv,
+    _StrictPDEEPoseController,
+)
 
 
 class _CountingPose:
@@ -177,6 +180,47 @@ class AbsolutePoseSemanticsTest(unittest.TestCase):
         self.assertEqual(config.rot_upper, np.pi)
         controller_instance.set_drive_property.assert_called_once_with()
         self.assertIs(result, controller_instance)
+
+    def test_iterative_ik_keeps_full_articulation_qpos(self) -> None:
+        controller = object.__new__(_StrictPDEEPoseController)
+        initial_qpos = torch.arange(8, dtype=torch.float32).reshape(1, 8)
+        controller.articulation = SimpleNamespace(
+            get_qpos=mock.Mock(return_value=initial_qpos)
+        )
+        controller.active_joint_indices = torch.arange(6, dtype=torch.long)
+        controller.config = SimpleNamespace(
+            use_target=True,
+            delta_solver_config={"type": "levenberg_marquardt", "solver_iterations": 3},
+            interpolate=False,
+        )
+        controller._target_pose = object()
+        controller._preprocess_action = lambda action: action
+        controller.compute_target_pose = lambda _pose, _action: object()
+        ik_targets = [
+            torch.full((1, 6), float(iteration), dtype=torch.float32)
+            for iteration in (10, 20, 30)
+        ]
+        controller.kinematics = SimpleNamespace(
+            compute_ik=mock.Mock(side_effect=ik_targets)
+        )
+        controller.set_drive_targets = mock.Mock()
+
+        _StrictPDEEPoseController.set_action(
+            controller,
+            torch.zeros((1, 6), dtype=torch.float32),
+        )
+
+        q0_calls = [
+            call.kwargs["q0"]
+            for call in controller.kinematics.compute_ik.call_args_list
+        ]
+        self.assertEqual([tuple(value.shape) for value in q0_calls], [(1, 8)] * 3)
+        torch.testing.assert_close(q0_calls[0], initial_qpos)
+        torch.testing.assert_close(q0_calls[1][:, :6], ik_targets[0])
+        torch.testing.assert_close(q0_calls[2][:, :6], ik_targets[1])
+        for q0 in q0_calls:
+            torch.testing.assert_close(q0[:, 6:], initial_qpos[:, 6:])
+        controller.set_drive_targets.assert_called_once_with(ik_targets[-1])
 
 
 if __name__ == "__main__":

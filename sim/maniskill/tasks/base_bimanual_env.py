@@ -57,7 +57,8 @@ class _StrictPDEEPoseController(PDEEPoseController):
                 raise RuntimeError("PDEE inverse kinematics failed.")
             if not torch.isfinite(target_qpos).all():
                 raise RuntimeError("PDEE inverse kinematics returned a non-finite joint target.")
-            q0 = target_qpos
+            q0 = q0.clone()
+            q0[:, self.active_joint_indices] = target_qpos
 
         self._target_qpos = target_qpos
         if self.config.interpolate:

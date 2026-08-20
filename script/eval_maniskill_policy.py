@@ -9,13 +9,6 @@ import dill
 import imageio.v2 as imageio
 import numpy as np
 import torch
-from mani_skill.utils.geometry.rotation_conversions import (
-    euler_angles_to_matrix,
-    matrix_to_euler_angles,
-    matrix_to_quaternion,
-    quaternion_multiply,
-    quaternion_to_matrix,
-)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -51,10 +44,6 @@ MULTIVIEW_POINT_CLOUD_SPECS = {
 }
 
 DELTA_POSE_CONTROL_MODE = "bimanual_pd_ee_delta_pose"
-DELTA_POSE_ARM_SPECS = (
-    ("left", slice(0, 6), 6, "left_delta_pose_controller"),
-    ("right", slice(7, 13), 13, "right_delta_pose_controller"),
-)
 
 
 def _shape_meta_obs_items(ckpt_cfg) -> list[tuple[str, object]]:
@@ -116,199 +105,120 @@ def _adapt_runtime_for_checkpoint_action(ckpt_cfg, runtime_kwargs: dict) -> None
         runtime_kwargs["action_type"] = str(checkpoint_action_type)
 
 
-def _new_action_clip_stats():
-    return {
-        "steps": 0,
-        "clipped_steps": 0,
-        "dims": 0,
-        "clipped_dims": 0,
-        "abs_sum": 0.0,
-        "abs_max": 0.0,
+def _validate_checkpoint_action_semantics(ckpt_cfg, *, control_mode: str) -> None:
+    """Reject old per-step delta checkpoints on the absolute-target runtime."""
+
+    if str(control_mode) != DELTA_POSE_CONTROL_MODE:
+        return
+    task_cfg = getattr(ckpt_cfg, "task", None)
+    maniskill_cfg = getattr(task_cfg, "maniskill", None)
+    expected = {
+        "action_semantics": "chunk_anchor_relative_target",
+        "rotation_representation": "euler_xyz",
+        "translation_frame": "root_aligned",
+        "gripper_semantics": "absolute",
     }
+    actual = {
+        key: (
+            maniskill_cfg.get(key, None)
+            if isinstance(maniskill_cfg, Mapping)
+            else getattr(maniskill_cfg, key, None)
+        )
+        for key in expected
+    }
+    mismatches = {
+        key: {"expected": expected_value, "actual": actual[key]}
+        for key, expected_value in expected.items()
+        if actual[key] != expected_value
+    }
+    if mismatches:
+        raise ValueError(
+            "Checkpoint action semantics are incompatible with chunk-anchored absolute "
+            f"EEF execution: {mismatches}. Retrain or use a checkpoint whose saved Hydra "
+            "config declares the new action semantics."
+        )
 
 
-def _clip_action_to_space(action, action_space, stats: dict):
+def _prepare_runtime_action_chunk(env, action_chunk, *, control_mode: str):
+    """Prepare a policy chunk once before any of its targets are executed."""
+
+    chunk = np.asarray(action_chunk, dtype=np.float32)
+    if chunk.ndim != 2 or chunk.shape[0] < 1:
+        raise ValueError(f"Expected a non-empty [K, A] action chunk, got {chunk.shape}.")
+    if not np.isfinite(chunk).all():
+        raise ValueError("Policy action chunk contains NaN or Inf values.")
+    if str(control_mode) != DELTA_POSE_CONTROL_MODE:
+        return chunk.copy()
+
+    prepared = np.asarray(env.prepare_action_chunk(chunk), dtype=np.float32)
+    if prepared.shape != chunk.shape:
+        raise ValueError(
+            "Prepared target chunk shape differs from the policy chunk: "
+            f"policy={chunk.shape}, target={prepared.shape}."
+        )
+    if not np.isfinite(prepared).all():
+        raise ValueError("Prepared absolute EEF target chunk contains NaN or Inf values.")
+    return prepared
+
+
+def _validate_action_in_space(action, action_space) -> np.ndarray:
+    """Fail fast instead of silently changing a prepared controller target."""
+
     action_np = np.asarray(action, dtype=np.float32)
     low = np.asarray(action_space.low, dtype=np.float32)
     high = np.asarray(action_space.high, dtype=np.float32)
-    clipped = np.clip(action_np, low, high)
-    diff = np.abs(clipped - action_np)
-
-    stats["steps"] += 1
-    stats["dims"] += int(diff.size)
-    clipped_mask = diff > 0.0
-    clipped_dims = int(np.count_nonzero(clipped_mask))
-    stats["clipped_dims"] += clipped_dims
-    if clipped_dims > 0:
-        stats["clipped_steps"] += 1
-        stats["abs_sum"] += float(diff[clipped_mask].sum())
-        stats["abs_max"] = max(stats["abs_max"], float(diff.max()))
-
-    return clipped
-
-
-def _quaternion_inverse_wxyz(quat: torch.Tensor) -> torch.Tensor:
-    norm_sq = torch.sum(quat * quat).clamp_min(1e-8)
-    return torch.cat([quat[0:1], -quat[1:]], dim=0) / norm_sq
+    if action_np.shape != low.shape or action_np.shape != high.shape:
+        raise ValueError(
+            "Action/action-space shape mismatch: "
+            f"action={action_np.shape}, low={low.shape}, high={high.shape}."
+        )
+    if not np.isfinite(action_np).all():
+        raise ValueError("Controller target contains NaN or Inf values.")
+    invalid = (action_np < low) | (action_np > high)
+    if np.any(invalid):
+        indices = np.flatnonzero(invalid).tolist()
+        raise ValueError(
+            "Prepared controller target exceeds the absolute environment action space; "
+            f"dims={indices}, target={action_np[invalid].tolist()}, "
+            f"low={low[invalid].tolist()}, high={high[invalid].tolist()}."
+        )
+    return action_np
 
 
-def _normalize_pose_wxyz(pose: torch.Tensor) -> torch.Tensor:
-    pose = pose.to(dtype=torch.float32)
-    quat = pose[3:7]
-    quat = quat / torch.linalg.norm(quat).clamp_min(1e-8)
-    return torch.cat([pose[0:3], quat], dim=0)
+def _clip_legacy_action_to_space(action, action_space) -> np.ndarray:
+    """Preserve the pre-existing clipping behavior for non-EEF controllers."""
 
-
-def _target_pose_from_delta(current_pose: torch.Tensor, delta_action: torch.Tensor) -> torch.Tensor:
-    delta_pos = delta_action[0:3]
-    delta_rot = delta_action[3:6].reshape(1, 3)
-    delta_quat = matrix_to_quaternion(euler_angles_to_matrix(delta_rot, "XYZ"))[0]
-    target_pos = current_pose[0:3] + delta_pos
-    target_quat = quaternion_multiply(
-        delta_quat.reshape(1, 4),
-        current_pose[3:7].reshape(1, 4),
-    )[0]
-    return _normalize_pose_wxyz(torch.cat([target_pos, target_quat], dim=0))
-
-
-def _delta_action_from_target_pose(current_pose: torch.Tensor, target_pose: torch.Tensor) -> torch.Tensor:
-    delta_pos = target_pose[0:3] - current_pose[0:3]
-    delta_quat = quaternion_multiply(
-        target_pose[3:7].reshape(1, 4),
-        _quaternion_inverse_wxyz(current_pose[3:7]).reshape(1, 4),
-    )[0]
-    delta_rot = matrix_to_euler_angles(
-        quaternion_to_matrix(delta_quat.reshape(1, 4)),
-        "XYZ",
-    )[0]
-    return torch.cat([delta_pos, delta_rot], dim=0)
-
-
-class DeltaPoseHoldFilter:
-    """Eval-only postprocessor for suppressing open-arm delta-pose drift."""
-
-    def __init__(
-        self,
-        *,
-        mode: str,
-        gripper_threshold: float,
-        pos_threshold: float,
-        rot_threshold: float,
-    ) -> None:
-        self.mode = mode
-        self.gripper_threshold = float(gripper_threshold)
-        self.pos_threshold = float(pos_threshold)
-        self.rot_threshold = float(rot_threshold)
-        self.anchors = {arm_name: None for arm_name, *_rest in DELTA_POSE_ARM_SPECS}
-        self.stats = {
-            "steps": 0,
-            "arm_steps": 0,
-            "held": 0,
-            "committed": 0,
-            "closed_passthrough": 0,
-            "unavailable": 0,
-        }
-        self.last_decisions = {arm_name: "off" for arm_name, *_rest in DELTA_POSE_ARM_SPECS}
-
-    def reset_episode(self) -> None:
-        self.anchors = {arm_name: None for arm_name, *_rest in DELTA_POSE_ARM_SPECS}
-        self.last_decisions = {arm_name: "off" for arm_name, *_rest in DELTA_POSE_ARM_SPECS}
-
-    def _read_current_pose(self, env_backend, controller_attr: str) -> torch.Tensor | None:
-        inner_env = getattr(env_backend, "env", env_backend)
-        unwrapped = getattr(inner_env, "unwrapped", inner_env)
-        controller = getattr(unwrapped, controller_attr, None)
-        ee_pose = getattr(controller, "ee_pose_at_base", None)
-        raw_pose = getattr(ee_pose, "raw_pose", None)
-        if raw_pose is None:
-            return None
-        pose = raw_pose.detach()
-        if pose.ndim == 2:
-            pose = pose[0]
-        elif pose.ndim > 2:
-            pose = pose.reshape(-1, pose.shape[-1])[0]
-        if pose.shape[-1] != 7:
-            return None
-        return _normalize_pose_wxyz(pose)
-
-    def apply(self, action, env_backend) -> np.ndarray:
-        action_np = np.asarray(action, dtype=np.float32).copy()
-        if action_np.shape != (14,):
-            raise ValueError(
-                f"Delta-pose hold filter expects a 14D bimanual action, got {action_np.shape}."
-            )
-
-        self.stats["steps"] += 1
-        for arm_name, action_slice, gripper_idx, controller_attr in DELTA_POSE_ARM_SPECS:
-            self.last_decisions[arm_name] = "passthrough"
-            self.stats["arm_steps"] += 1
-            gripper_cmd = float(action_np[gripper_idx])
-            current_pose = None
-            if gripper_cmd <= self.gripper_threshold:
-                current_pose = self._read_current_pose(env_backend, controller_attr)
-                if current_pose is not None:
-                    self.anchors[arm_name] = current_pose
-                self.last_decisions[arm_name] = "closed_passthrough"
-                self.stats["closed_passthrough"] += 1
-                continue
-
-            delta_np = action_np[action_slice]
-            pos_norm = float(np.linalg.norm(delta_np[0:3]))
-            rot_norm = float(np.linalg.norm(delta_np[3:6]))
-            is_small_delta = pos_norm <= self.pos_threshold and rot_norm <= self.rot_threshold
-
-            if self.mode == "deadband":
-                if is_small_delta:
-                    action_np[action_slice] = 0.0
-                    self.last_decisions[arm_name] = "held"
-                    self.stats["held"] += 1
-                else:
-                    self.last_decisions[arm_name] = "committed"
-                    self.stats["committed"] += 1
-                continue
-
-            current_pose = self._read_current_pose(env_backend, controller_attr)
-            if current_pose is None:
-                self.last_decisions[arm_name] = "unavailable"
-                self.stats["unavailable"] += 1
-                continue
-            if self.anchors[arm_name] is None:
-                self.anchors[arm_name] = current_pose
-
-            delta_action = torch.as_tensor(delta_np, device=current_pose.device, dtype=torch.float32)
-            if is_small_delta:
-                held_delta = _delta_action_from_target_pose(current_pose, self.anchors[arm_name])
-                action_np[action_slice] = held_delta.detach().cpu().numpy().astype(np.float32)
-                self.last_decisions[arm_name] = "held"
-                self.stats["held"] += 1
-            else:
-                self.anchors[arm_name] = _target_pose_from_delta(current_pose, delta_action)
-                self.last_decisions[arm_name] = "committed"
-                self.stats["committed"] += 1
-
-        return action_np
+    action_np = np.asarray(action, dtype=np.float32)
+    low = np.asarray(action_space.low, dtype=np.float32)
+    high = np.asarray(action_space.high, dtype=np.float32)
+    if action_np.shape != low.shape or action_np.shape != high.shape:
+        raise ValueError(
+            "Action/action-space shape mismatch: "
+            f"action={action_np.shape}, low={low.shape}, high={high.shape}."
+        )
+    if not np.isfinite(action_np).all():
+        raise ValueError("Policy action contains NaN or Inf values.")
+    return np.clip(action_np, low, high)
 
 
 def _new_action_trace():
     return {
         "episode": [],
         "step": [],
-        "action": [],
-        "raw_action": [],
-        "filtered_action": [],
-        "clip_delta": [],
-        "left_xyz_norm": [],
-        "left_rot_norm": [],
-        "left_gripper": [],
-        "right_xyz_norm": [],
-        "right_rot_norm": [],
-        "right_gripper": [],
-        "raw_left_gripper": [],
-        "raw_right_gripper": [],
-        "filtered_left_gripper": [],
-        "filtered_right_gripper": [],
-        "left_filter_decision": [],
-        "right_filter_decision": [],
+        "raw_policy_action": [],
+        "target_action": [],
+        "policy_left_xyz_norm": [],
+        "policy_left_rot_norm": [],
+        "policy_left_gripper": [],
+        "policy_right_xyz_norm": [],
+        "policy_right_rot_norm": [],
+        "policy_right_gripper": [],
+        "target_left_xyz_norm": [],
+        "target_left_rot_norm": [],
+        "target_left_gripper": [],
+        "target_right_xyz_norm": [],
+        "target_right_rot_norm": [],
+        "target_right_gripper": [],
         "reward_stage": [],
         "box_to_target": [],
         "spatial_success": [],
@@ -319,16 +229,6 @@ def _new_action_trace():
         "box_static": [],
         "success": [],
     }
-
-
-FILTER_DECISION_CODES = {
-    "off": 0,
-    "passthrough": 1,
-    "closed_passthrough": 2,
-    "held": 3,
-    "committed": 4,
-    "unavailable": 5,
-}
 
 
 def _action_or_nan(action) -> np.ndarray:
@@ -346,55 +246,25 @@ def _append_action_trace(
     trace: dict,
     episode_idx: int,
     step: int,
-    action: np.ndarray,
+    target_action: np.ndarray,
     info: Mapping,
     *,
-    raw_action=None,
-    filtered_action=None,
-    filter_decisions: Mapping[str, str] | None = None,
+    raw_policy_action,
 ) -> None:
-    action_np = np.asarray(action, dtype=np.float32).reshape(-1)
-    raw_action_np = _action_or_nan(raw_action)
-    filtered_action_np = _action_or_nan(filtered_action)
-    clipped_action_np = _action_or_nan(action)
-    if action_np.shape[0] >= 14:
-        left_xyz = action_np[0:3]
-        left_rot = action_np[3:6]
-        left_gripper = float(action_np[6])
-        right_xyz = action_np[7:10]
-        right_rot = action_np[10:13]
-        right_gripper = float(action_np[13])
-    else:
-        left_xyz = np.zeros(3, dtype=np.float32)
-        left_rot = np.zeros(3, dtype=np.float32)
-        left_gripper = float("nan")
-        right_xyz = np.zeros(3, dtype=np.float32)
-        right_rot = np.zeros(3, dtype=np.float32)
-        right_gripper = float("nan")
+    policy_np = _action_or_nan(raw_policy_action)
+    target_np = _action_or_nan(target_action)
 
     trace["episode"].append(int(episode_idx))
     trace["step"].append(int(step))
-    trace["action"].append(action_np.astype(np.float32, copy=True))
-    trace["raw_action"].append(raw_action_np)
-    trace["filtered_action"].append(filtered_action_np)
-    trace["clip_delta"].append(clipped_action_np - filtered_action_np)
-    trace["left_xyz_norm"].append(float(np.linalg.norm(left_xyz)))
-    trace["left_rot_norm"].append(float(np.linalg.norm(left_rot)))
-    trace["left_gripper"].append(left_gripper)
-    trace["right_xyz_norm"].append(float(np.linalg.norm(right_xyz)))
-    trace["right_rot_norm"].append(float(np.linalg.norm(right_rot)))
-    trace["right_gripper"].append(right_gripper)
-    trace["raw_left_gripper"].append(float(raw_action_np[6]))
-    trace["raw_right_gripper"].append(float(raw_action_np[13]))
-    trace["filtered_left_gripper"].append(float(filtered_action_np[6]))
-    trace["filtered_right_gripper"].append(float(filtered_action_np[13]))
-    filter_decisions = filter_decisions or {}
-    trace["left_filter_decision"].append(
-        FILTER_DECISION_CODES.get(str(filter_decisions.get("left", "off")), -1)
-    )
-    trace["right_filter_decision"].append(
-        FILTER_DECISION_CODES.get(str(filter_decisions.get("right", "off")), -1)
-    )
+    trace["raw_policy_action"].append(policy_np)
+    trace["target_action"].append(target_np)
+    for prefix, value in (("policy", policy_np), ("target", target_np)):
+        trace[f"{prefix}_left_xyz_norm"].append(float(np.linalg.norm(value[0:3])))
+        trace[f"{prefix}_left_rot_norm"].append(float(np.linalg.norm(value[3:6])))
+        trace[f"{prefix}_left_gripper"].append(float(value[6]))
+        trace[f"{prefix}_right_xyz_norm"].append(float(np.linalg.norm(value[7:10])))
+        trace[f"{prefix}_right_rot_norm"].append(float(np.linalg.norm(value[10:13])))
+        trace[f"{prefix}_right_gripper"].append(float(value[13]))
     trace["reward_stage"].append(_to_float_scalar_or_none(info.get("reward_stage")))
     trace["box_to_target"].append(_to_float_scalar_or_none(info.get("reward_box_to_target")))
     for key in (
@@ -415,7 +285,7 @@ def _save_action_trace(trace: dict, path: str) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     arrays = {}
     for key, values in trace.items():
-        if key in {"action", "raw_action", "filtered_action", "clip_delta"}:
+        if key in {"raw_policy_action", "target_action"}:
             arrays[key] = (
                 np.stack(values, axis=0).astype(np.float32)
                 if len(values) > 0
@@ -426,26 +296,26 @@ def _save_action_trace(trace: dict, path: str) -> None:
                 [np.nan if value is None else value for value in values],
                 dtype=(
                     np.int64
-                    if key in {"episode", "step", "left_filter_decision", "right_filter_decision"}
+                    if key in {"episode", "step"}
                     else np.float32
                 ),
             )
     np.savez_compressed(output_path, **arrays)
 
-    if arrays["action"].size == 0:
+    if arrays["target_action"].size == 0:
         print(f"action_trace_saved path={output_path} steps=0")
         return
 
     summary = {
         "path": str(output_path),
-        "steps": int(arrays["action"].shape[0]),
-        "left_xyz_norm_mean": float(np.nanmean(arrays["left_xyz_norm"])),
-        "left_xyz_norm_max": float(np.nanmax(arrays["left_xyz_norm"])),
-        "right_xyz_norm_mean": float(np.nanmean(arrays["right_xyz_norm"])),
-        "right_xyz_norm_max": float(np.nanmax(arrays["right_xyz_norm"])),
-        "left_rot_norm_mean": float(np.nanmean(arrays["left_rot_norm"])),
-        "right_rot_norm_mean": float(np.nanmean(arrays["right_rot_norm"])),
-        "right_gripper_mean": float(np.nanmean(arrays["right_gripper"])),
+        "steps": int(arrays["target_action"].shape[0]),
+        "policy_left_xyz_norm_mean": float(np.nanmean(arrays["policy_left_xyz_norm"])),
+        "policy_left_xyz_norm_max": float(np.nanmax(arrays["policy_left_xyz_norm"])),
+        "policy_right_xyz_norm_mean": float(np.nanmean(arrays["policy_right_xyz_norm"])),
+        "policy_right_xyz_norm_max": float(np.nanmax(arrays["policy_right_xyz_norm"])),
+        "target_left_xyz_norm_mean": float(np.nanmean(arrays["target_left_xyz_norm"])),
+        "target_right_xyz_norm_mean": float(np.nanmean(arrays["target_right_xyz_norm"])),
+        "policy_right_gripper_mean": float(np.nanmean(arrays["policy_right_gripper"])),
     }
     stage = arrays["reward_stage"]
     stage4_mask = np.isfinite(stage) & (np.rint(stage).astype(np.int64) == 4)
@@ -453,9 +323,15 @@ def _save_action_trace(trace: dict, path: str) -> None:
         summary.update(
             {
                 "stage4_steps": int(np.count_nonzero(stage4_mask)),
-                "stage4_right_xyz_norm_mean": float(np.nanmean(arrays["right_xyz_norm"][stage4_mask])),
-                "stage4_right_xyz_norm_max": float(np.nanmax(arrays["right_xyz_norm"][stage4_mask])),
-                "stage4_right_gripper_mean": float(np.nanmean(arrays["right_gripper"][stage4_mask])),
+                "stage4_policy_right_xyz_norm_mean": float(
+                    np.nanmean(arrays["policy_right_xyz_norm"][stage4_mask])
+                ),
+                "stage4_policy_right_xyz_norm_max": float(
+                    np.nanmax(arrays["policy_right_xyz_norm"][stage4_mask])
+                ),
+                "stage4_policy_right_gripper_mean": float(
+                    np.nanmean(arrays["policy_right_gripper"][stage4_mask])
+                ),
                 "stage4_right_open_frac": float(np.nanmean(arrays["right_gripper_open"][stage4_mask])),
                 "stage4_right_clear_frac": float(np.nanmean(arrays["right_ee_clear"][stage4_mask])),
                 "stage4_spatial_frac": float(np.nanmean(arrays["spatial_success"][stage4_mask])),
@@ -616,15 +492,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional .npz path for per-step action/stage diagnostics. Default is disabled.",
     )
-    parser.add_argument(
-        "--delta-pose-hold-mode",
-        choices=("off", "deadband", "anchor"),
-        default="off",
-        help="Eval-only filter for suppressing open-arm drift in delta-pose control.",
-    )
-    parser.add_argument("--delta-pose-hold-gripper-threshold", type=float, default=0.95)
-    parser.add_argument("--delta-pose-hold-pos-threshold", type=float, default=0.002)
-    parser.add_argument("--delta-pose-hold-rot-threshold", type=float, default=0.02)
     return parser
 
 
@@ -683,6 +550,13 @@ def run_evaluation(args) -> None:
         runtime_kwargs["render_mode"] = "rgb_array"
     profile_runtime_key = resolved_profile_name or runtime_task_name
     _, resolved_runtime, _profile_name = apply_task_profile(profile_runtime_key, runtime_kwargs)
+    effective_control_mode = str(
+        resolved_runtime.get("control_mode") or resolved_control_mode or ""
+    )
+    _validate_checkpoint_action_semantics(
+        ckpt_cfg,
+        control_mode=effective_control_mode,
+    )
 
     env = ManiSkillTaskFactory().create_env(
         task_name=runtime_task_name,
@@ -693,8 +567,6 @@ def run_evaluation(args) -> None:
             {
                 "ckpt_path": args.ckpt_path,
                 "n_action_steps": n_action_steps,
-                "action_low": np.asarray(env.action_space.low, dtype=np.float32),
-                "action_high": np.asarray(env.action_space.high, dtype=np.float32),
             }
         )
     except BaseException:
@@ -706,24 +578,6 @@ def run_evaluation(args) -> None:
         f"executed_steps={n_action_steps} "
         f"checkpoint_executed_steps={int(ckpt_cfg.n_action_steps)}"
     )
-    delta_pose_hold_filter = None
-    if args.delta_pose_hold_mode != "off":
-        runtime_action_type = str(resolved_runtime.get("action_type") or "")
-        runtime_control_mode = str(resolved_runtime.get("control_mode") or resolved_control_mode or "")
-        if DELTA_POSE_CONTROL_MODE in (runtime_action_type, runtime_control_mode):
-            delta_pose_hold_filter = DeltaPoseHoldFilter(
-                mode=args.delta_pose_hold_mode,
-                gripper_threshold=args.delta_pose_hold_gripper_threshold,
-                pos_threshold=args.delta_pose_hold_pos_threshold,
-                rot_threshold=args.delta_pose_hold_rot_threshold,
-            )
-        else:
-            print(
-                "delta_pose_hold_filter disabled "
-                f"mode={args.delta_pose_hold_mode} "
-                f"action_type={runtime_action_type} "
-                f"control_mode={runtime_control_mode}"
-            )
 
     video_dir = Path(args.save_video_dir) if args.save_video_dir is not None else None
     if video_dir is not None:
@@ -733,14 +587,11 @@ def run_evaluation(args) -> None:
     lengths = []
     successes = []
     handover_diags = []
-    action_clip_stats = _new_action_clip_stats()
     action_trace = _new_action_trace() if args.save_action_trace is not None else None
 
     try:
         for episode_idx in range(args.episodes):
             obs = env.reset(seed=args.seed + episode_idx)
-            if delta_pose_hold_filter is not None:
-                delta_pose_hold_filter.reset_episode()
             adapter.reset_model(model)
             encoded_obs = adapter.encode_obs(dict(obs.data))
             missing_obs_keys = [
@@ -777,29 +628,47 @@ def run_evaluation(args) -> None:
             while episode_length < args.max_episode_steps:
                 if len(model.obs_cache) == 0:
                     model.update_obs(encoded_obs)
-                action_chunk = model.get_action()
+                raw_policy_chunk = np.asarray(model.get_action(), dtype=np.float32)
+                target_chunk = _prepare_runtime_action_chunk(
+                    env,
+                    raw_policy_chunk,
+                    control_mode=effective_control_mode,
+                )
+                if effective_control_mode == DELTA_POSE_CONTROL_MODE:
+                    target_chunk = np.stack(
+                        [
+                            _validate_action_in_space(target, env.action_space)
+                            for target in target_chunk
+                        ],
+                        axis=0,
+                    )
+                else:
+                    target_chunk = np.stack(
+                        [
+                            _clip_legacy_action_to_space(action, env.action_space)
+                            for action in target_chunk
+                        ],
+                        axis=0,
+                    )
 
-                for action in action_chunk:
-                    raw_action = np.asarray(action, dtype=np.float32).copy()
-                    filtered_action = raw_action
-                    filter_decisions = None
-                    if delta_pose_hold_filter is not None:
-                        filtered_action = delta_pose_hold_filter.apply(raw_action, env)
-                        filter_decisions = dict(delta_pose_hold_filter.last_decisions)
-                    action = _clip_action_to_space(filtered_action, env.action_space, action_clip_stats)
+                for raw_policy_action, target_action in zip(
+                    raw_policy_chunk,
+                    target_chunk,
+                ):
                     result = env.step(
-                        ActionSpec.from_value(action, action_type=resolved_runtime["action_type"])
+                        ActionSpec.from_value(
+                            target_action,
+                            action_type=resolved_runtime["action_type"],
+                        )
                     )
                     if action_trace is not None:
                         _append_action_trace(
                             action_trace,
                             episode_idx=episode_idx,
                             step=episode_length,
-                            action=action,
+                            target_action=target_action,
                             info=result.info,
-                            raw_action=raw_action,
-                            filtered_action=filtered_action,
-                            filter_decisions=filter_decisions,
+                            raw_policy_action=raw_policy_action,
                         )
                     if _to_bool_scalar(result.info.get("success", False)):
                         success = True
@@ -869,30 +738,6 @@ def run_evaluation(args) -> None:
         f"mean_length={float(np.mean(lengths)):.2f} "
         f"success_rate={float(np.mean(successes)):.4f}"
     )
-    if action_clip_stats["steps"] > 0:
-        clipped_dims = max(1, int(action_clip_stats["clipped_dims"]))
-        print(
-            "action_clip_summary "
-            f"step_frac={action_clip_stats['clipped_steps'] / action_clip_stats['steps']:.6f} "
-            f"dim_frac={action_clip_stats['clipped_dims'] / max(1, action_clip_stats['dims']):.6f} "
-            f"abs_mean={action_clip_stats['abs_sum'] / clipped_dims:.6f} "
-            f"abs_max={action_clip_stats['abs_max']:.6f}"
-        )
-    if delta_pose_hold_filter is not None:
-        stats = delta_pose_hold_filter.stats
-        print(
-            "delta_pose_hold_summary "
-            f"mode={delta_pose_hold_filter.mode} "
-            f"steps={stats['steps']} "
-            f"arm_steps={stats['arm_steps']} "
-            f"held={stats['held']} "
-            f"committed={stats['committed']} "
-            f"closed_passthrough={stats['closed_passthrough']} "
-            f"unavailable={stats['unavailable']} "
-            f"gripper_threshold={delta_pose_hold_filter.gripper_threshold:.4f} "
-            f"pos_threshold={delta_pose_hold_filter.pos_threshold:.6f} "
-            f"rot_threshold={delta_pose_hold_filter.rot_threshold:.6f}"
-        )
     if len(handover_diags) > 0:
         diag_count = float(len(handover_diags))
         stage_buckets = [0, 0, 0, 0, 0]
