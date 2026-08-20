@@ -86,7 +86,7 @@ class ManiSkillDeployAdapterTest(unittest.TestCase):
                 )
                 self.assertEqual(model.policy.n_action_steps, 4)
 
-    def test_resfit_get_model_receives_environment_action_bounds(self) -> None:
+    def test_resfit_get_model_does_not_receive_environment_action_bounds(self) -> None:
         cfg = SimpleNamespace(n_obs_steps=3, n_action_steps=1)
         action_low = np.full(14, -1.0, dtype=np.float32)
         action_high = np.full(14, 1.0, dtype=np.float32)
@@ -117,8 +117,6 @@ class ManiSkillDeployAdapterTest(unittest.TestCase):
             ckpt.name,
             n_obs_steps=3,
             n_action_steps=4,
-            action_low=action_low,
-            action_high=action_high,
         )
         self.assertIs(model, loaded_model)
 

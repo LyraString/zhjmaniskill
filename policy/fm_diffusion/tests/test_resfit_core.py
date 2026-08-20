@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
+from omegaconf import OmegaConf
 from pytorch3d.transforms import euler_angles_to_matrix
 
 from diffusion_policy.common.online_replay_buffer import OnlineReplayBuffer
@@ -19,6 +20,7 @@ from diffusion_policy.model.rl.residual_actor import (
 )
 from diffusion_policy.policy.FPO_image_policy import FPOImagePolicy
 from diffusion_policy.policy.resfit_policy import ResFiTPolicy
+from diffusion_policy.workspace.fpo_robotworkspace import RobotWorkspace as FPOWorkspace
 from diffusion_policy.workspace.resfit_robotworkspace import ResFiTWorkspace
 
 
@@ -118,12 +120,51 @@ class _ToyContinuousRunner:
         self.device = torch.device("cpu")
         self.reset_count = 0
         self.step_count = 0
+        self.prepared_policy_chunks = []
+        self.prepared_absolute_chunks = []
+        self.stepped_actions = []
+        self.action_low = ACTION_LOW.clone()
+        self.action_high = ACTION_HIGH.clone()
+        self._reset_anchors()
+
+    def _reset_anchors(self):
+        env_offset = torch.arange(self.num_envs, dtype=torch.float32)[:, None]
+        self.left_anchor = torch.full((self.num_envs, 3), 10.0) + env_offset
+        self.right_anchor = torch.full((self.num_envs, 3), 20.0) + env_offset
 
     def reset(self):
         self.reset_count += 1
+        self._reset_anchors()
         return {"encoded": torch.zeros(self.num_envs, 4)}, {}
 
+    def set_policy_action_bounds(self, action_low, action_high):
+        self.action_low = torch.as_tensor(action_low, dtype=torch.float32).flatten()
+        self.action_high = torch.as_tensor(action_high, dtype=torch.float32).flatten()
+
+    def clip_actions(self, action):
+        action = torch.as_tensor(action, dtype=torch.float32)
+        return torch.maximum(torch.minimum(action, self.action_high), self.action_low)
+
+    def prepare_action_chunk(self, action_chunk, env_ids=None):
+        action_chunk = torch.as_tensor(action_chunk, dtype=torch.float32)
+        if env_ids is None:
+            env_ids = list(range(self.num_envs))
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long)
+        absolute_chunk = action_chunk.clone()
+        absolute_chunk[:, :, :3] += self.left_anchor[env_ids, None]
+        absolute_chunk[:, :, 7:10] += self.right_anchor[env_ids, None]
+        self.prepared_policy_chunks.append(action_chunk.clone())
+        self.prepared_absolute_chunks.append(absolute_chunk.clone())
+        return absolute_chunk
+
+    def _record_step_action(self, action):
+        action = torch.as_tensor(action, dtype=torch.float32)
+        self.stepped_actions.append(action.clone())
+        self.left_anchor.copy_(action[:, :3])
+        self.right_anchor.copy_(action[:, 7:10])
+
     def step(self, action):
+        self._record_step_action(action)
         self.step_count += 1
         obs = {
             "encoded": torch.full(
@@ -145,7 +186,7 @@ class _ToyContinuousRunner:
 
 class _ToyPartialDoneRunner(_ToyContinuousRunner):
     def step(self, action):
-        del action
+        self._record_step_action(action)
         self.step_count += 1
         obs = {"encoded": torch.ones(self.num_envs, 4)}
         reward = torch.ones(self.num_envs)
@@ -161,9 +202,30 @@ class _ToyPartialDoneRunner(_ToyContinuousRunner):
         self.reset_count += 1
         if env_ids != [0]:
             raise AssertionError(f"Expected only env 0 to reset, got {env_ids}.")
+        self.left_anchor[0] = 100.0
+        self.right_anchor[0] = 200.0
         obs = {"encoded": torch.zeros(self.num_envs, 4)}
         obs["encoded"][0] = 100.0
         return obs, {}
+
+
+class _ToyActionStats:
+    def __init__(self, action_low, action_high):
+        self.action_low = action_low
+        self.action_high = action_high
+
+    def get_input_stats(self):
+        return {"min": self.action_low, "max": self.action_high}
+
+
+class _ToyNormalizer:
+    def __init__(self, action_low, action_high):
+        self.action = _ToyActionStats(action_low, action_high)
+
+    def __getitem__(self, key):
+        if key != "action":
+            raise KeyError(key)
+        return self.action
 
 
 class ResfitCoreTest(unittest.TestCase):
@@ -354,6 +416,160 @@ class ResfitCoreTest(unittest.TestCase):
             rtol=0,
             atol=0,
         )
+
+    def test_fpo_prepares_unclipped_policy_chunk_once(self):
+        runner = _ToyContinuousRunner()
+        action_chunk = torch.zeros(runner.num_envs, 3, 14)
+        action_chunk[0, 1, 0] = 0.2
+        action_chunk[:, :, 6] = 0.5
+        action_chunk[:, :, 13] = 0.5
+
+        absolute_chunk = FPOWorkspace._prepare_absolute_action_chunk(
+            runner,
+            action_chunk,
+        )
+
+        self.assertEqual(len(runner.prepared_policy_chunks), 1)
+        torch.testing.assert_close(
+            runner.prepared_policy_chunks[0],
+            action_chunk,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            absolute_chunk,
+            runner.prepared_absolute_chunks[0],
+            rtol=0,
+            atol=0,
+        )
+        self.assertAlmostEqual(
+            runner.prepared_policy_chunks[0][0, 1, 0].item(),
+            0.2,
+        )
+
+    def test_fpo_checkpoint_validator_rejects_old_delta_semantics(self):
+        checkpoint_cfg = OmegaConf.create(
+            {
+                "n_action_steps": 4,
+                "task": {
+                    "maniskill": {
+                        "control_mode": "bimanual_pd_ee_delta_pose",
+                        "action_semantics": "chunk_anchor_relative_target",
+                        "rotation_representation": "euler_xyz",
+                        "translation_frame": "root_aligned",
+                        "gripper_semantics": "absolute",
+                    }
+                }
+            }
+        )
+        FPOWorkspace._validate_maniskill_checkpoint_action_semantics(
+            {"cfg": checkpoint_cfg},
+            expected_action_steps=4,
+        )
+
+        checkpoint_cfg.task.maniskill.action_semantics = "delta_pose_actual"
+        checkpoint_cfg.task.maniskill.translation_frame = "root_world_aligned"
+        with self.assertRaisesRegex(RuntimeError, "action semantics mismatch"):
+            FPOWorkspace._validate_maniskill_checkpoint_action_semantics(
+                {"cfg": checkpoint_cfg},
+                expected_action_steps=4,
+            )
+
+    def test_resfit_action_bounds_come_from_base_normalizer(self):
+        workspace = ResFiTWorkspace.__new__(ResFiTWorkspace)
+        action_low = torch.linspace(-0.3, -0.1, 14)
+        action_high = torch.linspace(0.1, 0.4, 14)
+        base_policy = SimpleNamespace(
+            normalizer=_ToyNormalizer(action_low, action_high),
+        )
+        runner = _ToyContinuousRunner()
+
+        configured_low, configured_high = workspace._configure_policy_action_bounds(
+            base_policy,
+            runner,
+        )
+
+        torch.testing.assert_close(configured_low, action_low, rtol=0, atol=0)
+        torch.testing.assert_close(configured_high, action_high, rtol=0, atol=0)
+        torch.testing.assert_close(runner.action_low, action_low, rtol=0, atol=0)
+        torch.testing.assert_close(runner.action_high, action_high, rtol=0, atol=0)
+
+    def test_resfit_checkpoint_validator_requires_chunk_anchor_semantics(self):
+        shape_meta = {
+            "obs": {"agent_pos": {"shape": [14], "type": "low_dim"}},
+            "action": {"shape": [14]},
+        }
+        cfg = OmegaConf.create(
+            {
+                "n_obs_steps": 3,
+                "n_action_steps": 4,
+                "horizon": 8,
+                "shape_meta": shape_meta,
+                "training": {"base_policy_source": "ema_model"},
+            }
+        )
+        checkpoint_cfg = OmegaConf.create(
+            {
+                "n_obs_steps": 3,
+                "n_action_steps": 4,
+                "horizon": 8,
+                "shape_meta": shape_meta,
+                "policy": {"denoiser_type": "action_dit"},
+                "task": {
+                    "maniskill": {
+                        "control_mode": "bimanual_pd_ee_delta_pose",
+                        "action_semantics": "chunk_anchor_relative_target",
+                        "rotation_representation": "euler_xyz",
+                        "translation_frame": "root_aligned",
+                        "gripper_semantics": "absolute",
+                        "control_freq": 20,
+                    }
+                },
+            }
+        )
+        payload = {
+            "cfg": checkpoint_cfg,
+            "state_dicts": {
+                "ema_model": {"normalizer.params_dict.action.scale": torch.ones(14)}
+            },
+        }
+
+        ResFiTWorkspace._validate_base_checkpoint(payload, cfg)
+
+        old_semantics_payload = copy.deepcopy(payload)
+        old_semantics_payload["cfg"].task.maniskill.action_semantics = "delta_pose_actual"
+        old_semantics_payload["cfg"].task.maniskill.translation_frame = "root_world_aligned"
+        with self.assertRaisesRegex(RuntimeError, "Base checkpoint semantics mismatch"):
+            ResFiTWorkspace._validate_base_checkpoint(old_semantics_payload, cfg)
+
+        ResFiTWorkspace._validate_resume_checkpoint(payload, cfg)
+        with self.assertRaisesRegex(RuntimeError, "resume checkpoint semantics mismatch"):
+            ResFiTWorkspace._validate_resume_checkpoint(old_semantics_payload, cfg)
+
+    def test_resfit_identity_rollout_steps_absolute_targets(self):
+        workspace = ResFiTWorkspace.__new__(ResFiTWorkspace)
+        policy = _ToyRolloutPolicy()
+        runner = _ToyContinuousRunner()
+        cfg = SimpleNamespace(
+            training=SimpleNamespace(
+                identity_rollout_steps=2,
+                num_envs=runner.num_envs,
+            ),
+            residual_actor=SimpleNamespace(feature_dim=4),
+        )
+
+        summary = workspace._run_identity_rollout(policy, runner, cfg)
+
+        self.assertEqual(summary["steps"], 2)
+        self.assertEqual(summary["identity_error_max"], 0.0)
+        self.assertEqual(len(runner.prepared_policy_chunks), 2)
+        self.assertEqual(len(runner.stepped_actions), 2)
+        for prepared, stepped in zip(
+            runner.prepared_absolute_chunks,
+            runner.stepped_actions,
+            strict=True,
+        ):
+            torch.testing.assert_close(stepped, prepared[:, 0], rtol=0, atol=0)
 
     def test_online_replay_buffer_wraps_and_samples(self):
         buffer = OnlineReplayBuffer(capacity=5, feature_dim=3, action_dim=2)
@@ -563,14 +779,31 @@ class ResfitCoreTest(unittest.TestCase):
         self.assertEqual(first["transitions"], 4)
         self.assertEqual(second["transitions"], 4)
         self.assertEqual(policy.base_predict_count, 2)
+        self.assertEqual(len(runner.prepared_policy_chunks), 2)
         self.assertEqual(rollout_state["chunk_index"], 0)
         torch.testing.assert_close(
             replay._storage["action"][:8],
             torch.zeros(8, 14),
         )
+        torch.testing.assert_close(
+            torch.stack(runner.stepped_actions, dim=1),
+            runner.prepared_absolute_chunks[0],
+            rtol=0,
+            atol=0,
+        )
+        self.assertNotEqual(
+            runner.stepped_actions[0][0, 0].item(),
+            replay._storage["action"][0, 0].item(),
+        )
         self.assertGreater(
             float(rollout_state["current_result"]["residual_action"].abs().amax()),
             0.0,
+        )
+        torch.testing.assert_close(
+            rollout_state["current_result"]["absolute_action"],
+            runner.prepared_absolute_chunks[-1],
+            rtol=0,
+            atol=0,
         )
         torch.testing.assert_close(
             rollout_state["episode_length"],
@@ -601,10 +834,35 @@ class ResfitCoreTest(unittest.TestCase):
         )
 
         self.assertEqual(policy.base_predict_count, 3)
+        self.assertEqual(len(runner.prepared_policy_chunks), 2)
         self.assertEqual(rollout_state["chunk_index"], 0)
         torch.testing.assert_close(
             replay._storage["next_obs_feature"][:2],
             torch.ones(2, 4),
+        )
+        torch.testing.assert_close(
+            replay._storage["action"][:2],
+            torch.zeros(2, 14),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            runner.stepped_actions[0],
+            runner.prepared_absolute_chunks[0][:, 0],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            runner.prepared_absolute_chunks[1][0, :, :3],
+            torch.full((4, 3), 100.0),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            rollout_state["current_result"]["absolute_action"],
+            runner.prepared_absolute_chunks[1],
+            rtol=0,
+            atol=0,
         )
         torch.testing.assert_close(
             rollout_state["current_result"]["obs_feature"],

@@ -21,14 +21,10 @@ class DP:
         ckpt_file: str,
         n_obs_steps: int,
         n_action_steps: int,
-        action_low,
-        action_high,
     ) -> None:
         self.policy = self.get_policy(
             ckpt_file,
             n_action_steps=n_action_steps,
-            action_low=action_low,
-            action_high=action_high,
             device="cuda:0",
         )
         self.runner = DPRunner(
@@ -51,7 +47,7 @@ class DP:
         return self.runner.obs[-1]
 
     @staticmethod
-    def get_policy(checkpoint, n_action_steps, action_low, action_high, device):
+    def get_policy(checkpoint, n_action_steps, device):
         checkpoint_path = pathlib.Path(checkpoint).expanduser()
         with checkpoint_path.open("rb") as file:
             payload = torch.load(file, pickle_module=dill, map_location="cpu")
@@ -94,6 +90,21 @@ class DP:
         else:
             raise ValueError("training.base_policy_source must be `model` or `ema_model`.")
         base_policy.n_action_steps = int(n_action_steps)
+        normalizer = getattr(base_policy, "normalizer", None)
+        if normalizer is None or "action" not in normalizer.params_dict:
+            raise RuntimeError("Base policy checkpoint has no action normalizer statistics.")
+        action_stats = normalizer["action"].get_input_stats()
+        action_low = action_stats["min"].detach().to(device="cpu", dtype=torch.float32)
+        action_high = action_stats["max"].detach().to(device="cpu", dtype=torch.float32)
+        if action_low.shape != (14,) or action_high.shape != (14,):
+            raise RuntimeError(
+                "Base policy action normalizer must contain 14D min/max statistics, got "
+                f"{tuple(action_low.shape)} and {tuple(action_high.shape)}."
+            )
+        if not torch.isfinite(action_low).all() or not torch.isfinite(action_high).all():
+            raise RuntimeError("Base policy action normalizer bounds contain NaN or Inf values.")
+        if not torch.all(action_low < action_high):
+            raise RuntimeError("Base policy action normalizer requires min < max in every dimension.")
 
         policy = ResFiTPolicy(
             base_policy=base_policy,

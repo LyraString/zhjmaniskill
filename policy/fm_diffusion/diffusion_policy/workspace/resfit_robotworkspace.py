@@ -118,11 +118,12 @@ class ResFiTWorkspace(BaseWorkspace):
             resume_path = pathlib.Path(str(resume_path)).expanduser()
             if not resume_path.is_file():
                 raise FileNotFoundError(f"ResFiT checkpoint not found: {resume_path}")
-            self.load_checkpoint(
+            resume_payload = self.load_checkpoint(
                 path=resume_path,
                 exclude_keys=self.exclude_keys,
                 include_keys=self.include_keys,
             )
+            self._validate_resume_checkpoint(resume_payload, cfg)
             optimizer_to(self.actor_optimizer, device)
             optimizer_to(self.critic_optimizer, device)
             self.target_residual_actor.eval()
@@ -189,11 +190,15 @@ class ResFiTWorkspace(BaseWorkspace):
             )
 
         try:
+            policy_action_low, policy_action_high = self._configure_policy_action_bounds(
+                base_policy,
+                runner,
+            )
             policy = ResFiTPolicy(
                 base_policy=base_policy,
                 residual_actor=self.residual_actor,
-                action_low=runner.action_low,
-                action_high=runner.action_high,
+                action_low=policy_action_low,
+                action_high=policy_action_high,
             ).to(device).eval()
             if is_main_process and distributed:
                 print(
@@ -247,17 +252,19 @@ class ResFiTWorkspace(BaseWorkspace):
 
         expected = {
             "n_obs_steps": int(cfg.n_obs_steps),
+            "n_action_steps": int(cfg.n_action_steps),
             "horizon": int(cfg.horizon),
             "action_dim": int(cfg.shape_meta.action.shape[0]),
             "control_mode": "bimanual_pd_ee_delta_pose",
-            "action_semantics": "delta_pose_actual",
+            "action_semantics": "chunk_anchor_relative_target",
             "rotation_representation": "euler_xyz",
-            "translation_frame": "root_world_aligned",
+            "translation_frame": "root_aligned",
             "gripper_semantics": "absolute",
             "control_freq": 20,
         }
         actual = {
             "n_obs_steps": int(checkpoint_cfg.n_obs_steps),
+            "n_action_steps": int(checkpoint_cfg.n_action_steps),
             "horizon": int(checkpoint_cfg.horizon),
             "action_dim": int(checkpoint_cfg.shape_meta.action.shape[0]),
             "control_mode": str(checkpoint_cfg.task.maniskill.control_mode),
@@ -296,6 +303,56 @@ class ResFiTWorkspace(BaseWorkspace):
         if not any(str(key).startswith("normalizer.") for key in source_state):
             raise RuntimeError("Selected base policy checkpoint has no saved normalizer.")
 
+    @staticmethod
+    def _validate_resume_checkpoint(payload: dict, cfg: OmegaConf) -> None:
+        checkpoint_cfg = payload.get("cfg")
+        if checkpoint_cfg is None:
+            raise RuntimeError("ResFiT resume checkpoint has no saved Hydra configuration.")
+        expected = {
+            "n_obs_steps": int(cfg.n_obs_steps),
+            "n_action_steps": int(cfg.n_action_steps),
+            "horizon": int(cfg.horizon),
+            "action_dim": int(cfg.shape_meta.action.shape[0]),
+            "control_mode": "bimanual_pd_ee_delta_pose",
+            "action_semantics": "chunk_anchor_relative_target",
+            "rotation_representation": "euler_xyz",
+            "translation_frame": "root_aligned",
+            "gripper_semantics": "absolute",
+        }
+        try:
+            actual = {
+                "n_obs_steps": int(checkpoint_cfg.n_obs_steps),
+                "n_action_steps": int(checkpoint_cfg.n_action_steps),
+                "horizon": int(checkpoint_cfg.horizon),
+                "action_dim": int(checkpoint_cfg.shape_meta.action.shape[0]),
+                "control_mode": str(checkpoint_cfg.task.maniskill.control_mode),
+                "action_semantics": str(
+                    checkpoint_cfg.task.maniskill.action_semantics
+                ),
+                "rotation_representation": str(
+                    checkpoint_cfg.task.maniskill.rotation_representation
+                ),
+                "translation_frame": str(
+                    checkpoint_cfg.task.maniskill.translation_frame
+                ),
+                "gripper_semantics": str(
+                    checkpoint_cfg.task.maniskill.gripper_semantics
+                ),
+            }
+        except (AttributeError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                "ResFiT resume checkpoint is missing action execution semantics."
+            ) from exc
+        mismatches = {
+            key: (expected_value, actual[key])
+            for key, expected_value in expected.items()
+            if actual[key] != expected_value
+        }
+        if mismatches:
+            raise RuntimeError(
+                f"ResFiT resume checkpoint semantics mismatch: {mismatches}"
+            )
+
     def _run_identity_rollout(self, policy, runner, cfg) -> dict:
         steps = int(cfg.training.identity_rollout_steps)
         if steps <= 0:
@@ -314,6 +371,11 @@ class ResFiTWorkspace(BaseWorkspace):
             base_action = result["base_action"]
             residual_action = result["residual_action"]
             action = result["action"][:, 0]
+            absolute_action_chunk = self._prepare_absolute_action_chunk(
+                runner,
+                result["action"],
+            )
+            absolute_action = absolute_action_chunk[:, 0]
             expected_action = runner.clip_actions(base_action)
 
             if not all(
@@ -341,7 +403,7 @@ class ResFiTWorkspace(BaseWorkspace):
             action_abs_max = max(action_abs_max, float(action.abs().amax().item()))
             feature_shape = tuple(result["obs_feature"].shape)
 
-            next_obs, _, terminated, truncated, _ = runner.step(action)
+            next_obs, _, terminated, truncated, _ = runner.step(absolute_action)
             obs_history = self._append_obs_history(obs_history, next_obs)
             done_ids = torch.logical_or(terminated, truncated).nonzero(as_tuple=False).flatten()
             if done_ids.numel() > 0:
@@ -364,6 +426,48 @@ class ResFiTWorkspace(BaseWorkspace):
             "identity_error_max": identity_error_max,
             "action_abs_max": action_abs_max,
         }
+
+    @staticmethod
+    def _configure_policy_action_bounds(base_policy, runner):
+        """Install ResFiT algorithm bounds from the base action normalizer."""
+
+        try:
+            action_stats = base_policy.normalizer["action"].get_input_stats()
+            action_low = torch.as_tensor(action_stats["min"], dtype=torch.float32).flatten()
+            action_high = torch.as_tensor(action_stats["max"], dtype=torch.float32).flatten()
+        except (AttributeError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                "Base policy action normalizer must expose finite `min`/`max` input stats."
+            ) from exc
+        if action_low.shape != (14,) or action_high.shape != (14,):
+            raise RuntimeError(
+                "Base policy action normalizer bounds must both have shape (14,), got "
+                f"{tuple(action_low.shape)} and {tuple(action_high.shape)}."
+            )
+        if not torch.isfinite(action_low).all() or not torch.isfinite(action_high).all():
+            raise RuntimeError("Base policy action normalizer bounds contain NaN or Inf values.")
+        if not torch.all(action_low < action_high):
+            raise RuntimeError(
+                "Every base policy action normalizer minimum must be smaller than its maximum."
+            )
+
+        runner.set_policy_action_bounds(action_low, action_high)
+        configured_low = torch.as_tensor(
+            runner.action_low,
+            dtype=torch.float32,
+        ).flatten()
+        configured_high = torch.as_tensor(
+            runner.action_high,
+            dtype=torch.float32,
+        ).flatten()
+        if not torch.equal(configured_low.cpu(), action_low.cpu()) or not torch.equal(
+            configured_high.cpu(),
+            action_high.cpu(),
+        ):
+            raise RuntimeError(
+                "Runner policy action bounds differ from the base normalizer input stats."
+            )
+        return configured_low, configured_high
 
     def _run_online_training(
         self,
@@ -739,7 +843,12 @@ class ResFiTWorkspace(BaseWorkspace):
         policy.eval()
         with torch.inference_mode():
             base_result = policy.predict_base_action_chunk(obs_history)
-            current_result = self._prepare_rollout_chunk(policy, base_result, cfg)
+            current_result = self._prepare_rollout_chunk(
+                policy,
+                base_result,
+                cfg,
+                runner,
+            )
         return {
             "obs_history": obs_history,
             "current_result": current_result,
@@ -795,12 +904,13 @@ class ResFiTWorkspace(BaseWorkspace):
             base_action = base_action_sequence[:, chunk_index]
             residual_action = current_result["residual_action"][:, chunk_index]
             action = current_result["action"][:, chunk_index]
+            absolute_action = current_result["absolute_action"][:, chunk_index]
             if not torch.isfinite(action).all():
                 raise RuntimeError("ResFiT rollout action contains NaN or Inf values.")
             if torch.any(action < policy.action_low) or torch.any(action > policy.action_high):
-                raise RuntimeError("ResFiT rollout action exceeded environment bounds.")
+                raise RuntimeError("ResFiT rollout action exceeded policy normalizer bounds.")
 
-            next_obs, reward, terminated, truncated, info = runner.step(action)
+            next_obs, reward, terminated, truncated, info = runner.step(absolute_action)
             next_obs_history = self._append_obs_history(obs_history, next_obs)
             done_ids = torch.logical_or(terminated, truncated).nonzero(
                 as_tuple=False
@@ -890,6 +1000,7 @@ class ResFiTWorkspace(BaseWorkspace):
                     policy,
                     current_result,
                     cfg,
+                    runner,
                 )
                 chunk_index = 0
             else:
@@ -898,6 +1009,7 @@ class ResFiTWorkspace(BaseWorkspace):
                         policy,
                         transition_next_result,
                         cfg,
+                        runner,
                     )
                 else:
                     current_result = transition_next_result
@@ -930,7 +1042,27 @@ class ResFiTWorkspace(BaseWorkspace):
         }
 
     @staticmethod
-    def _prepare_rollout_chunk(policy, base_result, cfg) -> dict[str, torch.Tensor]:
+    def _prepare_absolute_action_chunk(runner, action_chunk) -> torch.Tensor:
+        """Resolve a policy-domain chunk once against the current EEF anchors."""
+
+        absolute_action_chunk = runner.prepare_action_chunk(action_chunk)
+        absolute_action_chunk = torch.as_tensor(
+            absolute_action_chunk,
+            device=action_chunk.device,
+            dtype=action_chunk.dtype,
+        )
+        if absolute_action_chunk.shape != action_chunk.shape:
+            raise RuntimeError(
+                "Prepared ResFiT action chunk shape mismatch: "
+                f"policy={tuple(action_chunk.shape)}, "
+                f"absolute={tuple(absolute_action_chunk.shape)}."
+            )
+        if not torch.isfinite(absolute_action_chunk).all():
+            raise RuntimeError("Prepared ResFiT action chunk contains NaN or Inf values.")
+        return absolute_action_chunk
+
+    @staticmethod
+    def _prepare_rollout_chunk(policy, base_result, cfg, runner) -> dict[str, torch.Tensor]:
         base_action = base_result["base_action"]
         obs_feature = base_result["obs_feature"]
         feature_sequence = obs_feature[:, None, :].expand(
@@ -957,11 +1089,16 @@ class ResFiTWorkspace(BaseWorkspace):
                 policy.action_low,
                 policy.action_high,
             )
+            absolute_action = ResFiTWorkspace._prepare_absolute_action_chunk(
+                runner,
+                action,
+            )
         return {
             "base_action": base_action,
             "obs_feature": obs_feature,
             "residual_action": residual_action,
             "action": action,
+            "absolute_action": absolute_action,
         }
 
     @staticmethod

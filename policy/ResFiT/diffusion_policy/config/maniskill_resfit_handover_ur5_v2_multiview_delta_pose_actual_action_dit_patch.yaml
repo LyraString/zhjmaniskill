@@ -21,6 +21,10 @@ task:
     robot_uids: null
     sim_freq: 200
     control_freq: 20
+    action_semantics: chunk_anchor_relative_target
+    rotation_representation: euler_xyz
+    translation_frame: root_aligned
+    gripper_semantics: absolute
   shape_meta: &shape_meta
     obs:
       head_point_cloud:

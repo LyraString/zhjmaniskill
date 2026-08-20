@@ -27,15 +27,11 @@ def get_model(usr_args):
         payload = torch.load(file, pickle_module=dill, map_location="cpu")
     cfg = payload["cfg"]
     n_action_steps = int(usr_args.get("n_action_steps", cfg.n_action_steps))
-    if "action_low" not in usr_args or "action_high" not in usr_args:
-        raise ValueError("ResFiT deployment requires environment action bounds.")
 
     return DP(
         ckpt_file,
         n_obs_steps=int(cfg.n_obs_steps),
         n_action_steps=n_action_steps,
-        action_low=usr_args["action_low"],
-        action_high=usr_args["action_high"],
     )
 
 
