@@ -91,3 +91,8 @@ class ManiSkillFPORunner(OnlineEnvRunner):
     def step(self, action):
         obs, reward, terminated, truncated, info = super().step(action)
         return self._format_obs(obs), reward, terminated, truncated, info
+
+    def prepare_action_chunk(self, action_chunk):
+        """Resolve one policy chunk before executing any target in it."""
+
+        return self.backend.prepare_action_chunk(action_chunk)

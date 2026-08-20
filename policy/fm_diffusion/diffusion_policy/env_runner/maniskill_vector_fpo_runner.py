@@ -140,5 +140,10 @@ class ManiSkillVectorFPORunner:
         info = [dict(item.info) for item in results]
         return obs, rew, terminated, truncated, info
 
+    def prepare_action_chunk(self, action_chunk, env_ids=None):
+        """Resolve one batched policy chunk before executing any target in it."""
+
+        return self.backend.prepare_action_chunk(action_chunk, env_ids=env_ids)
+
     def close(self):
         self.backend.close()

@@ -11,10 +11,10 @@ maniskill:
   robot_uids: none
   sim_freq: 200
   control_freq: 20
-  zarr_path: data/HandoverBlockUR5-v2-delta_mv_actual_500_v1-500.zarr
-  action_semantics: delta_pose_actual
+  zarr_path: ../FlowMatching/data/HandoverBlockUR5-v2-delta_mv_actual_place_terminal_300_dynamic_v1-300.zarr
+  action_semantics: chunk_anchor_relative_target
   rotation_representation: euler_xyz
-  translation_frame: root_world_aligned
+  translation_frame: root_aligned
   gripper_semantics: absolute
 
 shape_meta: &shape_meta
@@ -35,10 +35,11 @@ shape_meta: &shape_meta
     shape: [14]
 
 dataset:
-  _target_: diffusion_policy.dataset.robot_pointcloud_dataset.RobotMultiViewPointCloudDataset
+  _target_: diffusion_policy.dataset.robot_pointcloud_dataset.RobotMultiViewPointCloudChunkAnchorDataset
   zarr_path: ${task.maniskill.zarr_path}
   batch_size: ${dataloader.batch_size}
   horizon: ${horizon}
+  obs_steps: ${n_obs_steps}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}
   seed: 42

@@ -431,6 +431,12 @@ class RobotWorkspace(BaseWorkspace):
 
         env_backend = str(getattr(cfg.training, "env_backend", "robotwin_legacy"))
         num_envs = int(getattr(cfg.training, "num_envs", 1))
+        uses_absolute_eef_runtime = self._uses_absolute_eef_chunk_runtime(cfg)
+        if uses_absolute_eef_runtime and loaded_checkpoint_payload is not None:
+            self._validate_maniskill_checkpoint_action_semantics(
+                loaded_checkpoint_payload,
+                expected_action_steps=int(cfg.n_action_steps),
+            )
         if distributed and not (env_backend == "maniskill" and num_envs > 1):
             raise RuntimeError(
                 "Distributed FPO currently requires the ManiSkill CUDA vector runner "
@@ -1318,6 +1324,107 @@ class RobotWorkspace(BaseWorkspace):
             reset_value = obs[key][env_idx].unsqueeze(1).expand(-1, value.shape[1], *value.shape[2:])
             value[env_idx] = reset_value
 
+    @staticmethod
+    def _uses_absolute_eef_chunk_runtime(cfg):
+        if str(getattr(cfg.training, "env_backend", "robotwin_legacy")) != "maniskill":
+            return False
+        task_maniskill_cfg = getattr(cfg.task, "maniskill", None)
+        if task_maniskill_cfg is None or str(
+            getattr(task_maniskill_cfg, "control_mode", "")
+        ) != "bimanual_pd_ee_delta_pose":
+            return False
+        actual = {
+            "control_mode": str(getattr(task_maniskill_cfg, "control_mode", "")),
+            "action_semantics": str(getattr(task_maniskill_cfg, "action_semantics", "")),
+            "rotation_representation": str(
+                getattr(task_maniskill_cfg, "rotation_representation", "")
+            ),
+            "translation_frame": str(getattr(task_maniskill_cfg, "translation_frame", "")),
+            "gripper_semantics": str(
+                getattr(task_maniskill_cfg, "gripper_semantics", "")
+            ),
+        }
+        expected = {
+            "control_mode": "bimanual_pd_ee_delta_pose",
+            "action_semantics": "chunk_anchor_relative_target",
+            "rotation_representation": "euler_xyz",
+            "translation_frame": "root_aligned",
+            "gripper_semantics": "absolute",
+        }
+        mismatches = {
+            key: (expected_value, actual[key])
+            for key, expected_value in expected.items()
+            if actual[key] != expected_value
+        }
+        if mismatches:
+            raise RuntimeError(
+                "ManiSkill FPO runtime action semantics mismatch: "
+                f"{mismatches}"
+            )
+        return True
+
+    @staticmethod
+    def _validate_maniskill_checkpoint_action_semantics(
+        payload,
+        *,
+        expected_action_steps,
+    ):
+        checkpoint_cfg = payload.get("cfg")
+        if checkpoint_cfg is None:
+            raise RuntimeError("ManiSkill FPO checkpoint has no saved Hydra configuration.")
+        try:
+            maniskill_cfg = checkpoint_cfg.task.maniskill
+            actual = {
+                "control_mode": str(maniskill_cfg.control_mode),
+                "action_semantics": str(maniskill_cfg.action_semantics),
+                "rotation_representation": str(maniskill_cfg.rotation_representation),
+                "translation_frame": str(maniskill_cfg.translation_frame),
+                "gripper_semantics": str(maniskill_cfg.gripper_semantics),
+                "n_action_steps": int(checkpoint_cfg.n_action_steps),
+            }
+        except (AttributeError, KeyError) as exc:
+            raise RuntimeError(
+                "ManiSkill FPO checkpoint is missing action execution semantics."
+            ) from exc
+        expected = {
+            "control_mode": "bimanual_pd_ee_delta_pose",
+            "action_semantics": "chunk_anchor_relative_target",
+            "rotation_representation": "euler_xyz",
+            "translation_frame": "root_aligned",
+            "gripper_semantics": "absolute",
+            "n_action_steps": int(expected_action_steps),
+        }
+        mismatches = {
+            key: (expected_value, actual[key])
+            for key, expected_value in expected.items()
+            if actual[key] != expected_value
+        }
+        if mismatches:
+            raise RuntimeError(
+                "ManiSkill FPO checkpoint action semantics mismatch: "
+                f"{mismatches}"
+            )
+
+    @staticmethod
+    def _prepare_absolute_action_chunk(env, action_chunk):
+        """Resolve one unmodified policy-domain chunk into fixed EEF targets."""
+
+        absolute_action_chunk = env.prepare_action_chunk(action_chunk)
+        absolute_action_chunk = torch.as_tensor(
+            absolute_action_chunk,
+            device=action_chunk.device,
+            dtype=action_chunk.dtype,
+        )
+        if absolute_action_chunk.shape != action_chunk.shape:
+            raise RuntimeError(
+                "Prepared FPO action chunk shape mismatch: "
+                f"policy={tuple(action_chunk.shape)}, "
+                f"absolute={tuple(absolute_action_chunk.shape)}."
+            )
+        if not torch.isfinite(absolute_action_chunk).all():
+            raise RuntimeError("Prepared FPO action chunk contains NaN or Inf values.")
+        return absolute_action_chunk
+
     def collect_rollout_maniskill_cuda_vector(self, env, device, num_envs):
         cfg_t = self.cfg.training
         actor_amp_enabled, actor_amp_dtype = _resolve_actor_amp_config(cfg_t, device)
@@ -1591,6 +1698,13 @@ class RobotWorkspace(BaseWorkspace):
                 # Critic inputs and environment actions stay in FP32.
                 out["global_cond"] = out["global_cond"].float()
                 action_chunk = out["action"].detach().float()
+                if self._uses_absolute_eef_chunk_runtime(self.cfg):
+                    absolute_action_chunk = self._prepare_absolute_action_chunk(
+                        env,
+                        action_chunk,
+                    )
+                else:
+                    absolute_action_chunk = action_chunk
                 chunk_limit = min(chunk_steps, int(action_chunk.shape[1]))
                 executed_actions = []
                 chunk_start_step = len(reward_steps)
@@ -1611,15 +1725,14 @@ class RobotWorkspace(BaseWorkspace):
                         v = self.critic(critic_in).squeeze(-1)
 
                     actions = action_chunk[:, chunk_i].detach()
-                    if hasattr(env, "clip_actions"):
-                        actions = env.clip_actions(actions)
+                    absolute_actions = absolute_action_chunk[:, chunk_i].detach()
                     action_stats = actions.detach().to(device=device, dtype=torch.float32)
                     action_abs_max_steps.append(action_stats.abs().amax())
                     action_abs_mean_steps.append(action_stats.abs().mean())
                     action_mean_steps.append(action_stats.mean())
                     action_std_steps.append(action_stats.std(unbiased=False))
 
-                    next_obs, rew, terminated, truncated, info = env.step(actions)
+                    next_obs, rew, terminated, truncated, info = env.step(absolute_actions)
                     for info_metric_key in info_metric_keys:
                         append_info_metric(info, info_metric_key)
                     done_tensor = torch.logical_or(terminated, truncated)
@@ -1964,9 +2077,26 @@ class RobotWorkspace(BaseWorkspace):
                         critic_in = out["global_cond"]
                         v = self.critic(critic_in).squeeze(-1)                     # [1]
 
-                    # 执行动作：默认取第一个动作
-                    # out["action"]: [1, Ta, Da]
-                    env_action = out["action"][0, 0].detach().cpu().numpy()
+                    # ManiSkill policy actions are anchor-relative chunks. Resolve
+                    # the whole chunk once, even though this legacy single-env
+                    # rollout consumes only its first slot.
+                    policy_action_chunk = out["action"][0].detach().cpu().numpy()
+                    if self._uses_absolute_eef_chunk_runtime(self.cfg):
+                        absolute_action_chunk = env.prepare_action_chunk(policy_action_chunk)
+                        absolute_action_chunk = np.asarray(absolute_action_chunk, dtype=np.float32)
+                        if absolute_action_chunk.shape != policy_action_chunk.shape:
+                            raise RuntimeError(
+                                "Prepared single-env FPO action chunk shape mismatch: "
+                                f"policy={policy_action_chunk.shape}, "
+                                f"absolute={absolute_action_chunk.shape}."
+                            )
+                        if not np.isfinite(absolute_action_chunk).all():
+                            raise RuntimeError(
+                                "Prepared single-env FPO action chunk contains NaN or Inf values."
+                            )
+                        env_action = absolute_action_chunk[0]
+                    else:
+                        env_action = policy_action_chunk[0]
 
                     with _maybe_suppress_stdout(suppress_env_step_print):
                         next_obs, rew, terminated, truncated, _ = env.step(env_action)

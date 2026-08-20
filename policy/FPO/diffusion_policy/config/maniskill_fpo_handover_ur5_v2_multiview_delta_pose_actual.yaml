@@ -6,7 +6,7 @@ defaults:
 name: maniskill_fpo_handover_ur5_v2_multiview_delta_pose_actual
 exp_name: handover_block_ur5_v2_multiview_delta_pose_actual
 
-n_action_steps: 1
+n_action_steps: 4
 
 policy:
   obs_encoder:

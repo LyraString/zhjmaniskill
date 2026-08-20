@@ -203,16 +203,18 @@ class ManiSkillCudaFPORunner:
                     f"expected {expected_device}, got {self.device}."
                 )
         action_space = getattr(self.env.unwrapped, "single_action_space", self.env.action_space)
-        self.action_low = torch.as_tensor(
+        self.target_action_low = torch.as_tensor(
             action_space.low,
             device=self.device,
             dtype=torch.float32,
-        ).reshape(1, self.action_dim)
-        self.action_high = torch.as_tensor(
+        ).reshape(self.action_dim)
+        self.target_action_high = torch.as_tensor(
             action_space.high,
             device=self.device,
             dtype=torch.float32,
-        ).reshape(1, self.action_dim)
+        ).reshape(self.action_dim)
+        self.action_low = None
+        self.action_high = None
         self.crop_min = torch.as_tensor(
             DEFAULT_POINT_CLOUD_CROP_MIN,
             device=self.device,
@@ -268,9 +270,52 @@ class ManiSkillCudaFPORunner:
         raw_obs, reward, terminated, truncated, info = self.env.step(actions)
         return self.format_obs(raw_obs), reward, terminated, truncated, info
 
+    def set_policy_action_bounds(self, action_low, action_high) -> None:
+        """Configure algorithm bounds without reusing the absolute controller Box."""
+
+        low = torch.as_tensor(action_low, device=self.device, dtype=torch.float32).flatten()
+        high = torch.as_tensor(action_high, device=self.device, dtype=torch.float32).flatten()
+        if low.shape != (self.action_dim,) or high.shape != (self.action_dim,):
+            raise ValueError(
+                "Policy action bounds must match the runner action dimension: "
+                f"expected {(self.action_dim,)}, got {tuple(low.shape)} and {tuple(high.shape)}."
+            )
+        if not torch.isfinite(low).all() or not torch.isfinite(high).all():
+            raise ValueError("Policy action bounds contain NaN or Inf values.")
+        if not torch.all(low < high):
+            raise ValueError("Every policy action lower bound must be smaller than its upper bound.")
+        self.action_low = low
+        self.action_high = high
+
     def clip_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """Clip only in the explicitly configured policy/algorithm domain."""
+
+        if self.action_low is None or self.action_high is None:
+            raise RuntimeError(
+                "Policy action bounds are not configured. Call set_policy_action_bounds() "
+                "with the base policy normalizer statistics first."
+            )
         actions = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
         return torch.minimum(torch.maximum(actions, self.action_low), self.action_high)
+
+    def prepare_action_chunk(self, action_chunk, env_ids=None) -> torch.Tensor:
+        """Resolve one batched anchor-relative chunk against one EEF snapshot."""
+
+        chunk = torch.as_tensor(action_chunk, device=self.device, dtype=torch.float32)
+        if chunk.ndim != 3 or chunk.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"Expected policy chunk shape [B, K, {self.action_dim}], "
+                f"got {tuple(chunk.shape)}."
+            )
+        if env_ids is None and chunk.shape[0] != self.num_envs:
+            raise ValueError(
+                f"Expected policy chunk batch {self.num_envs}, got {chunk.shape[0]}."
+            )
+        if chunk.shape[1] < 1:
+            raise ValueError("Policy action chunk must contain at least one step.")
+        if not torch.isfinite(chunk).all():
+            raise ValueError("Policy action chunk contains NaN or Inf values.")
+        return self.env.unwrapped.prepare_action_chunk(chunk, env_ids=env_ids)
 
     def close(self) -> None:
         self.env.close()
