@@ -162,9 +162,9 @@ def _prepare_runtime_action_chunk(env, action_chunk, *, control_mode: str):
 
 
 def _validate_action_in_space(action, action_space) -> np.ndarray:
-    """Fail fast instead of silently changing a prepared controller target."""
+    """Clamp absolute gripper commands while keeping pose targets strict."""
 
-    action_np = np.asarray(action, dtype=np.float32)
+    action_np = np.asarray(action, dtype=np.float32).copy()
     low = np.asarray(action_space.low, dtype=np.float32)
     high = np.asarray(action_space.high, dtype=np.float32)
     if action_np.shape != low.shape or action_np.shape != high.shape:
@@ -174,6 +174,16 @@ def _validate_action_in_space(action, action_space) -> np.ndarray:
         )
     if not np.isfinite(action_np).all():
         raise ValueError("Controller target contains NaN or Inf values.")
+
+    # Gripper outputs are continuous network predictions for bounded absolute
+    # commands, so harmless numerical overshoot should saturate at the actuator
+    # boundary. Cartesian pose targets remain fail-fast below.
+    gripper_dims = (6, 13)
+    action_np[list(gripper_dims)] = np.clip(
+        action_np[list(gripper_dims)],
+        low[list(gripper_dims)],
+        high[list(gripper_dims)],
+    )
     invalid = (action_np < low) | (action_np > high)
     if np.any(invalid):
         indices = np.flatnonzero(invalid).tolist()
