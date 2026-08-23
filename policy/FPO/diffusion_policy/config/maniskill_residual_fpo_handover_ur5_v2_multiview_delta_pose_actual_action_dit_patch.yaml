@@ -1,0 +1,29 @@
+defaults:
+  - maniskill_fpo_handover_ur5_v2_multiview_delta_pose_actual_action_dit_patch
+  - _self_
+
+name: maniskill_residual_fpo_handover_ur5_v2_multiview_delta_pose_actual_action_dit_patch
+exp_name: handover_block_ur5_v2_residual_fpo_action_dit_patch
+
+policy:
+  velocity_residual:
+    _target_: diffusion_policy.model.rl.residual_velocity_transformer.ResidualVelocityTransformer
+    action_dim: ${eval:'${task.shape_meta.action.shape[0]}'}
+    horizon: ${horizon}
+    condition_dim: ${policy.action_dit.hidden_dim}
+    num_arms: 2
+    hidden_dim: 256
+    depth: 4
+    num_heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.0
+    residual_scale: 0.1
+  freeze_base_velocity: true
+
+optimizer:
+  lr: 1.0e-5
+
+training:
+  online_iters: 200
+  checkpoint_every: 50
+  velocity_kl_coeff: 0.05

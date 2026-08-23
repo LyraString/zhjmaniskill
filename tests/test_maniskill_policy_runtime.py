@@ -213,6 +213,8 @@ class ManiSkillPolicyRuntimeTest(unittest.TestCase):
         runner.device = torch.device("cpu")
         runner.action_dim = 14
         runner.num_envs = 2
+        runner.target_action_low = torch.tensor([-2.0] * 6 + [0.0] + [-2.0] * 6 + [0.0])
+        runner.target_action_high = torch.tensor([2.0] * 6 + [1.0] + [2.0] * 6 + [1.0])
         chunk = torch.zeros((2, 4, 14), dtype=torch.float32)
         expected = chunk + 1.0
         prepare = mock.Mock(return_value=expected)
@@ -224,6 +226,36 @@ class ManiSkillPolicyRuntimeTest(unittest.TestCase):
 
         prepare.assert_called_once_with(chunk, env_ids=None)
         torch.testing.assert_close(result, expected)
+
+    def test_cuda_runner_clamps_only_prepared_gripper_targets(self) -> None:
+        runner = object.__new__(ManiSkillCudaFPORunner)
+        runner.device = torch.device("cpu")
+        runner.action_dim = 14
+        runner.num_envs = 1
+        runner.target_action_low = torch.tensor([-2.0] * 6 + [0.0] + [-2.0] * 6 + [0.0])
+        runner.target_action_high = torch.tensor([2.0] * 6 + [1.0] + [2.0] * 6 + [1.0])
+        chunk = torch.zeros((1, 2, 14), dtype=torch.float32)
+        targets = chunk.clone()
+        targets[..., 6] = -0.1
+        targets[..., 13] = 1.1
+        runner.env = SimpleNamespace(
+            unwrapped=SimpleNamespace(
+                prepare_action_chunk=mock.Mock(return_value=targets),
+            ),
+        )
+
+        result = runner.prepare_action_chunk(chunk)
+
+        torch.testing.assert_close(result[..., 6], torch.zeros((1, 2)))
+        torch.testing.assert_close(result[..., 13], torch.ones((1, 2)))
+        torch.testing.assert_close(targets[..., 6], torch.full((1, 2), -0.1))
+        torch.testing.assert_close(targets[..., 13], torch.full((1, 2), 1.1))
+
+        bad_targets = targets.clone()
+        bad_targets[..., 0] = 2.1
+        runner.env.unwrapped.prepare_action_chunk.return_value = bad_targets
+        with self.assertRaisesRegex(ValueError, "Cartesian target"):
+            runner.prepare_action_chunk(chunk)
 
 
 if __name__ == "__main__":

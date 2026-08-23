@@ -315,7 +315,39 @@ class ManiSkillCudaFPORunner:
             raise ValueError("Policy action chunk must contain at least one step.")
         if not torch.isfinite(chunk).all():
             raise ValueError("Policy action chunk contains NaN or Inf values.")
-        return self.env.unwrapped.prepare_action_chunk(chunk, env_ids=env_ids)
+        targets = torch.as_tensor(
+            self.env.unwrapped.prepare_action_chunk(chunk, env_ids=env_ids),
+            device=self.device,
+            dtype=torch.float32,
+        ).clone()
+        if targets.shape != chunk.shape:
+            raise ValueError(
+                "Prepared action chunk shape mismatch: "
+                f"expected {tuple(chunk.shape)}, got {tuple(targets.shape)}."
+            )
+        if not torch.isfinite(targets).all():
+            raise ValueError("Prepared action chunk contains NaN or Inf values.")
+
+        # Gripper commands are bounded absolute actuator values. Saturate only
+        # those two dimensions; Cartesian targets remain strict below.
+        gripper_indices = (6, 13)
+        targets[..., list(gripper_indices)] = torch.minimum(
+            torch.maximum(
+                targets[..., list(gripper_indices)],
+                self.target_action_low[list(gripper_indices)],
+            ),
+            self.target_action_high[list(gripper_indices)],
+        )
+        invalid = (targets < self.target_action_low) | (
+            targets > self.target_action_high
+        )
+        if torch.any(invalid):
+            invalid_dims = torch.nonzero(invalid, as_tuple=False)[:, -1].unique().tolist()
+            raise ValueError(
+                "Prepared Cartesian target exceeds the absolute environment action "
+                f"space at dimensions {invalid_dims}; pose targets are not clipped."
+            )
+        return targets
 
     def close(self) -> None:
         self.env.close()

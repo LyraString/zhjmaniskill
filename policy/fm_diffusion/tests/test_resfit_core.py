@@ -18,6 +18,9 @@ from diffusion_policy.model.rl.residual_actor import (
     ResidualActor,
     compose_bimanual_delta_pose_action,
 )
+from diffusion_policy.model.rl.residual_velocity_transformer import (
+    ResidualVelocityTransformer,
+)
 from diffusion_policy.policy.FPO_image_policy import FPOImagePolicy
 from diffusion_policy.policy.resfit_policy import ResFiTPolicy
 from diffusion_policy.workspace.fpo_robotworkspace import RobotWorkspace as FPOWorkspace
@@ -230,7 +233,10 @@ class _ToyNormalizer:
 
 class ResfitCoreTest(unittest.TestCase):
     @staticmethod
-    def _make_toy_action_dit_policy():
+    def _make_toy_action_dit_policy(
+        velocity_residual=None,
+        freeze_base_velocity=False,
+    ):
         policy = FPOImagePolicy(
             shape_meta={"action": {"shape": [14]}},
             obs_encoder=_ToyObsEncoder(),
@@ -255,11 +261,103 @@ class ResfitCoreTest(unittest.TestCase):
                 "mlp_ratio": 2.0,
                 "dropout": 0.0,
             },
+            velocity_residual=velocity_residual,
+            freeze_base_velocity=freeze_base_velocity,
         )
         identity = SingleFieldLinearNormalizer.create_identity()
         policy.normalizer["encoded"] = identity
         policy.normalizer["action"] = identity
         return policy.eval()
+
+    def test_residual_fpo_starts_as_exact_base_velocity(self):
+        torch.manual_seed(7)
+        base_policy = self._make_toy_action_dit_policy()
+        residual_policy = self._make_toy_action_dit_policy(
+            velocity_residual=ResidualVelocityTransformer(
+                action_dim=14,
+                horizon=3,
+                condition_dim=16,
+                hidden_dim=32,
+                depth=2,
+                num_heads=4,
+                dropout=0.0,
+                residual_scale=0.1,
+            ),
+            freeze_base_velocity=True,
+        )
+        FPOWorkspace._load_actor_state_with_optional_residual(
+            residual_policy,
+            base_policy.state_dict(),
+            "model",
+        )
+
+        sample = torch.randn(4, 3, 14)
+        timestep = torch.randint(0, 1000, (4,))
+        global_cond = torch.randn(4, 8)
+        base_velocity = base_policy._predict_velocity(
+            sample,
+            timestep,
+            global_cond=global_cond,
+        )
+        combined_velocity = residual_policy._predict_velocity(
+            sample,
+            timestep,
+            global_cond=global_cond,
+        )
+
+        torch.testing.assert_close(
+            combined_velocity,
+            base_velocity,
+            rtol=0,
+            atol=0,
+        )
+        self.assertTrue(
+            all(not parameter.requires_grad for parameter in residual_policy.model.parameters())
+        )
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in residual_policy.velocity_residual.parameters()
+            )
+        )
+
+        combined_velocity.sum().backward()
+        self.assertIsNotNone(
+            residual_policy.velocity_residual.output_projection.bias.grad
+        )
+        self.assertGreater(
+            residual_policy.velocity_residual.output_projection.bias.grad.abs().sum().item(),
+            0.0,
+        )
+        self.assertTrue(
+            all(parameter.grad is None for parameter in residual_policy.model.parameters())
+        )
+
+    def test_residual_fpo_rejects_partial_residual_checkpoint(self):
+        policy = self._make_toy_action_dit_policy(
+            velocity_residual=ResidualVelocityTransformer(
+                action_dim=14,
+                horizon=3,
+                condition_dim=16,
+                hidden_dim=32,
+                depth=1,
+                num_heads=4,
+                dropout=0.0,
+            ),
+            freeze_base_velocity=True,
+        )
+        state_dict = policy.state_dict()
+        removed_key = next(
+            key for key in state_dict if key.startswith("velocity_residual.")
+        )
+        state_dict.pop(removed_key)
+
+        with self.assertRaisesRegex(RuntimeError, "Incompatible model checkpoint"):
+            FPOWorkspace._load_actor_state_with_optional_residual(
+                policy,
+                state_dict,
+                "model",
+            )
 
     def test_zero_initialized_actor_preserves_base_action(self):
         actor = ResidualActor(

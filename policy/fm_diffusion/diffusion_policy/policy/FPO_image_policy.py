@@ -1,4 +1,5 @@
 from typing import Dict
+import contextlib
 import random
 import numpy as np
 import torch
@@ -41,6 +42,8 @@ class FPOImagePolicy(BaseImagePolicy):
         ode_solver='euler',  # 'euler' 或 'rk4'
         denoiser_type='unet',
         action_dit=None,
+        velocity_residual=None,
+        freeze_base_velocity=False,
         **kwargs,
     ):
         super().__init__()
@@ -88,6 +91,17 @@ class FPOImagePolicy(BaseImagePolicy):
 
         self.obs_encoder = obs_encoder
         self.model = model
+        self.velocity_residual = velocity_residual
+        self.freeze_base_velocity = bool(freeze_base_velocity)
+        if self.velocity_residual is not None and denoiser_type != 'action_dit':
+            raise ValueError("Residual flow velocity currently requires Action DiT.")
+        if self.freeze_base_velocity and self.velocity_residual is None:
+            raise ValueError(
+                "freeze_base_velocity=True requires a velocity_residual module."
+            )
+        if self.freeze_base_velocity:
+            self.obs_encoder.requires_grad_(False)
+            self.model.requires_grad_(False)
         self.mask_generator = LowdimMaskGenerator(
             action_dim=action_dim,
             obs_dim=0 if obs_as_global_cond else obs_feature_dim,
@@ -107,6 +121,55 @@ class FPOImagePolicy(BaseImagePolicy):
         self.ode_solver = ode_solver
         self.denoiser_type = denoiser_type
         self.kwargs = kwargs
+
+    def _predict_velocity(
+        self,
+        sample,
+        timestep,
+        *,
+        local_cond=None,
+        global_cond=None,
+        condition_tokens=None,
+    ):
+        if self.velocity_residual is None:
+            return self.model(
+                sample,
+                timestep,
+                local_cond=local_cond,
+                global_cond=global_cond,
+                condition_tokens=condition_tokens,
+            )
+
+        encode_condition = getattr(self.model, "encode_condition_tokens", None)
+        if not callable(encode_condition):
+            raise RuntimeError(
+                "Residual flow velocity requires a denoiser condition-token encoder."
+            )
+
+        base_context = (
+            torch.no_grad() if self.freeze_base_velocity else contextlib.nullcontext()
+        )
+        with base_context:
+            if condition_tokens is None:
+                condition_tokens = encode_condition(global_cond)
+            base_velocity = self.model(
+                sample,
+                timestep,
+                local_cond=local_cond,
+                global_cond=global_cond,
+                condition_tokens=condition_tokens,
+            )
+
+        if self.freeze_base_velocity:
+            condition_tokens = condition_tokens.detach()
+            base_velocity = base_velocity.detach()
+        residual_velocity = self.velocity_residual(
+            sample,
+            timestep,
+            base_velocity=base_velocity,
+            condition_tokens=condition_tokens,
+        )
+        return base_velocity + residual_velocity.to(base_velocity.dtype)
 
     def build_condition_from_obs(self, obs_dict: Dict[str, torch.Tensor], *args) -> Dict:
         # 归一化输入
@@ -193,7 +256,7 @@ class FPOImagePolicy(BaseImagePolicy):
     ):
         """单步欧拉积分。"""
         # 在当前状态预测速度
-        v = self.model(
+        v = self._predict_velocity(
             x,
             t,
             local_cond=local_cond,
@@ -220,21 +283,21 @@ class FPOImagePolicy(BaseImagePolicy):
             "condition_tokens": condition_tokens,
         }
         # k1 = v(x, t)
-        k1 = self.model(x, t, **model_kwargs)
+        k1 = self._predict_velocity(x, t, **model_kwargs)
         
         # k2 = v(x + k1*dt/2, t + dt/2)
         x2 = x + k1 * dt / 2
         t2 = t + dt / 2
-        k2 = self.model(x2, t2, **model_kwargs)
+        k2 = self._predict_velocity(x2, t2, **model_kwargs)
         
         # k3 = v(x + k2*dt/2, t + dt/2)
         x3 = x + k2 * dt / 2
-        k3 = self.model(x3, t2, **model_kwargs)
+        k3 = self._predict_velocity(x3, t2, **model_kwargs)
         
         # k4 = v(x + k3*dt, t + dt)
         x4 = x + k3 * dt
         t4 = t + dt
-        k4 = self.model(x4, t4, **model_kwargs)
+        k4 = self._predict_velocity(x4, t4, **model_kwargs)
         
         # RK4 组合
         x_next = x + (k1 + 2*k2 + 2*k3 + k4) * dt / 6
@@ -460,7 +523,12 @@ class FPOImagePolicy(BaseImagePolicy):
         timesteps = (t * 999).long()
         
         # 预测速度场
-        pred_v = self.model(x_t, timesteps, local_cond=local_cond, global_cond=global_cond)
+        pred_v = self._predict_velocity(
+            x_t,
+            timesteps,
+            local_cond=local_cond,
+            global_cond=global_cond,
+        )
         
         # 只在非条件部分计算损失
         loss_mask = ~condition_mask
@@ -502,7 +570,12 @@ class FPOImagePolicy(BaseImagePolicy):
         x_t[cond_mask] = cond_data[cond_mask]
 
         timesteps = (t * 999).long()
-        pred_v = self.model(x_t, timesteps, local_cond=local_cond, global_cond=global_cond)
+        pred_v = self._predict_velocity(
+            x_t,
+            timesteps,
+            local_cond=local_cond,
+            global_cond=global_cond,
+        )
 
         loss_mask = ~cond_mask
 
@@ -543,7 +616,12 @@ class FPOImagePolicy(BaseImagePolicy):
         x_t[cond_mask] = cond_data[cond_mask]
 
         timesteps = (t * 999).long()
-        pred_v = self.model(x_t, timesteps, local_cond=local_cond, global_cond=global_cond)
+        pred_v = self._predict_velocity(
+            x_t,
+            timesteps,
+            local_cond=local_cond,
+            global_cond=global_cond,
+        )
         return pred_v, ~cond_mask
 
     # 采样动作 + 产出FPO训练所需信息

@@ -12,6 +12,7 @@ import os
 import io
 import contextlib
 import logging
+import dill
 import hydra
 import torch
 import torch.distributed as dist
@@ -24,7 +25,7 @@ import copy
 
 import tqdm, random
 import numpy as np
-from diffusion_policy.workspace.base_workspace import BaseWorkspace
+from diffusion_policy.workspace.base_workspace import BaseWorkspace, _unwrap_compiled_state_dict
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
@@ -354,6 +355,60 @@ class RobotWorkspace(BaseWorkspace):
     include_keys = ["global_step", "epoch"]
     exclude_keys = ("ref_model", "capo_coupling_model")
 
+    @staticmethod
+    def _load_actor_state_with_optional_residual(module, state_dict, state_name):
+        state_dict = _unwrap_compiled_state_dict(state_dict)
+        residual_prefix = "velocity_residual."
+        checkpoint_has_residual = any(
+            str(key).startswith(residual_prefix) for key in state_dict
+        )
+        expected_residual_keys = {
+            key for key in module.state_dict() if key.startswith(residual_prefix)
+        }
+        incompatible = module.load_state_dict(state_dict, strict=False)
+        missing = set(incompatible.missing_keys)
+        unexpected = set(incompatible.unexpected_keys)
+        allowed_missing = set() if checkpoint_has_residual else expected_residual_keys
+        if missing != allowed_missing or unexpected:
+            raise RuntimeError(
+                f"Incompatible {state_name} checkpoint for Residual FPO: "
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}, "
+                f"allowed_missing={sorted(allowed_missing)}."
+            )
+
+    def load_payload(self, payload, exclude_keys=None, include_keys=None, **kwargs):
+        if not self._residual_fpo_enabled:
+            return super().load_payload(
+                payload,
+                exclude_keys=exclude_keys,
+                include_keys=include_keys,
+                **kwargs,
+            )
+        if kwargs:
+            raise TypeError(
+                "Residual FPO checkpoint loading does not accept load_state_dict kwargs."
+            )
+        if exclude_keys is None:
+            exclude_keys = tuple()
+        if include_keys is None:
+            include_keys = payload["pickles"].keys()
+
+        for key, value in payload["state_dicts"].items():
+            if key in exclude_keys:
+                continue
+            if key in ("model", "ema_model"):
+                self._load_actor_state_with_optional_residual(
+                    self.__dict__[key],
+                    value,
+                    key,
+                )
+            else:
+                value = _unwrap_compiled_state_dict(value)
+                self.__dict__[key].load_state_dict(value)
+        for key in include_keys:
+            if key in payload["pickles"]:
+                self.__dict__[key] = dill.loads(payload["pickles"][key])
+
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
 
@@ -365,6 +420,7 @@ class RobotWorkspace(BaseWorkspace):
 
         # configure model
         self.model: BaseImagePolicy = hydra.utils.instantiate(cfg.policy)
+        self._residual_fpo_enabled = self.model.velocity_residual is not None
         self.ref_model: BaseImagePolicy = None
         self.capo_coupling_model = None
         self.capo_feature_mean = None
@@ -376,7 +432,25 @@ class RobotWorkspace(BaseWorkspace):
             self.ema_model = copy.deepcopy(self.model)
 
         # configure training state
-        self.optimizer = hydra.utils.instantiate(cfg.optimizer, params=self.model.parameters())
+        if self._residual_fpo_enabled:
+            unexpected_trainable = [
+                name
+                for name, parameter in self.model.named_parameters()
+                if parameter.requires_grad and not name.startswith("velocity_residual.")
+            ]
+            if unexpected_trainable:
+                raise RuntimeError(
+                    "Residual FPO must freeze the base policy; trainable base parameters: "
+                    f"{unexpected_trainable}."
+                )
+            actor_parameters = list(self.model.velocity_residual.parameters())
+            if not actor_parameters or not all(
+                parameter.requires_grad for parameter in actor_parameters
+            ):
+                raise RuntimeError("Residual FPO requires trainable residual parameters.")
+        else:
+            actor_parameters = self.model.parameters()
+        self.optimizer = hydra.utils.instantiate(cfg.optimizer, params=actor_parameters)
 
         # configure training state
         self.global_step = 0
@@ -394,6 +468,19 @@ class RobotWorkspace(BaseWorkspace):
         distributed = world_size > 1
         is_main_process = rank == 0
         self._is_main_process = is_main_process
+        if self._residual_fpo_enabled and is_main_process:
+            residual_parameters = sum(
+                parameter.numel() for parameter in self.model.velocity_residual.parameters()
+            )
+            frozen_parameters = sum(
+                parameter.numel()
+                for name, parameter in self.model.named_parameters()
+                if not name.startswith("velocity_residual.")
+            )
+            tqdm.tqdm.write(
+                "[Residual FPO] frozen base parameters="
+                f"{frozen_parameters:,}, trainable residual parameters={residual_parameters:,}"
+            )
 
         # resume training
         loaded_checkpoint_payload = None
@@ -1703,6 +1790,12 @@ class RobotWorkspace(BaseWorkspace):
                         env,
                         action_chunk,
                     )
+                    # The runner saturates bounded absolute gripper commands.
+                    # Train against those executed values while preserving the
+                    # anchor-relative Cartesian policy targets.
+                    action_chunk = action_chunk.clone()
+                    action_chunk[..., 6] = absolute_action_chunk[..., 6]
+                    action_chunk[..., 13] = absolute_action_chunk[..., 13]
                 else:
                     absolute_action_chunk = action_chunk
                 chunk_limit = min(chunk_steps, int(action_chunk.shape[1]))
