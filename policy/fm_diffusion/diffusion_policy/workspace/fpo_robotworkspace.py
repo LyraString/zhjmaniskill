@@ -608,9 +608,18 @@ class RobotWorkspace(BaseWorkspace):
 
         # configure checkpoint
         topk_manager = None
+        checkpoint_root_value = getattr(cfg.training, "checkpoint_root", None)
+        checkpoint_root = pathlib.Path(checkpoint_root_value or "checkpoints").expanduser()
+        pretrain_epoch_label = int(self.epoch) + 1
+        default_checkpoint_run_name = f"online_fpo-pretrain_ep{pretrain_epoch_label}-{seed}"
+        checkpoint_run_name = str(
+            getattr(cfg.training, "checkpoint_run_name", None)
+            or default_checkpoint_run_name
+        )
+        checkpoint_dir = checkpoint_root / checkpoint_run_name
         if is_main_process:
             topk_manager = TopKCheckpointManager(
-                save_dir=os.path.join(self.output_dir, "checkpoints"),
+                save_dir=str(checkpoint_dir),
                 **cfg.checkpoint.topk,
             )
 
@@ -1043,11 +1052,9 @@ class RobotWorkspace(BaseWorkspace):
                             # Use one-based labels in checkpoint names so they match
                             # the offline pretraining filenames (e.g. 2000.ckpt) and
                             # the human-readable online iteration count.
-                            pretrain_epoch_label = int(self.epoch) + 1
                             online_iter_label = int(it) + 1
-                            save_name = f"online_fpo-pretrain_ep{pretrain_epoch_label}"
                             self.save_checkpoint(
-                                f"checkpoints/{save_name}-{seed}/{pretrain_epoch_label}-{online_iter_label}.ckpt"
+                                checkpoint_dir / f"{pretrain_epoch_label}-{online_iter_label}.ckpt"
                             )
 
                         if is_main_process:

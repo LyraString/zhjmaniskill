@@ -346,6 +346,12 @@ maniskill_overrides=(
     training.resume_ckpt_path=${resume_ckpt_path}
 )
 
+if [ "${backend}" = "maniskill" ] && \
+   ! has_override_prefix "training.checkpoint_root=" && \
+   ! has_override_prefix "+training.checkpoint_root="; then
+    maniskill_overrides+=(training.checkpoint_root="${SCRIPT_DIR}/checkpoints")
+fi
+
 training_launcher=(python)
 if [ "${num_gpus}" -gt 1 ]; then
     training_launcher=(
