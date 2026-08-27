@@ -24,6 +24,9 @@ optimizer:
   lr: 1.0e-5
 
 training:
+  critic_privileged_state:
+    enabled: true
+    dim: 23
   online_iters: 200
   checkpoint_every: 50
   velocity_kl_coeff: 0.05

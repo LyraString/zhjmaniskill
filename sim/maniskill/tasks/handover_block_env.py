@@ -33,6 +33,7 @@ REWARD_GRIPPER_CLOSED_THRESHOLD = 0.25
 REWARD_GRIPPER_OPEN_THRESHOLD = 0.95
 REWARD_BOX_LIFT_Z = BOX_CENTER_Z + 0.025
 REWARD_DROP_Z = TARGET_CENTER_Z + 0.02
+FPO_CRITIC_PRIVILEGED_STATE_DIM = 23
 
 
 def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
@@ -282,6 +283,69 @@ class HandoverBlockEnv(DualUR5WSGEnv):
                 ).repeat(self.num_envs, 1),
             )
         return obs
+
+    def get_fpo_critic_privileged_state(self) -> torch.Tensor:
+        """Return simulation-only task state for the FPO value function.
+
+        The actor observation remains unchanged. Relative positions are in the
+        world frame, linear quantities use SI units, and the box orientation is
+        represented by its world-frame local z axis to avoid quaternion sign
+        ambiguity.
+        """
+
+        box_pos = self.box.pose.p
+        left_ee_pos = self.get_arm_end_effector_link(arm_index=0).pose.p
+        right_ee_pos = self.get_arm_end_effector_link(arm_index=1).pose.p
+
+        box_bottom_center = box_pos.clone()
+        box_bottom_center[:, 2] -= float(BOX_HALF_SIZE[2])
+        target_top_center = self.target_box.pose.p.clone()
+        target_top_center[:, 2] += float(TARGET_HALF_SIZE[2])
+        handover_pos = torch.as_tensor(
+            BLOCK_MIDDLE_POSE[:3],
+            device=self.device,
+            dtype=box_pos.dtype,
+        ).expand(self.num_envs, -1)
+
+        box_q = self.box.pose.q
+        box_q = box_q / torch.linalg.vector_norm(box_q, dim=-1, keepdim=True).clamp_min(1e-8)
+        qw, qx, qy, qz = box_q.unbind(dim=-1)
+        box_up = torch.stack(
+            (
+                2.0 * (qx * qz + qw * qy),
+                2.0 * (qy * qz - qw * qx),
+                1.0 - 2.0 * (qx.square() + qy.square()),
+            ),
+            dim=-1,
+        )
+
+        gripper_state = torch.cat(
+            (
+                self._get_gripper_state_tensor(arm_index=0),
+                self._get_gripper_state_tensor(arm_index=1),
+            ),
+            dim=-1,
+        )
+        privileged_state = torch.cat(
+            (
+                box_pos - left_ee_pos,
+                box_pos - right_ee_pos,
+                handover_pos - box_pos,
+                target_top_center - box_bottom_center,
+                box_up,
+                self.box.linear_velocity,
+                self.box.angular_velocity,
+                gripper_state,
+            ),
+            dim=-1,
+        ).to(dtype=torch.float32)
+        if privileged_state.shape != (self.num_envs, FPO_CRITIC_PRIVILEGED_STATE_DIM):
+            raise RuntimeError(
+                "Unexpected FPO critic privileged-state shape: "
+                f"expected {(self.num_envs, FPO_CRITIC_PRIVILEGED_STATE_DIM)}, "
+                f"got {tuple(privileged_state.shape)}."
+            )
+        return privileged_state
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
         stage = self._get_reward_stage()

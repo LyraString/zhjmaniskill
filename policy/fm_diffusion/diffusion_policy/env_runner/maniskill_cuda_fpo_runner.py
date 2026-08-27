@@ -352,6 +352,21 @@ class ManiSkillCudaFPORunner:
     def close(self) -> None:
         self.env.close()
 
+    def get_critic_privileged_state(self) -> torch.Tensor:
+        getter = getattr(self.env.unwrapped, "get_fpo_critic_privileged_state", None)
+        if not callable(getter):
+            raise RuntimeError(
+                f"Environment {self.env_id!r} does not expose "
+                "get_fpo_critic_privileged_state()."
+            )
+        state = torch.as_tensor(getter(), device=self.device, dtype=torch.float32)
+        if state.ndim != 2 or state.shape[0] != self.num_envs:
+            raise RuntimeError(
+                "Critic privileged state must have shape [num_envs, features], "
+                f"got {tuple(state.shape)}."
+            )
+        return state
+
     def format_obs(self, raw_obs: Mapping[str, Any]) -> dict[str, torch.Tensor]:
         obs = {
             key: self._extract_point_cloud(raw_obs, obs_key=key)

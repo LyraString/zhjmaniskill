@@ -1181,6 +1181,46 @@ class RobotWorkspace(BaseWorkspace):
         )
         return torch.cat([critic_input, stage_one_hot], dim=-1)
 
+    def _append_critic_privileged_state(self, critic_input, env):
+        privileged_cfg = getattr(self.cfg.training, "critic_privileged_state", None)
+        if privileged_cfg is None or not bool(getattr(privileged_cfg, "enabled", False)):
+            return critic_input
+        if critic_input.ndim != 2:
+            raise ValueError(
+                "Privileged critic input must have shape [batch, features], "
+                f"got {tuple(critic_input.shape)}."
+            )
+
+        expected_dim = int(getattr(privileged_cfg, "dim", 0))
+        if expected_dim <= 0:
+            raise ValueError(
+                "training.critic_privileged_state.dim must be positive when enabled."
+            )
+        getter = getattr(env, "get_critic_privileged_state", None)
+        if not callable(getter):
+            raise RuntimeError(
+                "The selected FPO runner does not support privileged critic state."
+            )
+        privileged_state = getter().detach().to(
+            device=critic_input.device,
+            dtype=critic_input.dtype,
+        )
+        expected_shape = (critic_input.shape[0], expected_dim)
+        if tuple(privileged_state.shape) != expected_shape:
+            raise ValueError(
+                "Critic privileged-state shape mismatch: "
+                f"expected {expected_shape}, got {tuple(privileged_state.shape)}."
+            )
+        torch._assert_async(
+            torch.isfinite(privileged_state).all(),
+            "Critic privileged state contains NaN or Inf values.",
+        )
+        return torch.cat([critic_input, privileged_state], dim=-1)
+
+    def _build_online_critic_input(self, critic_base, reward_stage, env):
+        critic_input = self._append_critic_stage_one_hot(critic_base, reward_stage)
+        return self._append_critic_privileged_state(critic_input, env)
+
     def _load_capo_coupling_model(self, capo_cfg, device):
         ckpt_path = getattr(capo_cfg, "coupling_ckpt_path", None)
         if ckpt_path in (None, ""):
@@ -1821,9 +1861,10 @@ class RobotWorkspace(BaseWorkspace):
                             critic_base = out["global_cond"]
                         else:
                             critic_base = self._build_critic_input_from_obs(obs_hist)
-                        critic_in = self._append_critic_stage_one_hot(
+                        critic_in = self._build_online_critic_input(
                             critic_base,
                             fpo_reward_stage,
+                            env,
                         )
                         v = self.critic(critic_in).squeeze(-1)
 
@@ -1868,9 +1909,10 @@ class RobotWorkspace(BaseWorkspace):
                     if finished_env_ids:
                         with torch.inference_mode():
                             next_critic_base = self._build_critic_input_from_obs(next_obs_hist)
-                            next_critic_in = self._append_critic_stage_one_hot(
+                            next_critic_in = self._build_online_critic_input(
                                 next_critic_base,
                                 fpo_reward_stage,
+                                env,
                             )
                             last_v_all = self.critic(next_critic_in).squeeze(-1)
                         bootstrap_steps.append(last_v_all.detach().to(device=device, dtype=torch.float32))
@@ -1976,9 +2018,10 @@ class RobotWorkspace(BaseWorkspace):
             if any(ep_step > 0 for ep_step in ep_steps):
                 with torch.inference_mode():
                     final_critic_base = self._build_critic_input_from_obs(obs_hist)
-                    final_critic_in = self._append_critic_stage_one_hot(
+                    final_critic_in = self._build_online_critic_input(
                         final_critic_base,
                         fpo_reward_stage,
+                        env,
                     )
                     last_v_all = self.critic(final_critic_in).squeeze(-1)
                 final_bootstrap = last_v_all.detach().to(device=device, dtype=torch.float32)

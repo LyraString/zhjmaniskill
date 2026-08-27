@@ -35,7 +35,7 @@ policy:
     dropout: 0.0
 
 critic:
-  input_dim: ${eval:'${n_obs_steps} * (sum(${policy.obs_encoder.view_token_counts}) * ${policy.obs_encoder.pointnet_out_dim} + ${task.shape_meta.obs.agent_pos.shape[0]}) + ${training.critic_stage_conditioning.num_stages}'}
+  input_dim: ${eval:'${n_obs_steps} * (sum(${policy.obs_encoder.view_token_counts}) * ${policy.obs_encoder.pointnet_out_dim} + ${task.shape_meta.obs.agent_pos.shape[0]}) + ${training.critic_stage_conditioning.num_stages} + ${training.critic_privileged_state.dim}'}
 
 training:
   actor_amp:
@@ -44,6 +44,9 @@ training:
   critic_stage_conditioning:
     enabled: true
     num_stages: 5
+  critic_privileged_state:
+    enabled: false
+    dim: 0
   preserve_ckpt_normalizer: True
   init_actor_from_ema: True
   load_optimizer_state: False
