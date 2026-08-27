@@ -48,11 +48,11 @@ training:
   init_actor_from_ema: True
   load_optimizer_state: False
   online_iters: 120
-  timesteps_per_batch: 6400
+  timesteps_per_batch: 12800
   max_timesteps_per_episode: 800
   n_updates_per_iteration: 1
-  num_minibatches: 32
-  num_envs: 8
+  num_minibatches: 64
+  num_envs: 16
   checkpoint_every: 20
   max_total_fpo_samples_per_call: 32
   num_fpo_samples: 1
