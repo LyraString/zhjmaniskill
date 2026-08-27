@@ -1037,6 +1037,9 @@ class RobotWorkspace(BaseWorkspace):
                         for diag_key in ONLINE_ROLLOUT_DIAG_KEYS:
                             if diag_key in rollout:
                                 local_metrics[diag_key] = rollout[diag_key]
+                        # Release the GPU-heavy batch before the next collection so
+                        # cached allocator blocks can be reused by the new rollout.
+                        del rollout
                         metrics = _reduce_distributed_metrics(local_metrics, device)
                         step_log = {
                             "iter": it,
