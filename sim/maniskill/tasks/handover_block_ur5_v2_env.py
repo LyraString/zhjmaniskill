@@ -33,9 +33,39 @@ class HandoverBlockUR5V2Env(HandoverBlockEnv):
 
     block_middle_pose = V2_BLOCK_MIDDLE_POSE
 
-    def __init__(self, *args, legacy_rng_compat: bool = False, **kwargs):
+    def __init__(
+        self,
+        *args,
+        legacy_rng_compat: bool = False,
+        box_x_range_override=None,
+        box_y_range_override=None,
+        box_yaw_limit_override: float | None = None,
+        block_middle_pose_override=None,
+        **kwargs,
+    ):
+        self.box_x_range_override = self._validate_optional_range(
+            box_x_range_override,
+            name="box_x_range_override",
+        )
+        self.box_y_range_override = self._validate_optional_range(
+            box_y_range_override,
+            name="box_y_range_override",
+        )
+        self.box_yaw_limit = (
+            V2_BOX_YAW_LIMIT
+            if box_yaw_limit_override is None
+            else float(box_yaw_limit_override)
+        )
+        if self.box_yaw_limit < 0.0:
+            raise ValueError("box_yaw_limit_override must be non-negative.")
+        if block_middle_pose_override is not None and len(block_middle_pose_override) != 7:
+            raise ValueError("block_middle_pose_override must contain 7 pose values.")
         super().__init__(*args, legacy_rng_compat=False, **kwargs)
-        self.block_middle_pose = list(V2_BLOCK_MIDDLE_POSE)
+        self.block_middle_pose = list(
+            V2_BLOCK_MIDDLE_POSE
+            if block_middle_pose_override is None
+            else block_middle_pose_override
+        )
         self.block_middle_pose[1] += float(self.object_y_offset)
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
@@ -44,18 +74,20 @@ class HandoverBlockUR5V2Env(HandoverBlockEnv):
             b = len(env_idx)
             episode_rng = self._batched_episode_rng[env_idx]
 
+            box_x_range = self.box_x_range_override or V2_BOX_X_RANGE
+            box_y_range = self.box_y_range_override or V2_BOX_Y_RANGE
             box_x = torch.as_tensor(
-                episode_rng.uniform(*V2_BOX_X_RANGE),
+                episode_rng.uniform(*box_x_range),
                 device=self.device,
                 dtype=torch.float32,
             ).reshape(b)
             box_y = torch.as_tensor(
-                episode_rng.uniform(*V2_BOX_Y_RANGE),
+                episode_rng.uniform(*box_y_range),
                 device=self.device,
                 dtype=torch.float32,
             ).reshape(b)
             yaw = torch.as_tensor(
-                episode_rng.uniform(-V2_BOX_YAW_LIMIT, V2_BOX_YAW_LIMIT),
+                episode_rng.uniform(-self.box_yaw_limit, self.box_yaw_limit),
                 device=self.device,
                 dtype=torch.float32,
             ).reshape(b)

@@ -47,6 +47,7 @@ class ManiSkillEnvBackend:
         self.point_cloud_views = point_cloud_views
         self.requested_sim_config = dict(sim_config or {})
         self.env_kwargs = dict(env_kwargs or {})
+        self._last_raw_obs: Any | None = None
 
         make_kwargs = dict(self.env_kwargs)
         make_kwargs.setdefault("obs_mode", obs_mode)
@@ -79,6 +80,14 @@ class ManiSkillEnvBackend:
     def observation_space(self):
         return self.env.observation_space
 
+    @property
+    def last_raw_obs(self) -> Any:
+        """Return the raw observation produced by the latest reset or step."""
+
+        if self._last_raw_obs is None:
+            raise RuntimeError("The environment has not been reset yet.")
+        return self._last_raw_obs
+
     def _collect_fixed_rate_info(self) -> dict[str, Any]:
         unwrapped = self.env.unwrapped
         sim_freq = getattr(unwrapped, "sim_freq", None)
@@ -100,6 +109,7 @@ class ManiSkillEnvBackend:
 
     def reset(self, *, seed: int | None = None):
         obs, info = self.env.reset(seed=seed)
+        self._last_raw_obs = obs
         metadata = {
             "backend": "maniskill",
             "env_id": self.env_id,
@@ -117,9 +127,27 @@ class ManiSkillEnvBackend:
 
         return self.env.unwrapped.prepare_action_chunk(action_chunk)
 
-    def step(self, action: ActionSpec) -> StepResult:
+    def step_raw(
+        self,
+        action: ActionSpec,
+    ) -> tuple[Any, float, bool, bool, dict[str, Any]]:
+        """Step without constructing learner-facing point cloud observations."""
+
         mani_action = convert_action_to_maniskill(action)
         obs, reward, terminated, truncated, info = self.env.step(mani_action)
+        self._last_raw_obs = obs
+        info = dict(info)
+        info.update(self._fixed_rate_info)
+        return (
+            obs,
+            float(reward),
+            bool(terminated),
+            bool(truncated),
+            info,
+        )
+
+    def step(self, action: ActionSpec) -> StepResult:
+        obs, reward, terminated, truncated, info = self.step_raw(action)
         observation = convert_maniskill_obs(
             obs,
             metadata={
@@ -132,13 +160,11 @@ class ManiSkillEnvBackend:
                 **self._fixed_rate_info,
             },
         )
-        info = dict(info)
-        info.update(self._fixed_rate_info)
         return StepResult.create(
             observation=observation,
-            reward=float(reward),
-            terminated=bool(terminated),
-            truncated=bool(truncated),
+            reward=reward,
+            terminated=terminated,
+            truncated=truncated,
             info=info,
         )
 

@@ -240,6 +240,33 @@ MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
             "enable_wrist_cameras": True,
         },
     },
+    "handover_block_ur5_v2_vr_robotwin_clean": {
+        "env_id": "HandoverBlockUR5-v2",
+        **DEFAULT_MANISKILL_RUNTIME,
+        "action_type": "bimanual_pd_ee_delta_pose",
+        "control_mode": "bimanual_pd_ee_delta_pose",
+        "robot_uids": "none",
+        "point_cloud_sampling": "fast",
+        "point_cloud_views": UR5_V2_MULTIVIEW_POINT_CLOUD_VIEWS,
+        "shape_meta": {
+            "head_point_cloud": [1024, 3],
+            "left_wrist_point_cloud": [512, 3],
+            "right_wrist_point_cloud": [512, 3],
+            "agent_pos": [14],
+            "action": [14],
+        },
+        "env_kwargs": {
+            "enable_wrist_cameras": True,
+            "wrist_camera_fovy_deg": 37.0,
+            "initial_gripper_value": 1.0,
+            "box_x_range_override": [-0.25, -0.05],
+            "box_y_range_override": [0.0, 0.25],
+            "box_yaw_limit_override": 0.2,
+            "target_x_range_override": [0.1, 0.25],
+            "target_y_range_override": [0.15, 0.2],
+            "block_middle_pose_override": [0.0, 0.1, 0.9, 0.0, 1.0, 0.0, 0.0],
+        },
+    },
 }
 
 

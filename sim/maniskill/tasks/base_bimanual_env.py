@@ -105,6 +105,14 @@ class BaseBimanualEnv(BaseEnv):
         **kwargs,
     ):
         self.enable_wrist_cameras = bool(kwargs.pop("enable_wrist_cameras", False))
+        self.wrist_camera_fovy_deg = float(
+            kwargs.pop("wrist_camera_fovy_deg", self.WRIST_CAMERA_FOVY_DEG)
+        )
+        if not 0.0 < self.wrist_camera_fovy_deg < 180.0:
+            raise ValueError("wrist_camera_fovy_deg must be between 0 and 180 degrees.")
+        self.initial_gripper_value = float(kwargs.pop("initial_gripper_value", 0.0))
+        if not 0.0 <= self.initial_gripper_value <= 1.0:
+            raise ValueError("initial_gripper_value must be between 0 and 1.")
         self.clamp_gripper_drive_targets = bool(
             kwargs.pop("clamp_gripper_drive_targets", False)
         )
@@ -114,8 +122,8 @@ class BaseBimanualEnv(BaseEnv):
         self.workspace_table_y = float(kwargs.pop("workspace_table_y", 0.0))
         self.expert_grasp_variant = str(kwargs.pop("expert_grasp_variant", ""))
         self.embodiment_spec = embodiment_spec
-        self.left_gripper_val = 0.0
-        self.right_gripper_val = 0.0
+        self.left_gripper_val = self.initial_gripper_value
+        self.right_gripper_val = self.initial_gripper_value
         self._manual_gripper_drive_override: dict[int, float] = {}
         self.left_delta_pose_controller = None
         self.right_delta_pose_controller = None
@@ -221,7 +229,7 @@ class BaseBimanualEnv(BaseEnv):
                         wrist_pose,
                         self.HEAD_CAMERA_WIDTH,
                         self.HEAD_CAMERA_HEIGHT,
-                        np.deg2rad(self.WRIST_CAMERA_FOVY_DEG),
+                        np.deg2rad(self.wrist_camera_fovy_deg),
                         self.HEAD_CAMERA_NEAR,
                         self.HEAD_CAMERA_FAR,
                         mount=self.get_arm_link_by_name(arm_index=0, link_name="camera"),
@@ -231,7 +239,7 @@ class BaseBimanualEnv(BaseEnv):
                         wrist_pose,
                         self.HEAD_CAMERA_WIDTH,
                         self.HEAD_CAMERA_HEIGHT,
-                        np.deg2rad(self.WRIST_CAMERA_FOVY_DEG),
+                        np.deg2rad(self.wrist_camera_fovy_deg),
                         self.HEAD_CAMERA_NEAR,
                         self.HEAD_CAMERA_FAR,
                         mount=self.get_arm_link_by_name(arm_index=1, link_name="camera"),
@@ -716,8 +724,13 @@ class BaseBimanualEnv(BaseEnv):
         with torch.device(self.device):
             self._initialize_robot_state(self.left_robot, env_idx, arm_index=0)
             self._initialize_robot_state(self.right_robot, env_idx, arm_index=1)
-            self._set_gripper(torch.zeros(len(env_idx), device=self.device), arm_index=0, env_idx=env_idx)
-            self._set_gripper(torch.zeros(len(env_idx), device=self.device), arm_index=1, env_idx=env_idx)
+            initial_gripper = torch.full(
+                (len(env_idx),),
+                self.initial_gripper_value,
+                device=self.device,
+            )
+            self._set_gripper(initial_gripper, arm_index=0, env_idx=env_idx)
+            self._set_gripper(initial_gripper, arm_index=1, env_idx=env_idx)
             if self.left_delta_pose_controller is not None:
                 self.left_delta_pose_controller.reset()
                 self.right_delta_pose_controller.reset()
@@ -787,9 +800,15 @@ class BaseBimanualEnv(BaseEnv):
                 }
                 try:
                     self.left_delta_pose_controller.set_action(left_action)
+                except Exception:
+                    self.delta_controller_failure_count += 1
+                    self.last_delta_control_debug["failed_arm"] = "left"
+                    raise
+                try:
                     self.right_delta_pose_controller.set_action(right_action)
                 except Exception:
                     self.delta_controller_failure_count += 1
+                    self.last_delta_control_debug["failed_arm"] = "right"
                     raise
                 target_qpos = (
                     self.left_delta_pose_controller._target_qpos,
