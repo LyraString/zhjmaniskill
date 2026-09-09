@@ -1,0 +1,16 @@
+defaults:
+  - maniskill_fm_handover_ur5_v2_multiview_delta_pose_actual_action_dit_patch
+  - override task: maniskill_handover_ur5_vr_task
+  - _self_
+
+name: maniskill_fm_vr
+exp_name: vr_fm
+
+training:
+  resume: False
+  checkpoint_run_name: ${now:%y%m%d-%H%M%S}-vr-seed${training.seed}
+  num_epochs: 1000
+  checkpoint_every: 250
+
+logging:
+  mode: offline

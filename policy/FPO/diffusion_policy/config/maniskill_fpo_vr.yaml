@@ -1,0 +1,27 @@
+defaults:
+  - maniskill_fpo_handover_ur5_v2_multiview_delta_pose_actual_action_dit_patch
+  - _self_
+
+name: maniskill_fpo_vr
+exp_name: vr_fpo
+
+task:
+  name: handover_block_ur5_v2_vr
+  maniskill:
+    profile: handover_block_ur5_v2_vr_robotwin_clean
+    # Unused in online-only training; kept consistent with the source dataset.
+    zarr_path: ../FlowMatching/data/HandoverBlockUR5-pico-clean-v2-80.zarr
+
+training:
+  # Pass the FM checkpoint as train_fpo.sh's third positional argument.
+  resume: True
+  preserve_ckpt_normalizer: True
+  init_actor_from_ema: True
+  load_optimizer_state: False
+  online_only_no_dataset: True
+  sim_backend: physx_cuda
+  render_backend: sapien_cuda
+  checkpoint_run_name: ${now:%y%m%d-%H%M%S}-vr-fpo-seed${training.seed}
+
+logging:
+  mode: offline

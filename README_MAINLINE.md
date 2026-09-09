@@ -262,6 +262,10 @@ tensorboard --logdir policy/FlowMatching/data/outputs \
 | `maniskill_fm_handover_ur5_v2_multiview_delta_pose_actual_action_dit_large` | Global multiview features | Action DiT | Experimental |
 | `maniskill_fm_handover_ur5_v2_multiview_delta_pose_actual_action_dit_patch` | 12/6/6 patch tokens | Action DiT | Current experimental path |
 
+Clean PICO training uses `maniskill_fm_vr` for all dataset sizes. See the
+[VR training guide](policy/FlowMatching/VR_TRAINING.md) for conversion, dataset
+selection and launch commands; episode counts belong in data paths, not new YAML files.
+
 ## Evaluation
 
 ```bash
