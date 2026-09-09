@@ -215,8 +215,22 @@ def _new_action_trace():
     return {
         "episode": [],
         "step": [],
+        "policy_inference": [],
+        "chunk_step": [],
         "raw_policy_action": [],
         "target_action": [],
+        "actual_ee_pose_root_before_wxyz": [],
+        "actual_ee_pose_root_after_wxyz": [],
+        "target_left_xyz_step_norm": [],
+        "target_right_xyz_step_norm": [],
+        "actual_left_xyz_step_norm": [],
+        "actual_right_xyz_step_norm": [],
+        "target_left_xyz_error_before": [],
+        "target_right_xyz_error_before": [],
+        "target_left_xyz_error_after": [],
+        "target_right_xyz_error_after": [],
+        "target_left_xyz_progress": [],
+        "target_right_xyz_progress": [],
         "policy_left_xyz_norm": [],
         "policy_left_rot_norm": [],
         "policy_left_gripper": [],
@@ -241,6 +255,28 @@ def _new_action_trace():
     }
 
 
+def _actual_eef_pose_root_wxyz(env) -> np.ndarray:
+    """Read both actual EEF poses in the frame used by absolute PDEE targets."""
+
+    base_env = env.env.unwrapped
+    controllers = (
+        base_env.left_delta_pose_controller,
+        base_env.right_delta_pose_controller,
+    )
+    poses = []
+    for controller in controllers:
+        if controller is None:
+            raise RuntimeError("PDEE action tracing requires both EEF controllers.")
+        pose = controller.ee_pose_at_base.raw_pose
+        if hasattr(pose, "detach") and hasattr(pose, "cpu"):
+            pose = pose.detach().cpu().numpy()
+        pose = np.asarray(pose, dtype=np.float32).reshape(-1, 7)
+        if pose.shape[0] != 1 or not np.isfinite(pose).all():
+            raise ValueError(f"Expected one finite EEF pose, got {pose.shape}.")
+        poses.append(pose[0].copy())
+    return np.stack(poses, axis=0)
+
+
 def _action_or_nan(action) -> np.ndarray:
     if action is None:
         return np.full((14,), np.nan, dtype=np.float32)
@@ -252,6 +288,15 @@ def _action_or_nan(action) -> np.ndarray:
     return padded
 
 
+def _eef_pose_or_nan(pose) -> np.ndarray:
+    if pose is None:
+        return np.full((2, 7), np.nan, dtype=np.float32)
+    pose_np = np.asarray(pose, dtype=np.float32)
+    if pose_np.shape != (2, 7) or not np.isfinite(pose_np).all():
+        raise ValueError(f"Expected finite EEF poses with shape (2, 7), got {pose_np.shape}.")
+    return pose_np.copy()
+
+
 def _append_action_trace(
     trace: dict,
     episode_idx: int,
@@ -260,14 +305,47 @@ def _append_action_trace(
     info: Mapping,
     *,
     raw_policy_action,
+    policy_inference: int = 0,
+    chunk_step: int = 0,
+    actual_ee_pose_root_before_wxyz=None,
+    actual_ee_pose_root_after_wxyz=None,
 ) -> None:
     policy_np = _action_or_nan(raw_policy_action)
     target_np = _action_or_nan(target_action)
+    actual_before = _eef_pose_or_nan(actual_ee_pose_root_before_wxyz)
+    actual_after = _eef_pose_or_nan(actual_ee_pose_root_after_wxyz)
 
     trace["episode"].append(int(episode_idx))
     trace["step"].append(int(step))
+    trace["policy_inference"].append(int(policy_inference))
+    trace["chunk_step"].append(int(chunk_step))
     trace["raw_policy_action"].append(policy_np)
     trace["target_action"].append(target_np)
+    trace["actual_ee_pose_root_before_wxyz"].append(actual_before)
+    trace["actual_ee_pose_root_after_wxyz"].append(actual_after)
+
+    previous_target = None
+    if len(trace["target_action"]) >= 2 and trace["episode"][-2] == int(episode_idx):
+        previous_target = trace["target_action"][-2]
+    for arm_name, arm_index, offset in (("left", 0, 0), ("right", 1, 7)):
+        target_position = target_np[offset : offset + 3]
+        before_position = actual_before[arm_index, :3]
+        after_position = actual_after[arm_index, :3]
+        error_before = float(np.linalg.norm(target_position - before_position))
+        error_after = float(np.linalg.norm(target_position - after_position))
+        trace[f"actual_{arm_name}_xyz_step_norm"].append(
+            float(np.linalg.norm(after_position - before_position))
+        )
+        trace[f"target_{arm_name}_xyz_error_before"].append(error_before)
+        trace[f"target_{arm_name}_xyz_error_after"].append(error_after)
+        trace[f"target_{arm_name}_xyz_progress"].append(error_before - error_after)
+        target_step = np.nan
+        if previous_target is not None:
+            target_step = float(
+                np.linalg.norm(target_position - previous_target[offset : offset + 3])
+            )
+        trace[f"target_{arm_name}_xyz_step_norm"].append(target_step)
+
     for prefix, value in (("policy", policy_np), ("target", target_np)):
         trace[f"{prefix}_left_xyz_norm"].append(float(np.linalg.norm(value[0:3])))
         trace[f"{prefix}_left_rot_norm"].append(float(np.linalg.norm(value[3:6])))
@@ -295,7 +373,12 @@ def _save_action_trace(trace: dict, path: str) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     arrays = {}
     for key, values in trace.items():
-        if key in {"raw_policy_action", "target_action"}:
+        if key in {
+            "raw_policy_action",
+            "target_action",
+            "actual_ee_pose_root_before_wxyz",
+            "actual_ee_pose_root_after_wxyz",
+        }:
             arrays[key] = (
                 np.stack(values, axis=0).astype(np.float32)
                 if len(values) > 0
@@ -306,7 +389,7 @@ def _save_action_trace(trace: dict, path: str) -> None:
                 [np.nan if value is None else value for value in values],
                 dtype=(
                     np.int64
-                    if key in {"episode", "step"}
+                    if key in {"episode", "step", "policy_inference", "chunk_step"}
                     else np.float32
                 ),
             )
@@ -327,6 +410,22 @@ def _save_action_trace(trace: dict, path: str) -> None:
         "target_right_xyz_norm_mean": float(np.nanmean(arrays["target_right_xyz_norm"])),
         "policy_right_gripper_mean": float(np.nanmean(arrays["policy_right_gripper"])),
     }
+    for arm_name in ("left", "right"):
+        actual_step = arrays[f"actual_{arm_name}_xyz_step_norm"]
+        target_step = arrays[f"target_{arm_name}_xyz_step_norm"]
+        target_error = arrays[f"target_{arm_name}_xyz_error_after"]
+        target_progress = arrays[f"target_{arm_name}_xyz_progress"]
+        summary.update(
+            {
+                f"actual_{arm_name}_xyz_step_mean_m": float(np.nanmean(actual_step)),
+                f"actual_{arm_name}_xyz_step_p95_m": float(np.nanpercentile(actual_step, 95)),
+                f"target_{arm_name}_xyz_step_mean_m": float(np.nanmean(target_step)),
+                f"target_{arm_name}_xyz_step_p95_m": float(np.nanpercentile(target_step, 95)),
+                f"target_{arm_name}_xyz_error_after_mean_m": float(np.nanmean(target_error)),
+                f"target_{arm_name}_xyz_error_after_p95_m": float(np.nanpercentile(target_error, 95)),
+                f"target_{arm_name}_xyz_progress_mean_m": float(np.nanmean(target_progress)),
+            }
+        )
     stage = arrays["reward_stage"]
     stage4_mask = np.isfinite(stage) & (np.rint(stage).astype(np.int64) == 4)
     if bool(np.any(stage4_mask)):
@@ -523,9 +622,17 @@ def _maybe_capture_frame(env_backend, frames: list[np.ndarray]) -> None:
     frames.append(frame)
 
 
+def _is_pdee_ik_failure(error: RuntimeError) -> bool:
+    return str(error) in {
+        "PDEE inverse kinematics failed.",
+        "PDEE inverse kinematics returned a non-finite joint target.",
+    }
+
+
 def run_evaluation(args) -> None:
     adapter = importlib.import_module(ADAPTER_MODULES[args.policy_kind])
-    payload = torch.load(open(args.ckpt_path, "rb"), pickle_module=dill, map_location="cpu")
+    with open(args.ckpt_path, "rb") as checkpoint_file:
+        payload = torch.load(checkpoint_file, pickle_module=dill, map_location="cpu")
     ckpt_cfg = payload["cfg"]
     n_action_steps = _resolve_n_action_steps(ckpt_cfg, args.n_action_steps)
     runtime_env_id = args.task_name
@@ -597,6 +704,7 @@ def run_evaluation(args) -> None:
     lengths = []
     successes = []
     handover_diags = []
+    ik_failures = []
     action_trace = _new_action_trace() if args.save_action_trace is not None else None
 
     try:
@@ -630,11 +738,13 @@ def run_evaluation(args) -> None:
             episode_return = 0.0
             episode_length = 0
             success = False
+            episode_failure = None
             frames = []
             if video_dir is not None:
                 _maybe_capture_frame(env, frames)
             result = None
             handover_diag = _new_handover_diag()
+            policy_inference = 0
             while episode_length < args.max_episode_steps:
                 if len(model.obs_cache) == 0:
                     model.update_obs(encoded_obs)
@@ -661,17 +771,45 @@ def run_evaluation(args) -> None:
                         axis=0,
                     )
 
-                for raw_policy_action, target_action in zip(
-                    raw_policy_chunk,
-                    target_chunk,
+                for chunk_step, (raw_policy_action, target_action) in enumerate(
+                    zip(raw_policy_chunk, target_chunk)
                 ):
-                    result = env.step(
-                        ActionSpec.from_value(
-                            target_action,
-                            action_type=resolved_runtime["action_type"],
+                    actual_ee_before = None
+                    if action_trace is not None and effective_control_mode == DELTA_POSE_CONTROL_MODE:
+                        actual_ee_before = _actual_eef_pose_root_wxyz(env)
+                    try:
+                        result = env.step(
+                            ActionSpec.from_value(
+                                target_action,
+                                action_type=resolved_runtime["action_type"],
+                            )
                         )
-                    )
+                    except RuntimeError as error:
+                        if effective_control_mode != DELTA_POSE_CONTROL_MODE or not _is_pdee_ik_failure(error):
+                            raise
+                        episode_failure = "pdee_ik_failure"
+                        ik_failures.append({
+                            "episode": episode_idx,
+                            "seed": args.seed + episode_idx,
+                            "completed_steps": episode_length,
+                            "policy_inference": policy_inference,
+                            "chunk_step": chunk_step,
+                            "reason": episode_failure,
+                            "error": str(error),
+                            "raw_policy_action": raw_policy_action.tolist(),
+                            "target_action": target_action.tolist(),
+                        })
+                        print(
+                            f"episode_failure episode={episode_idx} seed={args.seed + episode_idx} "
+                            f"completed_steps={episode_length} reason={episode_failure} error={error}"
+                        )
+                        # A controller may already have updated one arm. Do not step
+                        # again until the next episode has reset the whole environment.
+                        break
                     if action_trace is not None:
+                        actual_ee_after = None
+                        if effective_control_mode == DELTA_POSE_CONTROL_MODE:
+                            actual_ee_after = _actual_eef_pose_root_wxyz(env)
                         _append_action_trace(
                             action_trace,
                             episode_idx=episode_idx,
@@ -679,6 +817,10 @@ def run_evaluation(args) -> None:
                             target_action=target_action,
                             info=result.info,
                             raw_policy_action=raw_policy_action,
+                            policy_inference=policy_inference,
+                            chunk_step=chunk_step,
+                            actual_ee_pose_root_before_wxyz=actual_ee_before,
+                            actual_ee_pose_root_after_wxyz=actual_ee_after,
                         )
                     if _to_bool_scalar(result.info.get("success", False)):
                         success = True
@@ -695,13 +837,17 @@ def run_evaluation(args) -> None:
                     if result.terminated or result.truncated or episode_length >= args.max_episode_steps:
                         break
 
+                policy_inference += 1
+
+                if episode_failure is not None:
+                    break
                 if success or result.terminated or result.truncated or episode_length >= args.max_episode_steps:
                     break
 
             returns.append(episode_return)
             lengths.append(episode_length)
             successes.append(float(success))
-            handover_failure = _classify_handover_failure(handover_diag, success)
+            handover_failure = episode_failure or _classify_handover_failure(handover_diag, success)
             if handover_diag["has_stage"]:
                 handover_diags.append({**handover_diag, "failure": handover_failure})
             if video_dir is not None and len(frames) > 0:
@@ -746,7 +892,8 @@ def run_evaluation(args) -> None:
         "summary "
         f"mean_return={float(np.mean(returns)):.4f} "
         f"mean_length={float(np.mean(lengths)):.2f} "
-        f"success_rate={float(np.mean(successes)):.4f}"
+        f"success_rate={float(np.mean(successes)):.4f} "
+        f"pdee_ik_failures={len(ik_failures)}"
     )
     if len(handover_diags) > 0:
         diag_count = float(len(handover_diags))
@@ -756,6 +903,7 @@ def run_evaluation(args) -> None:
             "failed_handover": 0,
             "failed_right_carry": 0,
             "failed_place_or_release": 0,
+            "pdee_ik_failure": 0,
             "unknown": 0,
         }
         for diag in handover_diags:
@@ -774,6 +922,7 @@ def run_evaluation(args) -> None:
             f"failed_handover={failure_counts['failed_handover'] / diag_count:.3f} "
             f"failed_right_carry={failure_counts['failed_right_carry'] / diag_count:.3f} "
             f"failed_place={failure_counts['failed_place_or_release'] / diag_count:.3f} "
+            f"pdee_ik_failure={failure_counts['pdee_ik_failure'] / diag_count:.3f} "
             f"unknown={failure_counts['unknown'] / diag_count:.3f}"
         )
         failed_place_diags = [
@@ -798,6 +947,16 @@ def run_evaluation(args) -> None:
             )
     if action_trace is not None:
         _save_action_trace(action_trace, args.save_action_trace)
+    failure_path = None
+    if video_dir is not None:
+        failure_path = video_dir / "evaluation_failures.json"
+    elif args.save_action_trace is not None:
+        failure_path = Path(args.save_action_trace).with_suffix(".failures.json")
+    if failure_path is not None:
+        failure_path.write_text(
+            json.dumps({"evaluated_episodes": len(successes), "ik_failures": ik_failures}, indent=2),
+            encoding="utf-8",
+        )
 
 
 def main(argv=None) -> None:

@@ -163,6 +163,12 @@ class ManiSkillPolicyRuntimeTest(unittest.TestCase):
         policy_action[0] = 0.05
         target_action = policy_action.copy()
         target_action[0] = 0.45
+        actual_before = np.array(
+            [[0.40, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]],
+            dtype=np.float32,
+        )
+        actual_after = actual_before.copy()
+        actual_after[0, 0] = 0.44
 
         _append_action_trace(
             trace,
@@ -171,12 +177,23 @@ class ManiSkillPolicyRuntimeTest(unittest.TestCase):
             target_action=target_action,
             info={},
             raw_policy_action=policy_action,
+            policy_inference=3,
+            chunk_step=1,
+            actual_ee_pose_root_before_wxyz=actual_before,
+            actual_ee_pose_root_after_wxyz=actual_after,
         )
 
         np.testing.assert_array_equal(trace["raw_policy_action"][0], policy_action)
         np.testing.assert_array_equal(trace["target_action"][0], target_action)
         self.assertAlmostEqual(trace["policy_left_xyz_norm"][0], 0.05)
         self.assertAlmostEqual(trace["target_left_xyz_norm"][0], 0.45)
+        self.assertEqual(trace["policy_inference"][0], 3)
+        self.assertEqual(trace["chunk_step"][0], 1)
+        self.assertAlmostEqual(trace["actual_left_xyz_step_norm"][0], 0.04)
+        self.assertAlmostEqual(trace["target_left_xyz_error_before"][0], 0.05)
+        self.assertAlmostEqual(trace["target_left_xyz_error_after"][0], 0.01)
+        self.assertAlmostEqual(trace["target_left_xyz_progress"][0], 0.04)
+        self.assertTrue(np.isnan(trace["target_left_xyz_step_norm"][0]))
 
     def test_legacy_hold_options_are_removed(self) -> None:
         parser = build_parser()
