@@ -11,6 +11,7 @@ if __name__ == "__main__":
 import os
 import subprocess
 import logging
+import time
 from contextlib import nullcontext
 import hydra
 import torch
@@ -30,6 +31,12 @@ from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
+from diffusion_policy.common.training_monitor import (
+    evaluate_action_monitor,
+    gradient_norm,
+    make_monitor_batch,
+    monitor_rng,
+)
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 
@@ -463,11 +470,47 @@ class RobotWorkspace(BaseWorkspace):
             if tb_enabled and is_main_process
             else None
         )
+        monitor_cfg = cfg.training.get("action_monitor", {})
+        monitor_enabled = bool(monitor_cfg.get("enabled", False))
+        monitor_seed = int(monitor_cfg.get("seed", 12345))
+        monitor_probes = {}
+        if monitor_enabled and is_main_process:
+            task_cfg = cfg.task.get("maniskill", {})
+            if (
+                task_cfg.get("action_semantics") != "chunk_anchor_relative_target"
+                or task_cfg.get("rotation_representation") != "euler_xyz"
+                or task_cfg.get("translation_frame") != "root_aligned"
+                or task_cfg.get("gripper_semantics") != "absolute"
+                or not hasattr(dataset, "action_anchor_index")
+            ):
+                raise ValueError("Action monitoring requires root-aligned chunk-anchor pose labels.")
+            with monitor_rng(monitor_seed, device):
+                for split, split_dataset in (("train", dataset), ("val", val_dataset)):
+                    monitor_probes[split] = make_monitor_batch(
+                        split_dataset, device, int(monitor_cfg.get("max_samples", 32)),
+                    )
+            if tb_writer is not None:
+                tb_writer.add_text("action/definitions", (
+                    "Fixed, evenly spaced anchors per split; fixed inference noise. "
+                    "Uses the EMA policy when enabled, every val_every epochs. "
+                    "Errors cover only the executed target slots, excluding padding. "
+                    "First-target offsets are relative to the current EE anchor, not measured EE speed. "
+                    "Missed motion = predicted near-zero pose conditional on an active demo pose; "
+                    "gripper activity is measured separately. Missing conditional metrics mean no eligible samples. "
+                    f"Near-zero thresholds: {monitor_cfg.get('translation_threshold_m', 0.002)} m, "
+                    f"{monitor_cfg.get('rotation_threshold_rad', 0.02)} rad. "
+                    f"At most {monitor_cfg.get('max_samples', 32)} anchors per split; seed={monitor_seed}. "
+                    "These are offline diagnostics, not closed-loop success or pause duration."
+                ), 0)
+        grad_log_every = int(cfg.training.get("monitor_grad_every", 0))
         logger_context = JsonLogger(log_path) if is_main_process else nullcontext(None)
 
         try:
             with logger_context as json_logger:
                 for local_epoch_idx in range(cfg.training.num_epochs):
+                    epoch_started_at = time.perf_counter()
+                    train_sample_count = 0
+                    optimizer_updates = 0
                     sampler = train_dataloader.sampler
                     if hasattr(sampler, "set_epoch"):
                         sampler.set_epoch(self.epoch)
@@ -487,6 +530,7 @@ class RobotWorkspace(BaseWorkspace):
                     ) as tepoch:
                         for batch_idx, batch in enumerate(tepoch):
                             batch = dataset.postprocess(batch, device)
+                            train_sample_count += batch["action"].shape[0]
                             if train_sampling_batch is None:
                                 train_sampling_batch = batch
 
@@ -527,10 +571,14 @@ class RobotWorkspace(BaseWorkspace):
                             loss.backward()
 
                             # step optimizer
+                            logged_grad_norm = None
                             if (self.global_step % cfg.training.gradient_accumulate_every == 0):
+                                if is_main_process and grad_log_every > 0 and self.global_step % grad_log_every == 0:
+                                    logged_grad_norm = gradient_norm(self.model.parameters())
                                 self.optimizer.step()
                                 self.optimizer.zero_grad()
                                 lr_scheduler.step()
+                                optimizer_updates += 1
 
                             # update ema
                             if cfg.training.use_ema:
@@ -547,6 +595,10 @@ class RobotWorkspace(BaseWorkspace):
                                 "epoch": self.epoch,
                                 "lr": lr_scheduler.get_last_lr()[0],
                             }
+                            if logged_grad_norm is not None:
+                                step_log["train_grad_norm"] = logged_grad_norm
+                                if tb_writer is not None:
+                                    tb_writer.add_scalar("train/grad_norm", logged_grad_norm, int(self.global_step))
                             if fpo_smoke_status is not None:
                                 step_log["fpo_smoke_status"] = fpo_smoke_status
                             if fpo_repro_status is not None:
@@ -596,6 +648,10 @@ class RobotWorkspace(BaseWorkspace):
                         train_loss_std = float(np.std(train_losses))
                     step_log["train_loss"] = train_loss
                     step_log["train_loss_std"] = train_loss_std
+                    train_seconds = time.perf_counter() - epoch_started_at
+                    step_log["performance/train_epoch_seconds"] = train_seconds
+                    step_log["performance/train_samples_per_second"] = train_sample_count * world_size / max(train_seconds, 1e-9)
+                    step_log["progress/optimizer_updates_in_epoch"] = optimizer_updates
 
                     if is_main_process:
                         # ========= eval for this epoch ==========
@@ -670,6 +726,18 @@ class RobotWorkspace(BaseWorkspace):
                                 del mse
                                 del mae
 
+                        if monitor_enabled and self.epoch % cfg.training.val_every == 0:
+                            for split, probe in monitor_probes.items():
+                                monitor_metrics = evaluate_action_monitor(
+                                    policy, probe, seed=monitor_seed,
+                                    n_obs_steps=cfg.n_obs_steps,
+                                    n_action_steps=cfg.n_action_steps,
+                                    translation_threshold_m=float(monitor_cfg.get("translation_threshold_m", 0.002)),
+                                    rotation_threshold_rad=float(monitor_cfg.get("rotation_threshold_rad", 0.02)),
+                                    gripper_threshold=float(monitor_cfg.get("gripper_threshold", 0.5)),
+                                )
+                                step_log.update({f"action/{split}/{key}": value for key, value in monitor_metrics.items()})
+
                         step_log.update(_query_gpu_system_metrics(device))
 
                         # checkpoint
@@ -680,6 +748,7 @@ class RobotWorkspace(BaseWorkspace):
                                 save_dir_name = f"{save_name}-{seed}"
                             self.save_checkpoint(f"checkpoints/{save_dir_name}/{self.epoch + 1}.ckpt")  # TODO
 
+                        step_log["performance/epoch_seconds"] = time.perf_counter() - epoch_started_at
                         if tb_writer is not None:
                             tb_epoch = int(self.epoch)
                             tb_writer.add_scalar("epoch/train_loss", float(step_log["train_loss"]), tb_epoch)
@@ -715,6 +784,9 @@ class RobotWorkspace(BaseWorkspace):
                             ):
                                 if key in step_log:
                                     tb_writer.add_scalar(f"system/{key.removeprefix('system_')}", float(step_log[key]), tb_epoch)
+                            for key, value in step_log.items():
+                                if key.startswith(("action/", "performance/", "progress/")):
+                                    tb_writer.add_scalar(key, float(value), tb_epoch)
 
                         # ========= eval end for this epoch ==========
                         policy.train()
@@ -750,6 +822,9 @@ class BatchSampler:
         self.discard = data_size - batch_size * self.num_batch
         self.shuffle = shuffle
         self.rng = np.random.default_rng(seed) if shuffle else None
+
+    def set_epoch(self, epoch: int) -> None:
+        del epoch
 
     def __iter__(self):
         if self.shuffle:

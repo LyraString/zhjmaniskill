@@ -89,6 +89,14 @@ training:
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0
+  monitor_grad_every: 50
+  action_monitor:
+    enabled: False
+    max_samples: 32
+    seed: 12345
+    translation_threshold_m: 0.002
+    rotation_threshold_rad: 0.02
+    gripper_threshold: 0.5
   amp:
     enabled: False
     dtype: bf16

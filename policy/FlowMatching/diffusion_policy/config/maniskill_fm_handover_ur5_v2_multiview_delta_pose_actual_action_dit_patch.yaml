@@ -60,6 +60,8 @@ training:
   val_every: 25
   max_val_steps: 5
   sample_every: 10
+  action_monitor:
+    enabled: True
   amp:
     enabled: True
     dtype: bf16
