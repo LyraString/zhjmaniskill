@@ -265,6 +265,8 @@ MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
             "target_x_range_override": [0.1, 0.25],
             "target_y_range_override": [0.15, 0.2],
             "block_middle_pose_override": [0.0, 0.1, 0.9, 0.0, 1.0, 0.0, 0.0],
+            "handover_reward_center": [-0.023, -0.092, 1.011],
+            "handover_reward_plateau_radius": 0.16,
         },
     },
 }

@@ -1724,7 +1724,11 @@ class RobotWorkspace(BaseWorkspace):
             stage = info_tensor(info, "reward_stage")
             left_to_box = info_tensor(info, "reward_left_to_box")
             right_to_box = info_tensor(info, "reward_right_to_box")
-            box_to_handover = info_tensor(info, "reward_box_to_handover")
+            # Use distance to the region boundary when supplied by the task.
+            box_to_handover = info_tensor(
+                info, "reward_box_to_handover_region"
+                if "reward_box_to_handover_region" in info else "reward_box_to_handover"
+            )
             box_to_target = info_tensor(info, "reward_box_to_target")
             success = info_tensor(info, "success", dtype=torch.bool)
             if any(

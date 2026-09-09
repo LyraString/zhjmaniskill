@@ -63,8 +63,14 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         target_x_offset: float = 0.0,
         target_x_range_override=None,
         target_y_range_override=None,
+        handover_reward_center=None,
+        handover_reward_plateau_radius: float = 0.0,
         **kwargs,
     ):
+        self.handover_reward_center = (
+            BLOCK_MIDDLE_POSE[:3] if handover_reward_center is None else handover_reward_center
+        )
+        self.handover_reward_plateau_radius = float(handover_reward_plateau_radius)
         self.legacy_rng_compat = bool(legacy_rng_compat)
         self.object_y_offset = float(object_y_offset)
         self.box_x_offset = float(box_x_offset)
@@ -302,7 +308,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         target_top_center = self.target_box.pose.p.clone()
         target_top_center[:, 2] += float(TARGET_HALF_SIZE[2])
         handover_pos = torch.as_tensor(
-            BLOCK_MIDDLE_POSE[:3],
+            self.handover_reward_center,
             device=self.device,
             dtype=box_pos.dtype,
         ).expand(self.num_envs, -1)
@@ -361,7 +367,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         target_top_center = self.target_box.pose.p.clone()
         target_top_center[:, 2] += float(TARGET_HALF_SIZE[2])
         handover_pos = torch.tensor(
-            BLOCK_MIDDLE_POSE[:3],
+            self.handover_reward_center,
             device=device,
             dtype=dtype,
         ).repeat(self.num_envs, 1)
@@ -369,6 +375,9 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         left_to_box = torch.linalg.norm(left_ee_pos - box_pos, dim=1)
         right_to_box = torch.linalg.norm(right_ee_pos - box_pos, dim=1)
         box_to_handover = torch.linalg.norm(box_pos - handover_pos, dim=1)
+        box_to_handover_region = torch.clamp(
+            box_to_handover - self.handover_reward_plateau_radius, min=0.0
+        )
         target_delta = box_bottom_center - target_top_center
         target_xy_dist = torch.linalg.norm(target_delta[:, :2], dim=1)
         target_z_dist = torch.abs(target_delta[:, 2])
@@ -410,7 +419,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
 
         left_reach_reward = torch.exp(-8.0 * left_to_box)
         left_grasp_reward = left_closed.to(torch.float32) * (left_to_box < REWARD_LEFT_GRASP_DIST).to(torch.float32)
-        handover_reward = torch.exp(-6.0 * box_to_handover)
+        handover_reward = torch.exp(-6.0 * box_to_handover_region)
         right_reach_reward = torch.exp(-8.0 * right_to_box)
         right_grasp_reward = right_closed.to(torch.float32) * (right_to_box < REWARD_RIGHT_GRASP_DIST).to(torch.float32)
         stage2_left_transfer_reward = torch.where(
@@ -442,6 +451,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             reward_left_to_box=left_to_box,
             reward_right_to_box=right_to_box,
             reward_box_to_handover=box_to_handover,
+            reward_box_to_handover_region=box_to_handover_region,
             reward_box_to_target=box_to_target,
             reward_target_xy_dist=target_xy_dist,
             reward_target_z_dist=target_z_dist,
