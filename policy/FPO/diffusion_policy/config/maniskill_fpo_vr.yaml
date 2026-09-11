@@ -13,6 +13,8 @@ task:
     zarr_path: ../FlowMatching/data/HandoverBlockUR5-pico-clean-v2-80.zarr
 
 training:
+  max_timesteps_per_episode: 1000
+  timesteps_per_batch: ${eval:'${training.num_envs} * ${training.max_timesteps_per_episode}'}
   # Pass the FM checkpoint as train_fpo.sh's third positional argument.
   resume: True
   preserve_ckpt_normalizer: True
@@ -22,6 +24,9 @@ training:
   sim_backend: physx_cuda
   render_backend: sapien_cuda
   checkpoint_run_name: ${now:%y%m%d-%H%M%S}-vr-fpo-seed${training.seed}
+  num_envs: 32
+  num_minibatches: 128
+  checkpoint_every: 200
 
 logging:
   mode: offline

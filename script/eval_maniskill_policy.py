@@ -575,7 +575,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("task_name", type=str, help="ManiSkill env id or the env id associated with --task-profile")
     parser.add_argument("--task-profile", type=str, default=None, help="Optional registered ManiSkill task profile")
     parser.add_argument("--episodes", type=int, default=1)
-    parser.add_argument("--max-episode-steps", type=int, default=50)
+    parser.add_argument("--max-episode-steps", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--action-type", type=str, default=None)
     parser.add_argument("--obs-mode", type=str, default=None)
