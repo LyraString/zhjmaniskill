@@ -170,7 +170,11 @@ def _reduce_distributed_metrics(metrics: dict, device: torch.device) -> dict:
         )
 
     reduced = {}
-    sum_keys = {"rollout_policy_calls", "rollout_env_steps"}
+    sum_keys = {
+        "rollout_policy_calls", "rollout_env_steps",
+        "rollout_completed_episodes", "rollout_successful_episodes",
+        *(f"rollout_stage_{stage}_events" for stage in range(1, 5)),
+    }
     for key in local_keys:
         value = metrics[key]
         scalar = torch.tensor(float(value), device=device, dtype=torch.float64)
@@ -185,6 +189,16 @@ def _reduce_distributed_metrics(metrics: dict, device: torch.device) -> dict:
             scalar /= world_size
         reduced[key] = float(scalar.item())
     return reduced
+
+
+ONLINE_ROLLOUT_LOG_KEYS = (
+    *(f"rollout_reward_component_{term}_mean" for term in ("stage", "progress", "success", "time", "upright")),
+    *(f"rollout_stage_{stage}_events" for stage in range(1, 5)),
+    "rollout_completed_episodes",
+    "rollout_successful_episodes",
+    "rollout_reward_box_tilt_cost_mean",
+    "rollout_reward_box_upright_penalty_mean",
+)
 
 
 ONLINE_ROLLOUT_DIAG_KEYS = (
@@ -945,6 +959,7 @@ class RobotWorkspace(BaseWorkspace):
             )
             if num_envs > 1:
                 env = ManiSkillCudaFPORunner(
+                    max_episode_steps=int(cfg.training.max_timesteps_per_episode),
                     task_name=cfg.task.name,
                     shape_meta=OmegaConf.to_container(cfg.shape_meta, resolve=True),
                     task_profile=task_profile,
@@ -1034,13 +1049,17 @@ class RobotWorkspace(BaseWorkspace):
                             "mean_reward": rollout["reward_mean"],
                             "mean_ep_len": rollout["ep_len_mean"],
                         }
-                        for diag_key in ONLINE_ROLLOUT_DIAG_KEYS:
+                        for diag_key in ONLINE_ROLLOUT_DIAG_KEYS + ONLINE_ROLLOUT_LOG_KEYS:
                             if diag_key in rollout:
                                 local_metrics[diag_key] = rollout[diag_key]
                         # Release the GPU-heavy batch before the next collection so
                         # cached allocator blocks can be reused by the new rollout.
                         del rollout
                         metrics = _reduce_distributed_metrics(local_metrics, device)
+                        if metrics.get("rollout_completed_episodes", 0) > 0:
+                            metrics["rollout_success_rate"] = (
+                                metrics["rollout_successful_episodes"] / metrics["rollout_completed_episodes"]
+                            )
                         step_log = {
                             "iter": it,
                             "iter_total": online_iters,
@@ -1074,6 +1093,8 @@ class RobotWorkspace(BaseWorkspace):
                             tb_step = int(self.global_step)
                             tb_writer.add_scalar("online/mean_reward", _safe_float(step_log["mean_reward"]), tb_step)
                             tb_writer.add_scalar("online/mean_ep_len", _safe_float(step_log["mean_ep_len"]), tb_step)
+                            if "rollout_success_rate" in step_log:
+                                tb_writer.add_scalar("online/success_rate", step_log["rollout_success_rate"], tb_step)
                             tb_writer.add_scalar("online/actor_loss", _safe_float(step_log["actor_loss"]), tb_step)
                             tb_writer.add_scalar("online/critic_loss", _safe_float(step_log["critic_loss"]), tb_step)
                             tb_writer.add_scalar("online/rho_mean", _safe_float(step_log["rho_mean"]), tb_step)
@@ -1599,6 +1620,13 @@ class RobotWorkspace(BaseWorkspace):
         fpo_reward_potential = torch.zeros(num_envs, device=device, dtype=torch.float32)
         fpo_reward_has_potential = torch.zeros(num_envs, device=device, dtype=torch.bool)
         fpo_reward_success_awarded = torch.zeros(num_envs, device=device, dtype=torch.bool)
+        reward_component_sums = {
+            key: torch.zeros((), device=device)
+            for key in ("stage", "progress", "success", "time", "upright")
+        }
+        stage_event_counts = torch.zeros(4, device=device)
+        completed_successes = torch.zeros((), device=device)
+        completed_episodes = 0
 
         reward_steps = []
         fpo_reward_fallback_steps = []
@@ -1634,6 +1662,8 @@ class RobotWorkspace(BaseWorkspace):
             "reward_box_to_handover",
             "reward_box_to_target",
             "reward_target_xy_dist",
+            "reward_box_tilt_cost",
+            "reward_box_upright_penalty",
             "reward_target_z_dist",
             "reward_left_holding",
             "reward_right_holding",
@@ -1752,6 +1782,7 @@ class RobotWorkspace(BaseWorkspace):
             for next_stage, bonus in ((1, 8.0), (2, 10.0), (3, 15.0), (4, 20.0)):
                 crossed = (prev_stage_id < next_stage) & (stage_id >= next_stage)
                 stage_bonus = stage_bonus + crossed.to(dtype=torch.float32) * bonus
+                stage_event_counts[next_stage - 1] += crossed.sum()
 
             left_potential = torch.exp(-8.0 * left_to_box)
             handover_potential = torch.exp(-6.0 * box_to_handover)
@@ -1776,10 +1807,20 @@ class RobotWorkspace(BaseWorkspace):
             potential_delta = torch.clamp(potential_delta, min=-1.0, max=1.0)
 
             new_success = success & (~fpo_reward_success_awarded)
-            reward = stage_bonus
-            reward = reward + 3.0 * potential_delta
-            reward = reward + new_success.to(dtype=torch.float32) * 120.0
-            reward = reward - 0.02
+            upright_penalty = (
+                info_tensor(info, "reward_box_upright_penalty")
+                if "reward_box_upright_penalty" in info else torch.zeros_like(stage_bonus)
+            )
+            components = {
+                "stage": stage_bonus,
+                "progress": 3.0 * potential_delta,
+                "success": new_success.to(dtype=torch.float32) * 120.0,
+                "time": torch.full_like(stage_bonus, -0.02),
+                "upright": -upright_penalty,
+            }
+            reward = sum(components.values())
+            for key, value in components.items():
+                reward_component_sums[key] += value.sum()
 
             fpo_reward_stage = stage.detach()
             fpo_reward_potential = potential.detach()
@@ -1911,6 +1952,8 @@ class RobotWorkspace(BaseWorkspace):
                     boundary_steps.append(boundary)
 
                     if finished_env_ids:
+                        completed_successes += fpo_reward_success_awarded[finished_env_ids].sum()
+                        completed_episodes += len(finished_env_ids)
                         with torch.inference_mode():
                             next_critic_base = self._build_critic_input_from_obs(next_obs_hist)
                             next_critic_in = self._build_online_critic_input(
@@ -2106,6 +2149,8 @@ class RobotWorkspace(BaseWorkspace):
             "rollout_reward_right_to_box_mean": metric_mean("reward_right_to_box"),
             "rollout_reward_box_to_handover_mean": metric_mean("reward_box_to_handover"),
             "rollout_reward_box_to_target_mean": metric_mean("reward_box_to_target"),
+            "rollout_reward_box_tilt_cost_mean": metric_mean("reward_box_tilt_cost"),
+            "rollout_reward_box_upright_penalty_mean": metric_mean("reward_box_upright_penalty"),
             "rollout_reward_target_xy_dist_mean": metric_mean("reward_target_xy_dist"),
             "rollout_reward_target_z_dist_mean": metric_mean("reward_target_z_dist"),
             "rollout_reward_left_holding_frac": metric_mean("reward_left_holding"),
@@ -2117,6 +2162,12 @@ class RobotWorkspace(BaseWorkspace):
             "rollout_chunk_steps_mean": float(np.mean(chunk_step_counts)) if chunk_step_counts else 0.0,
             "rollout_policy_calls": float(len(actor_start_step_indices)),
             "rollout_env_steps": float(rewards.numel()),
+            "rollout_completed_episodes": float(completed_episodes),
+            "rollout_successful_episodes": float(completed_successes.item()),
+            **{f"rollout_reward_component_{key}_mean": float(value.item()) / rewards.numel()
+               for key, value in reward_component_sums.items()},
+            **{f"rollout_stage_{stage + 1}_events": float(value)
+               for stage, value in enumerate(stage_event_counts.cpu().tolist())},
         }
 
         if capo_enabled and flat_actor_coupling_score:

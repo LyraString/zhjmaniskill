@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Any
+from copy import copy
+import math
 import sapien
 import torch
 from mani_skill.utils.registration import register_env
@@ -34,6 +36,22 @@ REWARD_GRIPPER_OPEN_THRESHOLD = 0.95
 REWARD_BOX_LIFT_Z = BOX_CENTER_Z + 0.025
 REWARD_DROP_Z = TARGET_CENTER_Z + 0.02
 FPO_CRITIC_PRIVILEGED_STATE_DIM = 23
+GRASP_MIN_FORCE = 0.5  # Newtons per finger.
+GRASP_MAX_ANGLE_DEG = 85.0
+
+
+def _two_finger_grasp(left_force, right_force, left_pos, right_pos):
+    """Require opposing box contact forces along the fingers' opening directions."""
+    opening_direction = torch.nn.functional.normalize(left_pos - right_pos, dim=-1)
+    cos_limit = math.cos(math.radians(GRASP_MAX_ANGLE_DEG))
+    left_norm = torch.linalg.vector_norm(left_force, dim=-1)
+    right_norm = torch.linalg.vector_norm(right_force, dim=-1)
+    return (
+        (left_norm >= GRASP_MIN_FORCE)
+        & (right_norm >= GRASP_MIN_FORCE)
+        & ((left_force * opening_direction).sum(-1) >= cos_limit * left_norm)
+        & ((right_force * -opening_direction).sum(-1) >= cos_limit * right_norm)
+    )
 
 
 def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
@@ -65,12 +83,16 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         target_y_range_override=None,
         handover_reward_center=None,
         handover_reward_plateau_radius: float = 0.0,
+        box_upright_penalty_coef: float = 0.0,
+        use_contact_grasp_reward: bool = False,
         **kwargs,
     ):
         self.handover_reward_center = (
             BLOCK_MIDDLE_POSE[:3] if handover_reward_center is None else handover_reward_center
         )
         self.handover_reward_plateau_radius = float(handover_reward_plateau_radius)
+        self.box_upright_penalty_coef = float(box_upright_penalty_coef)
+        self.use_contact_grasp_reward = bool(use_contact_grasp_reward)
         self.legacy_rng_compat = bool(legacy_rng_compat)
         self.object_y_offset = float(object_y_offset)
         self.box_x_offset = float(box_x_offset)
@@ -100,6 +122,16 @@ class HandoverBlockEnv(DualUR5WSGEnv):
 
     def _load_scene(self, options: dict):
         super()._load_scene(options)
+        if self.use_contact_grasp_reward:
+            self._grasp_fingers = []
+            for arm_index in (0, 1):
+                fingers = []
+                for name in ("finger_left", "finger_right"):
+                    finger = copy(self.get_arm_link_by_name(arm_index, name))
+                    # ManiSkill caches GPU contact queries by name; the arms share URDF names.
+                    finger.name = f"grasp_arm{arm_index}_{name}"
+                    fingers.append(finger)
+                self._grasp_fingers.append(tuple(fingers))
 
         box_physical_material = sapien.physx.PhysxMaterial(
             static_friction=BOX_STATIC_FRICTION,
@@ -221,6 +253,14 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         else:
             self.reward_stage = self.reward_stage.to(device=self.device, dtype=torch.long)
         return self.reward_stage
+
+    def _is_box_grasped(self, arm_index: int) -> torch.Tensor:
+        left, right = self._grasp_fingers[arm_index]
+        return _two_finger_grasp(
+            self.scene.get_pairwise_contact_forces(left, self.box),
+            self.scene.get_pairwise_contact_forces(right, self.box),
+            left.pose.p, right.pose.p,
+        )
 
     def evaluate(self):
         base_info = super().evaluate()
@@ -378,6 +418,10 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         box_to_handover_region = torch.clamp(
             box_to_handover - self.handover_reward_plateau_radius, min=0.0
         )
+        # For a wxyz quaternion, 1 - dot(local_z, world_z) = 2 * (x*x + y*y).
+        box_q = torch.nn.functional.normalize(self.box.pose.q, dim=-1)
+        box_tilt_cost = 2.0 * box_q[:, 1:3].square().sum(dim=-1)
+        box_upright_penalty = self.box_upright_penalty_coef * box_tilt_cost
         target_delta = box_bottom_center - target_top_center
         target_xy_dist = torch.linalg.norm(target_delta[:, :2], dim=1)
         target_z_dist = torch.abs(target_delta[:, 2])
@@ -395,6 +439,11 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         left_holding = left_closed & (left_to_box < REWARD_LEFT_GRASP_DIST) & box_lifted
         handover_ready = box_to_handover < REWARD_HANDOVER_DIST
         right_holding = right_closed & (right_to_box < REWARD_RIGHT_GRASP_DIST)
+        if self.use_contact_grasp_reward:
+            left_grasped = self._is_box_grasped(0)
+            right_grasped = self._is_box_grasped(1)
+            left_holding = left_grasped & box_lifted
+            right_holding = right_grasped
         handover_complete = right_holding & left_released & left_clear
         target_near = box_to_target < REWARD_TARGET_NEAR_DIST
 
@@ -422,6 +471,9 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         handover_reward = torch.exp(-6.0 * box_to_handover_region)
         right_reach_reward = torch.exp(-8.0 * right_to_box)
         right_grasp_reward = right_closed.to(torch.float32) * (right_to_box < REWARD_RIGHT_GRASP_DIST).to(torch.float32)
+        if self.use_contact_grasp_reward:
+            left_grasp_reward = left_grasped.to(torch.float32)
+            right_grasp_reward = right_grasped.to(torch.float32)
         stage2_left_transfer_reward = torch.where(
             right_holding,
             0.25 * left_released.to(torch.float32) + 0.25 * left_clear.to(torch.float32),
@@ -445,6 +497,7 @@ class HandoverBlockEnv(DualUR5WSGEnv):
         reward = reward + 10.0 * info["success"].to(torch.float32)
         reward = reward - 1.0 * box_dropped.to(torch.float32)
         reward = reward - 0.01 * action_penalty
+        reward = reward - box_upright_penalty
 
         info.update(
             reward_stage=stage.to(torch.float32),
@@ -452,6 +505,8 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             reward_right_to_box=right_to_box,
             reward_box_to_handover=box_to_handover,
             reward_box_to_handover_region=box_to_handover_region,
+            reward_box_tilt_cost=box_tilt_cost,
+            reward_box_upright_penalty=box_upright_penalty,
             reward_box_to_target=box_to_target,
             reward_target_xy_dist=target_xy_dist,
             reward_target_z_dist=target_z_dist,

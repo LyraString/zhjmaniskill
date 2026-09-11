@@ -7,7 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sim.maniskill.task_profiles import get_task_profile
-from sim.maniskill.tasks.handover_block_env import BLOCK_MIDDLE_POSE, HandoverBlockEnv
+from sim.maniskill.tasks.handover_block_env import BLOCK_MIDDLE_POSE, HandoverBlockEnv, _two_finger_grasp
 from sim.maniskill.tasks.dual_ur5_wsg_env import DualUR5WSGEnv
 from sim.maniskill.tasks.handover_block_ur5_v2_env import HandoverBlockUR5V2Env
 
@@ -20,17 +20,25 @@ class HandoverRewardRegionTest(unittest.TestCase):
             legacy = HandoverBlockUR5V2Env()
         self.assertEqual(env.handover_reward_center, cfg['handover_reward_center'])
         self.assertEqual(env.handover_reward_plateau_radius, .16)
+        self.assertEqual(env.box_upright_penalty_coef, .02)
+        self.assertTrue(env.use_contact_grasp_reward)
+        self.assertFalse(legacy.use_contact_grasp_reward)
         self.assertEqual(legacy.handover_reward_center, BLOCK_MIDDLE_POSE[:3])
         self.assertEqual(legacy.handover_reward_plateau_radius, 0)
+        self.assertEqual(legacy.box_upright_penalty_coef, 0)
 
-    def evaluate(self, offsets, center, radius):
+    def evaluate(self, offsets, center, radius, *, quaternions=None, upright_coef=0.0):
         pos = torch.tensor(center).repeat(len(offsets), 1)
         pos[:, 0] += torch.tensor(offsets)
         n = len(pos)
+        if quaternions is None:
+            quaternions = torch.tensor([[1., 0., 0., 0.]]).repeat(n, 1)
         env = SimpleNamespace(
             device='cpu', num_envs=n, handover_reward_center=center,
             handover_reward_plateau_radius=radius,
-            box=SimpleNamespace(pose=SimpleNamespace(p=pos)),
+            box_upright_penalty_coef=upright_coef,
+            use_contact_grasp_reward=False,
+            box=SimpleNamespace(pose=SimpleNamespace(p=pos, q=quaternions)),
             target_box=SimpleNamespace(pose=SimpleNamespace(p=pos + 1)),
             _get_reward_stage=lambda: torch.ones(n, dtype=torch.long),
             get_arm_end_effector_link=lambda arm_index: SimpleNamespace(pose=SimpleNamespace(p=pos + .3)),
@@ -58,6 +66,25 @@ class HandoverRewardRegionTest(unittest.TestCase):
         torch.testing.assert_close(info['reward_box_to_handover_region'], expected)
         torch.testing.assert_close(reward, 1.5 + 2 * torch.exp(-6 * expected))
 
+    def test_upright_penalty_tracks_tilt_and_ignores_yaw_and_quaternion_sign(self):
+        half_angles = torch.deg2rad(torch.tensor([0., 30., 90., 180.])) / 2
+        q = torch.zeros(4, 4)
+        q[:, 0] = half_angles.cos()
+        q[:, 1] = half_angles.sin()
+        expected_cost = 1 - (2 * half_angles).cos()
+        offsets = [.2] * 4
+        baseline, _ = self.evaluate(offsets, BLOCK_MIDDLE_POSE[:3], 0, quaternions=q)
+        # Compose a 90-degree world-yaw rotation with each tilted orientation.
+        yaw_q = torch.stack((q[:, 0], q[:, 1], q[:, 1], q[:, 0]), dim=-1) / 2**.5
+        for orientation in (q, -q, yaw_q):
+            reward, info = self.evaluate(
+                offsets, BLOCK_MIDDLE_POSE[:3], 0,
+                quaternions=orientation, upright_coef=.02,
+            )
+            torch.testing.assert_close(info['reward_box_tilt_cost'], expected_cost)
+            torch.testing.assert_close(info['reward_box_upright_penalty'], .02 * expected_cost)
+            torch.testing.assert_close(reward, baseline - .02 * expected_cost)
+
     def test_actual_fpo_reward_uses_plateau_and_legacy_fallback(self):
         path = Path(__file__).resolve().parents[1] / 'policy/fm_diffusion/diffusion_policy/workspace/fpo_robotworkspace.py'
         tree = ast.parse(path.read_text())
@@ -71,16 +98,48 @@ class HandoverRewardRegionTest(unittest.TestCase):
         exec(compile(module, str(path), 'exec'), ns)
         ns.update(fpo_reward_stage=torch.ones(1), fpo_reward_potential=torch.ones(1),
                   fpo_reward_has_potential=torch.ones(1, dtype=torch.bool),
-                  fpo_reward_success_awarded=torch.zeros(1, dtype=torch.bool))
+                  fpo_reward_success_awarded=torch.zeros(1, dtype=torch.bool),
+                  stage_event_counts=torch.zeros(4),
+                  reward_component_sums={key: torch.zeros(()) for key in
+                                         ('stage', 'progress', 'success', 'time', 'upright')})
         info = {'reward_stage': [1.], 'reward_left_to_box': [.1], 'reward_right_to_box': [.2],
                 'reward_box_to_handover': [.08], 'reward_box_to_handover_region': [0.],
                 'reward_box_to_target': [.3], 'success': [False]}
         reward, fallback = ns['compute_handover_fpo_reward'](torch.zeros(1), info)
         torch.testing.assert_close(reward, torch.tensor([-.02]))
         self.assertFalse(bool(fallback.any()))
+        info['reward_box_upright_penalty'] = [.02]
+        reward, _ = ns['compute_handover_fpo_reward'](torch.tensor([-100.]), info)
+        torch.testing.assert_close(reward, torch.tensor([-.04]))
+        del info['reward_box_upright_penalty']
         del info['reward_box_to_handover_region']
         reward, _ = ns['compute_handover_fpo_reward'](torch.zeros(1), info)
         torch.testing.assert_close(reward, 3 * (torch.exp(torch.tensor([-.48])) - 1) - .02)
+        # Stage crossings and success are awarded once, including skipped stages.
+        info['reward_stage'] = [4.]
+        info['success'] = [True]
+        reward, _ = ns['compute_handover_fpo_reward'](torch.zeros(1), info)
+        torch.testing.assert_close(reward, torch.tensor([164.98]))
+        reward, _ = ns['compute_handover_fpo_reward'](torch.zeros(1), info)
+        torch.testing.assert_close(reward, torch.tensor([-.02]))
+        torch.testing.assert_close(ns['stage_event_counts'], torch.tensor([0., 1., 1., 1.]))
+        self.assertEqual(ns['reward_component_sums']['stage'].item(), 45.)
+        self.assertEqual(ns['reward_component_sums']['success'].item(), 120.)
+
+    def test_two_finger_grasp_rejects_empty_single_weak_and_wrong_direction_contacts(self):
+        left_pos = torch.tensor([[-.03, 0., 0.]]).repeat(5, 1)
+        right_pos = -left_pos
+        left_force = torch.tensor([[-1., 0., 0.], [0., 0., 0.], [-1., 0., 0.],
+                                   [-.1, 0., 0.], [0., 0., 1.]])
+        right_force = torch.tensor([[1., 0., 0.], [0., 0., 0.], [0., 0., 0.],
+                                    [.1, 0., 0.], [0., 0., 1.]])
+        expected = torch.tensor([True, False, False, False, False])
+        torch.testing.assert_close(_two_finger_grasp(left_force, right_force, left_pos, right_pos), expected)
+        # Rotate all world-space vectors together; grasp classification must be invariant.
+        rotation = torch.tensor([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
+        torch.testing.assert_close(_two_finger_grasp(
+            left_force @ rotation, right_force @ rotation, left_pos @ rotation, right_pos @ rotation,
+        ), expected)
 
 
 if __name__ == '__main__':
