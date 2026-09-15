@@ -170,7 +170,8 @@ def _extract_world_xyz_from_camera(
 
     valid_flat = valid.reshape(-1)
     if not np.any(valid_flat):
-        return None
+        # A valid camera frame can contain no depth hits; keep its view slot.
+        return np.empty((0, 3), dtype=np.float32)
 
     camera_xyz = position_xyz.reshape(-1, 3)[valid_flat]
     cam2world = np.asarray(cam2world, dtype=np.float32)
@@ -186,8 +187,6 @@ def _extract_world_xyz_from_camera(
         segmentation_flat,
         env_id=env_id,
     )
-    if xyz.shape[0] == 0:
-        return None
     return xyz.astype(np.float32, copy=False)
 
 
@@ -273,10 +272,12 @@ def _extract_multiview_point_clouds_from_sensor_data(
         images = sensor_data.get(camera_name)
         cam_param = sensor_param.get(camera_name)
         if not isinstance(images, Mapping) or not isinstance(cam_param, Mapping):
-            continue
+            raise ValueError(f"Missing sensor data or parameters for camera '{camera_name}'.")
         xyz = _extract_world_xyz_from_camera(images, cam_param, env_id=env_id)
         if xyz is None:
-            continue
+            raise ValueError(
+                f"Camera '{camera_name}' requires position XYZ data and cam2world_gl extrinsics."
+            )
         result[str(view["key"])] = _postprocess_point_cloud(
             xyz,
             int(view["points"]),
