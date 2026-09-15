@@ -8,9 +8,9 @@ exp_name: vr_fm
 
 training:
   resume: False
-  checkpoint_run_name: ${now:%y%m%d-%H%M%S}-vr-seed${training.seed}
-  num_epochs: 1000
-  checkpoint_every: 250
+  checkpoint_run_name: ${now:%y%m%d-%H%M%S}-vr-ep500-seed${training.seed}
+  num_epochs: 500
+  checkpoint_every: 50
 
 logging:
   mode: offline
