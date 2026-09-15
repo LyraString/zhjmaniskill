@@ -27,6 +27,13 @@ training:
   num_envs: 32
   num_minibatches: 128
   checkpoint_every: 200
+  early_failure:
+    enabled: True
+    penalty: 30.0
+    confirm_steps: 10  # 0.5 seconds at 20 Hz.
+    closed_threshold: 0.25
+    open_threshold: 0.95
+    box_tilt_deg: 60.0
 
 logging:
   mode: offline

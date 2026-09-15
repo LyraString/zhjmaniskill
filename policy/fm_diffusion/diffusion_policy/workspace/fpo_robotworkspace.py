@@ -44,6 +44,7 @@ from diffusion_policy.env_runner.vector_fpo_runner import VectorFPORunner
 from diffusion_policy.env_runner.maniskill_fpo_runner import ManiSkillFPORunner
 from diffusion_policy.env_runner.maniskill_vector_fpo_runner import ManiSkillVectorFPORunner
 from diffusion_policy.env_runner.maniskill_cuda_fpo_runner import ManiSkillCudaFPORunner
+from diffusion_policy.env_runner.handover_failure import HandoverFailureDetector
 from sim.maniskill.task_profiles import resolve_runtime_control_mode
 from sim.maniskill.tasks.handover_block_env import BOX_HALF_SIZE, TARGET_HALF_SIZE
 
@@ -174,6 +175,8 @@ def _reduce_distributed_metrics(metrics: dict, device: torch.device) -> dict:
         "rollout_policy_calls", "rollout_env_steps",
         "rollout_completed_episodes", "rollout_successful_episodes",
         *(f"rollout_stage_{stage}_events" for stage in range(1, 5)),
+        *(f"rollout_failure_{reason}" for reason in HandoverFailureDetector.reasons),
+        "rollout_early_failures",
     }
     for key in local_keys:
         value = metrics[key]
@@ -198,6 +201,9 @@ ONLINE_ROLLOUT_LOG_KEYS = (
     "rollout_successful_episodes",
     "rollout_reward_box_tilt_cost_mean",
     "rollout_reward_box_upright_penalty_mean",
+    "rollout_reward_component_failure_mean",
+    "rollout_early_failures",
+    *(f"rollout_failure_{reason}" for reason in HandoverFailureDetector.reasons),
 )
 
 
@@ -1627,6 +1633,13 @@ class RobotWorkspace(BaseWorkspace):
         stage_event_counts = torch.zeros(4, device=device)
         completed_successes = torch.zeros((), device=device)
         completed_episodes = 0
+        failure_cfg = getattr(cfg_t, "early_failure", None)
+        failure_detector = None
+        if failure_cfg is not None and failure_cfg.enabled:
+            failure_detector = HandoverFailureDetector(num_envs, device, failure_cfg)
+        failure_counts = torch.zeros(3, device=device)
+        early_failure_count = torch.zeros((), device=device)
+        failure_reward_sum = torch.zeros((), device=device)
 
         reward_steps = []
         fpo_reward_fallback_steps = []
@@ -1924,11 +1937,22 @@ class RobotWorkspace(BaseWorkspace):
                     next_obs, rew, terminated, truncated, info = env.step(absolute_actions)
                     for info_metric_key in info_metric_keys:
                         append_info_metric(info, info_metric_key)
-                    done_tensor = torch.logical_or(terminated, truncated)
                     next_obs_hist = self._append_batched_obs_history(obs_hist, next_obs)
 
                     env_reward = rew.detach().to(device=device, dtype=torch.float32)
                     fpo_reward, fpo_reward_fallback = compute_handover_fpo_reward(env_reward, info)
+                    if failure_detector is not None:
+                        failures = failure_detector.step(absolute_actions, info)
+                        failed = failures.any(dim=-1)
+                        penalty = failed.to(torch.float32) * float(failure_cfg.penalty)
+                        fpo_reward = fpo_reward - penalty
+                        failure_reward_sum -= penalty.sum()
+                        failure_counts += failures.sum(dim=0)
+                        early_failure_count += failed.sum()
+                        # True failure: no value bootstrap, even at the time limit.
+                        terminated = terminated | failed
+                        truncated = truncated & ~failed
+                    done_tensor = torch.logical_or(terminated, truncated)
                     reward_steps.append(fpo_reward * reward_scaling)
                     fpo_reward_fallback_steps.append(fpo_reward_fallback.to(dtype=torch.float32).mean())
                     value_steps.append(v.detach().to(device=device, dtype=torch.float32))
@@ -1967,6 +1991,8 @@ class RobotWorkspace(BaseWorkspace):
                             ep_len_totals.append(ep_steps[env_id])
                             ep_steps[env_id] = 0
                         reset_fpo_reward_state(finished_env_ids)
+                        if failure_detector is not None:
+                            failure_detector.reset(finished_env_ids)
                     else:
                         bootstrap_steps.append(torch.zeros(num_envs, device=device, dtype=torch.float32))
 
@@ -2164,6 +2190,10 @@ class RobotWorkspace(BaseWorkspace):
             "rollout_env_steps": float(rewards.numel()),
             "rollout_completed_episodes": float(completed_episodes),
             "rollout_successful_episodes": float(completed_successes.item()),
+            "rollout_early_failures": float(early_failure_count.item()),
+            "rollout_reward_component_failure_mean": float(failure_reward_sum.item()) / rewards.numel(),
+            **{f"rollout_failure_{reason}": float(count)
+               for reason, count in zip(HandoverFailureDetector.reasons, failure_counts.cpu().tolist())},
             **{f"rollout_reward_component_{key}_mean": float(value.item()) / rewards.numel()
                for key, value in reward_component_sums.items()},
             **{f"rollout_stage_{stage + 1}_events": float(value)

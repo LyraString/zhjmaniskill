@@ -444,6 +444,12 @@ class HandoverBlockEnv(DualUR5WSGEnv):
             right_grasped = self._is_box_grasped(1)
             left_holding = left_grasped & box_lifted
             right_holding = right_grasped
+            info.update(
+                reward_left_grasped=left_grasped,
+                reward_right_grasped=right_grasped,
+                reward_left_gripper_state=left_gripper_val,
+                reward_right_gripper_state=right_gripper_val,
+            )
         handover_complete = right_holding & left_released & left_clear
         target_near = box_to_target < REWARD_TARGET_NEAR_DIST
 
