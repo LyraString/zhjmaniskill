@@ -689,7 +689,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-episode-steps", type=int, default=900)
     parser.add_argument("--max-probes", type=int, default=3)
     parser.add_argument("--target-stage", type=int, default=4)
-    parser.add_argument("--output-dir", default="/home/idiot/zhj/RoboTwin/tmp/handover/multiview_pointcloud_stage4")
+    parser.add_argument("--output-dir", default="/home/idiot/zhj/zhj_maniskill/tmp/handover/multiview_pointcloud_stage4")
     parser.add_argument("--sim-backend", default="physx_cuda")
     parser.add_argument("--render-backend", default="sapien_cuda")
     parser.add_argument("--point-cloud-sampling", default="fast")

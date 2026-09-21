@@ -275,7 +275,7 @@ def _candidate_grid(args: argparse.Namespace) -> list[dict[str, str]]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Render real-layout home-qpos mapping candidates.")
-    parser.add_argument("--output-dir", default="/home/idiot/zhj/RoboTwin/tmp/handover/real_layout_home_candidates")
+    parser.add_argument("--output-dir", default="/home/idiot/zhj/zhj_maniskill/tmp/handover/real_layout_home_candidates")
     parser.add_argument("--left-pan-modes", default="pan,pan_plus_pi,pan_minus_pi")
     parser.add_argument("--right-pan-modes", default="pan,pan_plus_pi,pan_minus_pi")
     parser.add_argument("--left-lift-modes", default="lift,neg_lift,lift_plus_half_pi,lift_minus_half_pi")

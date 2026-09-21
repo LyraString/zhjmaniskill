@@ -20,7 +20,7 @@ Activate `zhjrl` and run from the worktree root. For example, after collecting
 
 ```bash
 conda activate zhjrl
-cd /home/idiot/zhj/RoboTwin
+cd /home/idiot/zhj/zhj_maniskill
 python script/convert_vr_teleop_dataset.py \
   data/HandoverBlockUR5-v2/pico_handover_clean_v2 pico-clean-v2 \
   --output-format zarr \
@@ -47,7 +47,7 @@ YAML. To repeat clean10, select `data/HandoverBlockUR5-pico-clean-v2-10.zarr` in
 Print the merged configuration without starting training:
 
 ```bash
-cd /home/idiot/zhj/RoboTwin/policy/FlowMatching
+cd /home/idiot/zhj/zhj_maniskill/policy/FlowMatching
 python train.py --config-name maniskill_fm_vr --cfg job --resolve
 ```
 
@@ -68,7 +68,7 @@ the unchanged first 500 epochs of the former 1000-epoch schedule.
 Checkpoint directories under `checkpoints/` include the date/time and seed;
 DDP logs under `data/outputs/` also include a timestamp.
 
-The VR branch uses the main checkout at `/home/idiot/zhj/RoboTwin`.
+The VR branch uses the main checkout at `/home/idiot/zhj/zhj_maniskill`.
 Switch branches there with `git switch vr-teleop`; a separate VR worktree is
 not required. Datasets and training outputs are untracked and remain in place
 when switching branches. Historical run configs may still record the former

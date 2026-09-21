@@ -13,8 +13,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
-DEFAULT_DATA_PATH = "/home/idiot/zhj/RoboTwin/tmp/handover/counterfactual_labels_100ep.npz"
-DEFAULT_OUTPUT_PATH = "/home/idiot/zhj/RoboTwin/tmp/handover/coupling_net_scalar_v0.pt"
+DEFAULT_DATA_PATH = "/home/idiot/zhj/zhj_maniskill/tmp/handover/counterfactual_labels_100ep.npz"
+DEFAULT_OUTPUT_PATH = "/home/idiot/zhj/zhj_maniskill/tmp/handover/coupling_net_scalar_v0.pt"
 TARGET_NAME = "coupling_score"
 DEFAULT_DEV_SCALE = 0.05
 

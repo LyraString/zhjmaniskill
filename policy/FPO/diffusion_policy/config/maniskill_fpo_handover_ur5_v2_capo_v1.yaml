@@ -23,6 +23,6 @@ training:
   capo:
     enabled: true
     source: learned
-    coupling_ckpt_path: /home/idiot/zhj/RoboTwin/tmp/handover/coupling_net_scalar_v0.pt
+    coupling_ckpt_path: /home/idiot/zhj/zhj_maniskill/tmp/handover/coupling_net_scalar_v0.pt
     clip_low_coupling: 0.015
     clip_high_coupling: 0.006

@@ -141,7 +141,7 @@ def _render_candidate(args: argparse.Namespace, twist_deg: float, output_dir: Pa
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Render real-layout base-twist home-pose candidates.")
-    parser.add_argument("--output-dir", default="/home/idiot/zhj/RoboTwin/tmp/handover/real_layout_twist_candidates")
+    parser.add_argument("--output-dir", default="/home/idiot/zhj/zhj_maniskill/tmp/handover/real_layout_twist_candidates")
     parser.add_argument("--twists-deg", default="0,90,180,270")
     parser.add_argument("--arms-distance", type=float, default=UR5_REAL_LAYOUT_ARMS_DISTANCE)
     parser.add_argument("--base-y", type=float, default=UR5_REAL_LAYOUT_BASE_Y)
