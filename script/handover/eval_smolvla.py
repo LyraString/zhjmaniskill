@@ -1,4 +1,4 @@
-"""Evaluate a SmolVLA policy server on held-out UR5 handover episodes."""
+"""Evaluate a SmolVLA policy server on held-out or fresh-reset UR5 handovers."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 from contextlib import closing
 from io import BytesIO
 import json
+import math
 from pathlib import Path
 import socket
 import struct
@@ -30,8 +31,10 @@ from sim.maniskill.teleop import capture_canonical_observation
 
 CAMERA_NAMES = ("head_camera", "left_wrist_camera", "right_wrist_camera")
 DEFAULT_DATASET = REPO_ROOT / "data/HandoverBlockUR5-v2/pico_handover_clean_v2"
-DEFAULT_OUTPUT = REPO_ROOT / "tmp/handover/smolvla_050000/results.json"
+DEFAULT_HELDOUT_OUTPUT = REPO_ROOT / "tmp/handover/smolvla_050000/results.json"
+DEFAULT_RESET_OUTPUT = REPO_ROOT / "tmp/handover/smolvla_050000_test/results.json"
 DEFAULT_HELDOUT_EPISODES = (6, 33, 49, 55, 57, 66, 76, 78)
+TASK_METADATA_EPISODE = 0
 EXPECTED_CONTROL_MODE = "bimanual_pd_ee_delta_pose"
 PACKET_LENGTH = struct.Struct("!Q")
 MAX_PACKET_BYTES = 64 * 1024 * 1024
@@ -40,9 +43,17 @@ MAX_PACKET_BYTES = 64 * 1024 * 1024
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--video-dir", type=Path, default=None)
+    parser.add_argument(
+        "--evaluation-mode",
+        choices=("heldout", "reset"),
+        default="heldout",
+        help="Restore held-out recordings or evaluate fresh unseen reset seeds.",
+    )
     parser.add_argument("--episodes", nargs="+", type=int, default=list(DEFAULT_HELDOUT_EPISODES))
+    parser.add_argument("--seed-start", type=int, default=1000)
+    parser.add_argument("--num-episodes", type=int, default=50)
     parser.add_argument("--execution-horizon", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--policy-seed", type=int, default=999)
@@ -159,6 +170,43 @@ def episode_dir(dataset: Path, episode: int) -> Path:
     return path
 
 
+def load_episode_metadata(dataset: Path, episode: int) -> dict[str, Any]:
+    source = episode_dir(dataset, episode)
+    return json.loads((source / "episode.json").read_text(encoding="utf-8"))
+
+
+def recorded_dataset_seeds(dataset: Path) -> set[int]:
+    seeds = set()
+    for path in sorted((dataset / "episodes").glob("episode_*")):
+        metadata_path = path / "episode.json"
+        if metadata_path.is_file():
+            seeds.add(int(json.loads(metadata_path.read_text(encoding="utf-8"))["seed"]))
+    if not seeds:
+        raise FileNotFoundError(f"No episode metadata found under {dataset}")
+    return seeds
+
+
+def evaluation_cases(args: argparse.Namespace) -> list[dict[str, int | str | None]]:
+    if args.evaluation_mode == "heldout":
+        return [
+            {
+                "case_id": f"episode_{episode:06d}",
+                "episode": int(episode),
+                "seed": int(load_episode_metadata(args.dataset, episode)["seed"]),
+            }
+            for episode in args.episodes
+        ]
+
+    seeds = list(range(int(args.seed_start), int(args.seed_start) + int(args.num_episodes)))
+    overlap = sorted(set(seeds) & recorded_dataset_seeds(args.dataset))
+    if overlap:
+        raise ValueError(f"Reset evaluation seeds overlap the recorded dataset: {overlap}")
+    return [
+        {"case_id": f"seed_{seed:06d}", "episode": None, "seed": seed}
+        for seed in seeds
+    ]
+
+
 def create_env(metadata: dict[str, Any], args: argparse.Namespace, *, record_video: bool):
     viewer_pose = sapien_utils.look_at(
         eye=np.asarray([0.0, -0.45, 1.90], dtype=np.float32),
@@ -193,25 +241,32 @@ def _scalar(value: Any) -> Any:
     return _to_numpy(value).reshape(-1)[0].item()
 
 
-def run_episode(
+def run_case(
     args: argparse.Namespace,
     client: PolicyClient,
-    episode: int,
+    case: dict[str, int | str | None],
     video_dir: Path,
 ) -> dict[str, Any]:
-    source = episode_dir(args.dataset, episode)
-    metadata = json.loads((source / "episode.json").read_text(encoding="utf-8"))
+    episode = case["episode"]
+    seed = int(case["seed"])
+    case_id = str(case["case_id"])
+    metadata_episode = int(episode) if episode is not None else TASK_METADATA_EPISODE
+    source = episode_dir(args.dataset, metadata_episode)
+    metadata = load_episode_metadata(args.dataset, metadata_episode)
     if metadata.get("action_semantics") != "actual_relative_delta_pose_euler_xyz":
-        raise ValueError(f"Episode {episode} has incompatible action semantics.")
+        raise ValueError(f"Case {case_id} has incompatible action semantics.")
     if metadata.get("control_mode") != EXPECTED_CONTROL_MODE:
-        raise ValueError(f"Episode {episode} has incompatible control mode.")
+        raise ValueError(f"Case {case_id} has incompatible control mode.")
 
-    video_path = video_dir / f"episode_{episode:06d}.mp4"
+    video_path = video_dir / f"{case_id}.mp4"
     env = create_env(metadata, args, record_video=True)
     writer = None
+    h5_file = None
     result: dict[str, Any] = {
-        "episode": int(episode),
-        "seed": int(metadata["seed"]),
+        "case_id": case_id,
+        "evaluation_mode": args.evaluation_mode,
+        "episode": int(episode) if episode is not None else None,
+        "seed": seed,
         "success": False,
         "max_stage": 0,
         "steps": 0,
@@ -223,9 +278,10 @@ def run_episode(
         "error": None,
     }
     try:
-        with h5py.File(source / "data.hdf5", "r") as h5_file:
-            env.reset(seed=int(metadata["seed"]))
-            raw_env = env.env.unwrapped
+        env.reset(seed=seed)
+        raw_env = env.env.unwrapped
+        if args.evaluation_mode == "heldout":
+            h5_file = h5py.File(source / "data.hdf5", "r")
             _restore_initial_state(raw_env, h5_file)
             raw_env._get_reward_stage()[:] = 0
 
@@ -238,66 +294,69 @@ def run_episode(
                 np.linalg.norm(actual_box[:3] - recorded_box[:3])
             )
 
-            raw_obs = raw_env.get_obs()
-            observation = capture_canonical_observation(raw_obs, raw_env)
-            client.reset()
-            action_queue: list[np.ndarray] = []
+        raw_obs = raw_env.get_obs()
+        observation = capture_canonical_observation(raw_obs, raw_env)
+        client.reset()
+        action_queue: list[np.ndarray] = []
 
-            video_path.parent.mkdir(parents=True, exist_ok=True)
-            writer = imageio.get_writer(
-                video_path,
-                fps=int(args.video_fps),
-                codec="libx264",
-                pixelformat="yuv420p",
-                macro_block_size=None,
-            )
-            frame = _render_frame(env)
-            if frame is not None:
-                writer.append_data(frame)
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = imageio.get_writer(
+            video_path,
+            fps=int(args.video_fps),
+            codec="libx264",
+            pixelformat="yuv420p",
+            macro_block_size=None,
+        )
+        frame = _render_frame(env)
+        if frame is not None:
+            writer.append_data(frame)
 
-            for step in range(int(args.max_steps)):
-                if not action_queue:
-                    policy_seed = int(args.policy_seed) + 100_000 * int(episode) + step
-                    chunk = client.predict(
-                        observation,
-                        str(metadata["task_instruction"]),
-                        policy_seed,
+        policy_case_seed = int(episode) if episode is not None else seed
+        for step in range(int(args.max_steps)):
+            if not action_queue:
+                policy_seed = int(args.policy_seed) + 100_000 * policy_case_seed + step
+                chunk = client.predict(
+                    observation,
+                    str(metadata["task_instruction"]),
+                    policy_seed,
+                )
+                if args.execution_horizon > len(chunk):
+                    raise ValueError(
+                        f"Execution horizon {args.execution_horizon} exceeds chunk {len(chunk)}"
                     )
-                    if args.execution_horizon > len(chunk):
-                        raise ValueError(
-                            f"Execution horizon {args.execution_horizon} exceeds chunk {len(chunk)}"
-                        )
-                    action_queue = list(chunk[: args.execution_horizon])
-                    result["replans"] += 1
+                action_queue = list(chunk[: args.execution_horizon])
+                result["replans"] += 1
 
-                delta, was_constrained = constrain_delta_action(
-                    action_queue.pop(0),
-                    max_translation_step=float(args.max_translation_step),
-                    max_rotation_step=float(args.max_rotation_step),
-                )
-                result["constrained_action_steps"] += int(was_constrained)
-                absolute = np.asarray(env.prepare_action_chunk(delta[None, :]), dtype=np.float32)
-                absolute = _validate_absolute_action(absolute.reshape(14), env.action_space)
-                raw_obs, _, terminated, truncated, info = env.step_raw(
-                    ActionSpec.from_value(absolute, action_type=EXPECTED_CONTROL_MODE)
-                )
-                observation = capture_canonical_observation(raw_obs, raw_env)
+            delta, was_constrained = constrain_delta_action(
+                action_queue.pop(0),
+                max_translation_step=float(args.max_translation_step),
+                max_rotation_step=float(args.max_rotation_step),
+            )
+            result["constrained_action_steps"] += int(was_constrained)
+            absolute = np.asarray(env.prepare_action_chunk(delta[None, :]), dtype=np.float32)
+            absolute = _validate_absolute_action(absolute.reshape(14), env.action_space)
+            raw_obs, _, terminated, truncated, info = env.step_raw(
+                ActionSpec.from_value(absolute, action_type=EXPECTED_CONTROL_MODE)
+            )
+            observation = capture_canonical_observation(raw_obs, raw_env)
 
-                result["steps"] = step + 1
-                result["max_stage"] = max(
-                    int(result["max_stage"]), int(_scalar(info.get("reward_stage", 0)))
-                )
-                success = bool(_scalar(info.get("success", False)))
-                result["success"] = bool(result["success"] or success)
-                if (step + 1) % int(args.video_every) == 0:
-                    frame = _render_frame(env)
-                    if frame is not None:
-                        writer.append_data(frame)
-                if result["success"] or terminated or truncated:
-                    break
+            result["steps"] = step + 1
+            result["max_stage"] = max(
+                int(result["max_stage"]), int(_scalar(info.get("reward_stage", 0)))
+            )
+            success = bool(_scalar(info.get("success", False)))
+            result["success"] = bool(result["success"] or success)
+            if (step + 1) % int(args.video_every) == 0:
+                frame = _render_frame(env)
+                if frame is not None:
+                    writer.append_data(frame)
+            if result["success"] or terminated or truncated:
+                break
     except Exception as error:
         result["error"] = f"{type(error).__name__}: {error}"
     finally:
+        if h5_file is not None:
+            h5_file.close()
         if writer is not None:
             writer.close()
         env.close()
@@ -306,22 +365,52 @@ def run_episode(
     return result
 
 
+def _wilson_interval(successes: int, total: int, z: float = 1.959963984540054) -> list[float]:
+    if total == 0:
+        return [0.0, 0.0]
+    probability = successes / total
+    denominator = 1.0 + z**2 / total
+    center = (probability + z**2 / (2.0 * total)) / denominator
+    margin = z * math.sqrt(
+        probability * (1.0 - probability) / total + z**2 / (4.0 * total**2)
+    ) / denominator
+    return [float(max(0.0, center - margin)), float(min(1.0, center + margin))]
+
+
 def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    successes = sum(bool(row["success"]) for row in rows)
+    total_steps = sum(int(row["steps"]) for row in rows)
+    constrained_steps = sum(int(row["constrained_action_steps"]) for row in rows)
     return {
         "episodes": len(rows),
-        "successes": sum(bool(row["success"]) for row in rows),
-        "success_rate": float(np.mean([row["success"] for row in rows])) if rows else 0.0,
+        "successes": successes,
+        "success_rate": successes / len(rows) if rows else 0.0,
+        "success_rate_wilson_95": _wilson_interval(successes, len(rows)),
         "mean_max_stage": float(np.mean([row["max_stage"] for row in rows])) if rows else 0.0,
+        "stage_reach_rate": {
+            str(stage): sum(int(row["max_stage"]) >= stage for row in rows) / len(rows)
+            if rows
+            else 0.0
+            for stage in range(1, 5)
+        },
         "errors": sum(row["error"] is not None for row in rows),
-        "constrained_action_steps": sum(int(row["constrained_action_steps"]) for row in rows),
+        "constrained_action_steps": constrained_steps,
+        "constrained_action_rate": constrained_steps / total_steps if total_steps else 0.0,
     }
 
 
-def save_results(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
+def save_results(
+    args: argparse.Namespace,
+    rows: list[dict[str, Any]],
+    cases: list[dict[str, int | str | None]],
+) -> None:
     payload = {
         "policy_label": args.policy_label,
+        "evaluation_mode": args.evaluation_mode,
         "dataset": str(args.dataset),
-        "episodes": list(args.episodes),
+        "case_ids": [str(case["case_id"]) for case in cases],
+        "episodes": [int(case["episode"]) for case in cases if case["episode"] is not None],
+        "seeds": [int(case["seed"]) for case in cases],
         "execution_horizon": int(args.execution_horizon),
         "max_steps": int(args.max_steps),
         "policy_seed": int(args.policy_seed),
@@ -344,7 +433,9 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Video cadence and FPS must be positive.")
     if args.max_translation_step <= 0 or args.max_rotation_step <= 0:
         raise ValueError("Action limits must be positive.")
-    if len(set(args.episodes)) != len(args.episodes):
+    if args.seed_start < 0 or args.num_episodes <= 0:
+        raise ValueError("Seed start must be non-negative and episode count must be positive.")
+    if args.evaluation_mode == "heldout" and len(set(args.episodes)) != len(args.episodes):
         raise ValueError("Episode list contains duplicates.")
 
 
@@ -352,21 +443,29 @@ def main() -> None:
     args = build_parser().parse_args()
     validate_args(args)
     args.dataset = args.dataset.expanduser().resolve()
+    if args.output is None:
+        args.output = (
+            DEFAULT_RESET_OUTPUT if args.evaluation_mode == "reset" else DEFAULT_HELDOUT_OUTPUT
+        )
     args.output = args.output.expanduser().resolve()
+    cases = evaluation_cases(args)
+    case_ids = [str(case["case_id"]) for case in cases]
     video_dir = (
         args.video_dir.expanduser().resolve()
         if args.video_dir is not None
         else args.output.parent / f"{args.output.stem}_videos"
     )
 
-    rows_by_episode: dict[int, dict[str, Any]] = {}
+    rows_by_case: dict[str, dict[str, Any]] = {}
     if args.output.is_file() and not args.force:
         existing = json.loads(args.output.read_text(encoding="utf-8"))
         expected = {
             "policy_label": args.policy_label,
+            "evaluation_mode": args.evaluation_mode,
             "execution_horizon": int(args.execution_horizon),
             "policy_seed": int(args.policy_seed),
         }
+        existing.setdefault("evaluation_mode", "heldout")
         mismatches = {
             key: (existing.get(key), value)
             for key, value in expected.items()
@@ -374,20 +473,34 @@ def main() -> None:
         }
         if mismatches:
             raise ValueError(f"Existing result configuration differs: {mismatches}")
-        rows_by_episode = {int(row["episode"]): row for row in existing.get("rows", [])}
+        existing_case_ids = existing.get(
+            "case_ids",
+            [f"episode_{int(episode):06d}" for episode in existing.get("episodes", [])],
+        )
+        if list(existing_case_ids) != case_ids:
+            raise ValueError("Existing result cases differ from the requested evaluation cases.")
+        rows_by_case = {
+            (
+                str(row["case_id"])
+                if row.get("case_id") is not None
+                else f"episode_{int(row['episode']):06d}"
+            ): row
+            for row in existing.get("rows", [])
+        }
 
-    pending = [episode for episode in args.episodes if args.force or episode not in rows_by_episode]
+    pending = [case for case in cases if args.force or str(case["case_id"]) not in rows_by_case]
     if pending:
         with closing(PolicyClient(args.server_host, args.server_port)) as client:
-            for episode in pending:
-                rows_by_episode[episode] = run_episode(args, client, episode, video_dir)
-                rows = [rows_by_episode[key] for key in args.episodes if key in rows_by_episode]
-                save_results(args, rows)
+            for case in pending:
+                case_id = str(case["case_id"])
+                rows_by_case[case_id] = run_case(args, client, case, video_dir)
+                rows = [rows_by_case[key] for key in case_ids if key in rows_by_case]
+                save_results(args, rows, cases)
     else:
         print("No pending episodes; existing result file is complete.", flush=True)
 
-    rows = [rows_by_episode[key] for key in args.episodes if key in rows_by_episode]
-    save_results(args, rows)
+    rows = [rows_by_case[key] for key in case_ids if key in rows_by_case]
+    save_results(args, rows, cases)
     summary = aggregate(rows)
     print("aggregate " + json.dumps(summary), flush=True)
     print(f"results={args.output}", flush=True)
