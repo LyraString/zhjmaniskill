@@ -21,6 +21,7 @@ from sim.maniskill.task_profiles import resolve_runtime_control_mode, resolve_ru
 
 
 ADAPTER_MODULES = {
+    "dp3": "policy.DP3.deploy_maniskill",
     "flowmatching": "policy.FlowMatching.deploy_maniskill",
     "fpo": "policy.FPO.deploy_maniskill",
     "resfit": "policy.ResFiT.deploy_maniskill",
@@ -629,6 +630,12 @@ def _is_pdee_ik_failure(error: RuntimeError) -> bool:
     }
 
 
+def _encode_policy_observation(adapter, env, observation, model):
+    if hasattr(adapter, "encode_env_obs"):
+        return adapter.encode_env_obs(env, observation, model)
+    return adapter.encode_obs(dict(observation.data))
+
+
 def run_evaluation(args) -> None:
     adapter = importlib.import_module(ADAPTER_MODULES[args.policy_kind])
     with open(args.ckpt_path, "rb") as checkpoint_file:
@@ -658,6 +665,9 @@ def run_evaluation(args) -> None:
     }
     _adapt_runtime_for_checkpoint_obs(ckpt_cfg, runtime_kwargs)
     _adapt_runtime_for_checkpoint_action(ckpt_cfg, runtime_kwargs)
+    if hasattr(adapter, "encode_env_obs"):
+        # This adapter uses raw cameras and its checkpoint's own preprocessing.
+        runtime_kwargs["point_cloud_views"] = []
     _resolved_action_type, resolved_control_mode = resolve_runtime_control_mode(
         action_type=runtime_kwargs["action_type"],
         control_mode=runtime_kwargs["control_mode"],
@@ -711,7 +721,7 @@ def run_evaluation(args) -> None:
         for episode_idx in range(args.episodes):
             obs = env.reset(seed=args.seed + episode_idx)
             adapter.reset_model(model)
-            encoded_obs = adapter.encode_obs(dict(obs.data))
+            encoded_obs = _encode_policy_observation(adapter, env, obs, model)
             missing_obs_keys = [
                 key for key in _shape_meta_obs_keys(ckpt_cfg) if key not in encoded_obs
             ]
@@ -828,7 +838,7 @@ def run_evaluation(args) -> None:
                     episode_return += float(result.reward)
                     episode_length += 1
                     _update_handover_diag(handover_diag, result.info)
-                    encoded_obs = adapter.encode_obs(dict(result.observation.data))
+                    encoded_obs = _encode_policy_observation(adapter, env, result.observation, model)
                     model.update_obs(encoded_obs)
                     if video_dir is not None:
                         _maybe_capture_frame(env, frames)

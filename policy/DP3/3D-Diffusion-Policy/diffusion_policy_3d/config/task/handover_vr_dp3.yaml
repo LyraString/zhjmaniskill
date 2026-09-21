@@ -1,0 +1,31 @@
+# Use the DP3 template's 1024 points; keep this checkout's head-camera selection.
+name: ${now:%y%m%d-%H%M%S}-handover-vr-dp3-qpos
+raw_dataset: ${repo_root:}/data/HandoverBlockUR5-v2/pico_handover_clean_v2
+preprocessing:
+  cameras: [head_camera]
+  points: 1024
+  crop_min: [-0.6, -0.35, 0.7401]
+  crop_max: [0.6, 0.35, 2.0]
+maniskill:
+  profile: handover_block_ur5_v2_vr_robotwin_clean
+  env_id: HandoverBlockUR5-v2
+  control_mode: bimanual_pd_joint_pos
+  action_type: bimanual_pd_joint_pos
+  action_semantics: next_observation_joint_position
+  gripper_semantics: absolute
+  sim_freq: 200
+  control_freq: 20
+shape_meta:
+  obs:
+    point_cloud: {shape: [1024, 3], type: point_cloud}
+    agent_pos: {shape: [14], type: low_dim}
+  action: {shape: [14]}
+dataset:
+  _target_: diffusion_policy_3d.dataset.robot_dataset.RobotDataset
+  zarr_path: ${repo_root:}/policy/DP3/data/vr_raw_head1024_qpos80.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 0
+  val_ratio: 0.02
+  max_train_episodes: null

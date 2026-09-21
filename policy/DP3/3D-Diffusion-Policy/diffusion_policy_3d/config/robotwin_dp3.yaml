@@ -1,0 +1,34 @@
+defaults:
+  - robot_dp3
+  - override task: handover_vr_dp3
+  - _self_
+
+name: robotwin_dp3
+exp_name: vr_dp3
+task_name: handover_block_ur5_v2_vr
+horizon: 8
+n_obs_steps: 3
+n_action_steps: 6
+training:
+  device: cuda:0
+  seed: 42
+  resume: false
+  num_epochs: 3000
+  debug: false
+  checkpoint_every: 100
+  val_every: 50
+dataloader:
+  batch_size: 512
+  num_workers: 8
+  persistent_workers: false
+val_dataloader:
+  batch_size: 512
+  num_workers: 8
+  persistent_workers: false
+checkpoint:
+  save_ckpt: true
+logging:
+  mode: offline
+hydra:
+  run:
+    dir: ${repo_root:}/policy/DP3/data/outputs/${now:%y%m%d-%H%M%S}-vr-seed${training.seed}
