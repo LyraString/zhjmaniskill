@@ -110,6 +110,9 @@ class BaseBimanualEnv(BaseEnv):
         )
         if not 0.0 < self.wrist_camera_fovy_deg < 180.0:
             raise ValueError("wrist_camera_fovy_deg must be between 0 and 180 degrees.")
+        self.wrist_camera_near = float(kwargs.pop("wrist_camera_near", self.HEAD_CAMERA_NEAR))
+        if not 0.0 < self.wrist_camera_near < self.HEAD_CAMERA_FAR:
+            raise ValueError("wrist_camera_near must be between 0 and the camera far plane.")
         self.initial_gripper_value = float(kwargs.pop("initial_gripper_value", 0.0))
         if not 0.0 <= self.initial_gripper_value <= 1.0:
             raise ValueError("initial_gripper_value must be between 0 and 1.")
@@ -230,7 +233,7 @@ class BaseBimanualEnv(BaseEnv):
                         self.HEAD_CAMERA_WIDTH,
                         self.HEAD_CAMERA_HEIGHT,
                         np.deg2rad(self.wrist_camera_fovy_deg),
-                        self.HEAD_CAMERA_NEAR,
+                        self.wrist_camera_near,
                         self.HEAD_CAMERA_FAR,
                         mount=self.get_arm_link_by_name(arm_index=0, link_name="camera"),
                     ),
@@ -240,7 +243,7 @@ class BaseBimanualEnv(BaseEnv):
                         self.HEAD_CAMERA_WIDTH,
                         self.HEAD_CAMERA_HEIGHT,
                         np.deg2rad(self.wrist_camera_fovy_deg),
-                        self.HEAD_CAMERA_NEAR,
+                        self.wrist_camera_near,
                         self.HEAD_CAMERA_FAR,
                         mount=self.get_arm_link_by_name(arm_index=1, link_name="camera"),
                     ),

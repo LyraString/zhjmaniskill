@@ -273,6 +273,13 @@ MANISKILL_TASK_PROFILES: dict[str, dict[str, Any]] = {
     },
 }
 
+MANISKILL_TASK_PROFILES["handover_block_ur5_v2_vr_robotwin_clean_near001"] = deepcopy(
+    MANISKILL_TASK_PROFILES["handover_block_ur5_v2_vr_robotwin_clean"]
+)
+MANISKILL_TASK_PROFILES["handover_block_ur5_v2_vr_robotwin_clean_near001"]["env_kwargs"][
+    "wrist_camera_near"
+] = 0.01
+
 
 _ENV_ID_TO_PROFILE: dict[str, str] = {}
 for _profile_name, _profile in MANISKILL_TASK_PROFILES.items():

@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 from core.schemas.action import ActionSpec
 from script.check_vr_teleop_dataset import _render_frame, _restore_initial_state, _to_numpy
 from sim.maniskill import ManiSkillTaskFactory
+from sim.maniskill.task_profiles import get_task_profile
 from sim.maniskill.teleop import capture_canonical_observation
 
 
@@ -34,7 +35,7 @@ DEFAULT_DATASET = REPO_ROOT / "data/HandoverBlockUR5-v2/pico_handover_clean_v2"
 DEFAULT_HELDOUT_OUTPUT = REPO_ROOT / "tmp/handover/smolvla_050000/results.json"
 DEFAULT_RESET_OUTPUT = REPO_ROOT / "tmp/handover/smolvla_050000_test/results.json"
 DEFAULT_HELDOUT_EPISODES = (6, 33, 49, 55, 57, 66, 76, 78)
-TASK_METADATA_EPISODE = 0
+DEFAULT_TASK_PROFILE = "handover_block_ur5_v2_vr_robotwin_clean"
 EXPECTED_CONTROL_MODE = "bimanual_pd_ee_delta_pose"
 PACKET_LENGTH = struct.Struct("!Q")
 MAX_PACKET_BYTES = 64 * 1024 * 1024
@@ -42,7 +43,9 @@ MAX_PACKET_BYTES = 64 * 1024 * 1024
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
+    parser.add_argument("--dataset", type=Path, default=None)
+    parser.add_argument("--task-profile", default=None)
+    parser.add_argument("--task-instruction", default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--video-dir", type=Path, default=None)
     parser.add_argument(
@@ -198,13 +201,47 @@ def evaluation_cases(args: argparse.Namespace) -> list[dict[str, int | str | Non
         ]
 
     seeds = list(range(int(args.seed_start), int(args.seed_start) + int(args.num_episodes)))
-    overlap = sorted(set(seeds) & recorded_dataset_seeds(args.dataset))
-    if overlap:
-        raise ValueError(f"Reset evaluation seeds overlap the recorded dataset: {overlap}")
+    if args.dataset is not None:
+        overlap = sorted(set(seeds) & recorded_dataset_seeds(args.dataset))
+        if overlap:
+            raise ValueError(f"Reset evaluation seeds overlap the recorded dataset: {overlap}")
     return [
         {"case_id": f"seed_{seed:06d}", "episode": None, "seed": seed}
         for seed in seeds
     ]
+
+
+def reset_task_profile(dataset: Path | None, task_profile: str | None) -> str:
+    if task_profile is None and dataset is not None:
+        task_profile = str(load_episode_metadata(dataset, 0)["task_profile"])
+    profile_name = task_profile or DEFAULT_TASK_PROFILE
+    profile = get_task_profile(profile_name)
+    if profile["env_id"] != "HandoverBlockUR5-v2":
+        raise ValueError(f"Unsupported evaluation task profile: {profile_name}")
+    if profile["control_mode"] != EXPECTED_CONTROL_MODE:
+        raise ValueError(f"Task profile has incompatible control mode: {profile_name}")
+    return profile_name
+
+
+def reset_case_metadata(task_profile: str) -> dict[str, Any]:
+    profile = get_task_profile(task_profile)
+    return {
+        "task_profile": task_profile,
+        "control_mode": profile["control_mode"],
+        "sim_freq_hz": profile["sim_freq"],
+        "control_freq_hz": profile["control_freq"],
+        "action_semantics": "actual_relative_delta_pose_euler_xyz",
+    }
+
+
+def case_task_instruction(
+    args: argparse.Namespace, metadata: dict[str, Any], env: Any
+) -> str:
+    if args.task_instruction is not None:
+        return str(args.task_instruction)
+    if args.evaluation_mode == "heldout":
+        return str(metadata["task_instruction"])
+    return str(env.env.unwrapped.task_description)
 
 
 def create_env(metadata: dict[str, Any], args: argparse.Namespace, *, record_video: bool):
@@ -250,9 +287,12 @@ def run_case(
     episode = case["episode"]
     seed = int(case["seed"])
     case_id = str(case["case_id"])
-    metadata_episode = int(episode) if episode is not None else TASK_METADATA_EPISODE
-    source = episode_dir(args.dataset, metadata_episode)
-    metadata = load_episode_metadata(args.dataset, metadata_episode)
+    source = episode_dir(args.dataset, int(episode)) if episode is not None else None
+    metadata = (
+        load_episode_metadata(args.dataset, int(episode))
+        if episode is not None
+        else reset_case_metadata(args.task_profile)
+    )
     if metadata.get("action_semantics") != "actual_relative_delta_pose_euler_xyz":
         raise ValueError(f"Case {case_id} has incompatible action semantics.")
     if metadata.get("control_mode") != EXPECTED_CONTROL_MODE:
@@ -267,6 +307,7 @@ def run_case(
         "evaluation_mode": args.evaluation_mode,
         "episode": int(episode) if episode is not None else None,
         "seed": seed,
+        "task_instruction": None,
         "success": False,
         "max_stage": 0,
         "steps": 0,
@@ -280,6 +321,8 @@ def run_case(
     try:
         env.reset(seed=seed)
         raw_env = env.env.unwrapped
+        task_instruction = case_task_instruction(args, metadata, env)
+        result["task_instruction"] = task_instruction
         if args.evaluation_mode == "heldout":
             h5_file = h5py.File(source / "data.hdf5", "r")
             _restore_initial_state(raw_env, h5_file)
@@ -317,7 +360,7 @@ def run_case(
                 policy_seed = int(args.policy_seed) + 100_000 * policy_case_seed + step
                 chunk = client.predict(
                     observation,
-                    str(metadata["task_instruction"]),
+                    task_instruction,
                     policy_seed,
                 )
                 if args.execution_horizon > len(chunk):
@@ -407,7 +450,9 @@ def save_results(
     payload = {
         "policy_label": args.policy_label,
         "evaluation_mode": args.evaluation_mode,
-        "dataset": str(args.dataset),
+        "dataset": str(args.dataset) if args.dataset is not None else None,
+        "task_profile": args.task_profile,
+        "task_instruction": args.task_instruction,
         "case_ids": [str(case["case_id"]) for case in cases],
         "episodes": [int(case["episode"]) for case in cases if case["episode"] is not None],
         "seeds": [int(case["seed"]) for case in cases],
@@ -437,12 +482,21 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Seed start must be non-negative and episode count must be positive.")
     if args.evaluation_mode == "heldout" and len(set(args.episodes)) != len(args.episodes):
         raise ValueError("Episode list contains duplicates.")
+    if args.evaluation_mode == "heldout" and args.task_profile is not None:
+        raise ValueError("Held-out task profiles come from the recorded episodes.")
+    if args.task_instruction is not None and not args.task_instruction.strip():
+        raise ValueError("Task instruction must not be empty.")
 
 
 def main() -> None:
     args = build_parser().parse_args()
     validate_args(args)
-    args.dataset = args.dataset.expanduser().resolve()
+    if args.evaluation_mode == "heldout":
+        args.dataset = (args.dataset or DEFAULT_DATASET).expanduser().resolve()
+    elif args.dataset is not None:
+        args.dataset = args.dataset.expanduser().resolve()
+    if args.evaluation_mode == "reset":
+        args.task_profile = reset_task_profile(args.dataset, args.task_profile)
     if args.output is None:
         args.output = (
             DEFAULT_RESET_OUTPUT if args.evaluation_mode == "reset" else DEFAULT_HELDOUT_OUTPUT
@@ -462,10 +516,15 @@ def main() -> None:
         expected = {
             "policy_label": args.policy_label,
             "evaluation_mode": args.evaluation_mode,
+            "dataset": str(args.dataset) if args.dataset is not None else None,
+            "task_profile": args.task_profile,
+            "task_instruction": args.task_instruction,
             "execution_horizon": int(args.execution_horizon),
             "policy_seed": int(args.policy_seed),
         }
         existing.setdefault("evaluation_mode", "heldout")
+        existing.setdefault("task_profile", None)
+        existing.setdefault("task_instruction", None)
         mismatches = {
             key: (existing.get(key), value)
             for key, value in expected.items()

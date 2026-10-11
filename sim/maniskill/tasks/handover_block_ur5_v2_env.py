@@ -32,6 +32,10 @@ class HandoverBlockUR5V2Env(HandoverBlockEnv):
     """
 
     block_middle_pose = V2_BLOCK_MIDDLE_POSE
+    task_description = (
+        "Pick up the block with the left arm, hand it to the right arm, "
+        "and place it on the target."
+    )
 
     def __init__(
         self,
